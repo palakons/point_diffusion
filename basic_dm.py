@@ -1,3 +1,4 @@
+import inspect
 from pytorch3d.loss import chamfer_distance
 import torch
 import torch.nn as nn
@@ -100,28 +101,15 @@ def train(model, dataloader, optimizer, scheduler, num_epochs=10, device='cpu'):
 
 
 @torch.no_grad()
-def sample(model, scheduler, sample_shape, evolution_freq=None, device='cpu'):
+def sample(model, scheduler, sample_shape, num_inference_steps=None, evolution_freq=None,  device='cpu'):
     model.eval()
-    num_timesteps = scheduler.config.num_train_timesteps
-    # Start from pure noise
-    x = torch.randn(sample_shape).to(device)
-    xs = []
-    for t in reversed(range(num_timesteps)):
-        timesteps = torch.full(
-            (x.size(0),), t, device=device, dtype=torch.long)
-        # Predict noise
-        noise_pred = model(x, timesteps)
-        # Compute previous noisy sample x_t -> x_{t-1}
-        x = scheduler.step(noise_pred, t, x)['prev_sample']
-        if evolution_freq is not None and t % evolution_freq == 0:
-            xs.append(x)
-    return x, xs
+    # Set timesteps
+    if num_inference_steps is None:
+        num_inference_steps = scheduler.config.num_train_timesteps
+    # print(num_inference_steps)
+    scheduler.set_timesteps(num_inference_steps)
+    # print(scheduler.timesteps)
 
-
-@torch.no_grad()
-def sample2(model, scheduler, sample_shape, evolution_freq=None, offset=0, device='cpu'):
-    model.eval()
-    num_timesteps = scheduler.config.num_train_timesteps
     # Start from pure noise
     x = torch.randn(sample_shape).to(device)
     xs = []
@@ -136,7 +124,7 @@ def sample2(model, scheduler, sample_shape, evolution_freq=None, offset=0, devic
         noise_pred = model(x, timesteps)
         # Compute previous noisy sample x_t -> x_{t-1}
         # x = scheduler.step(noise_pred, t, x)['prev_sample']
-        x = scheduler.step(noise_pred, t, x, offset=offset)['prev_sample']
+        x = scheduler.step(noise_pred, t, x)['prev_sample']
         if evolution_freq is not None and t % evolution_freq == 0:
             xs.append(x)
     return x, xs
@@ -154,33 +142,30 @@ data_dim = dataset[0].shape[0]
 
 model = SimpleDiffusionModel(data_dim=data_dim).to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-scheduler = DDPMScheduler(num_train_timesteps=1000)
+# linear, scaled_linear, or squaredcos_cap_v2.
+scheduler = DDPMScheduler(num_train_timesteps=1000,
+                          beta_schedule='squaredcos_cap_v2')
 
 # Train the model
 train(model, dataloader, optimizer, scheduler,
-      num_epochs=100000, device=device)
+      num_epochs=1000, device=device)
 
 
-samples = sample(model, scheduler, sample_shape=(
-    1000, data_dim), device=device)
-samples = samples * dataset.std.to(device) + dataset.mean.to(device)
-loss, _ = chamfer_distance(dataset[:].unsqueeze(0).to(device) * dataset.std.to(
-    device) + dataset.mean.to(device), samples.mean(dim=0).unsqueeze(0).unsqueeze(0).to(device))
-print("sameple:\t", samples.mean(dim=0), "Chamfer Distance:", loss.item())
+# samples, _ = sample(model, scheduler, sample_shape=( 1000, data_dim), device=device)
 
 # Sample from the model
-samples = sample2(model, scheduler, sample_shape=(
-    1000, data_dim), device=device)
-samples = samples * dataset.std.to(device) + dataset.mean.to(device)
-loss, _ = chamfer_distance(dataset[:].unsqueeze(0).to(device) * dataset.std.to(
-    device) + dataset.mean.to(device), samples.mean(dim=0).unsqueeze(0).unsqueeze(0).to(device))
-print("sameple2:\t", samples.mean(dim=0), "Chamfer Distance:", loss.item())
+samples = {"step1": sample(model, scheduler, sample_shape=(1000, data_dim), num_inference_steps=1, device=device)[0],
+           "step5": sample(model, scheduler, sample_shape=(1000, data_dim), num_inference_steps=5, device=device)[0],
+           "step10": sample(model, scheduler, sample_shape=(1000, data_dim), num_inference_steps=10, device=device)[0],
+           "step50": sample(model, scheduler, sample_shape=(1000, data_dim), num_inference_steps=50, device=device)[0],
+           "step100": sample(model, scheduler, sample_shape=(1000, data_dim), num_inference_steps=100, device=device)[0],
+           "step200": sample(model, scheduler, sample_shape=(1000, data_dim), num_inference_steps=200, device=device)[0],
+           "step500": sample(model, scheduler, sample_shape=(1000, data_dim), num_inference_steps=500, device=device)[0]}
 
-# Sample from the model
-samples = sample2(model, scheduler, sample_shape=(
-    1000, data_dim), offset=1, device=device)
-samples = samples * dataset.std.to(device) + dataset.mean.to(device)
-loss, _ = chamfer_distance(dataset[:].unsqueeze(0).to(device) * dataset.std.to(
-    device) + dataset.mean.to(device), samples.mean(dim=0).unsqueeze(0).unsqueeze(0).to(device))
-print("sameple2 offset:1\t", samples.mean(
-    dim=0), "Chamfer Distance:", loss.item())
+for key, value in samples.items():
+    samples[key] = samples[key] * \
+        dataset.std.to(device) + dataset.mean.to(device)
+    loss, _ = chamfer_distance(dataset[:].unsqueeze(0).to(device) * dataset.std.to(
+        device) + dataset.mean.to(device), samples[key].mean(dim=0).unsqueeze(0).unsqueeze(0).to(device))
+    print(key, "\t", samples[key].mean(
+        dim=0), "Chamfer Distance:", loss.item())
