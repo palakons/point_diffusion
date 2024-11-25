@@ -250,7 +250,7 @@ def sample(
         # Compute previous noisy sample x_t -> x_{t-1}
         # x = scheduler.step(noise_pred, t, x)['prev_sample']
         x = scheduler.step(noise_pred, t, x)["prev_sample"]
-        if evolution_freq is not None and t % evolution_freq == 0:
+        if evolution_freq is not None and i % evolution_freq == 0:
             xs.append(x)
     return x, xs
 
@@ -447,131 +447,99 @@ if not args.no_wandb:
 
 # Sample from the model
 num_sample_points = 1
-samples = {
-    "step1": sample(
+samples = {}
+for i in [1, 5, 10, 50,100]:
+    try:
+        samples[f"step{i}"] = sample(
         model,
         scheduler,
         sample_shape=(num_sample_points, data_dim),
-        num_inference_steps=1,
-        evolution_freq=1,
+        num_inference_steps=i,
+        evolution_freq=args.visualize_freq,
         device=device,
-    ),
-    "step5": sample(
-        model,
-        scheduler,
-        sample_shape=(num_sample_points, data_dim),
-        num_inference_steps=5,
-        evolution_freq=1,
-        device=device,
-    ),
-    "step10": sample(
-        model,
-        scheduler,
-        sample_shape=(num_sample_points, data_dim),
-        num_inference_steps=10,
-        evolution_freq=1,
-        device=device,
-    ),
-    "step50": sample(
-        model,
-        scheduler,
-        sample_shape=(num_sample_points, data_dim),
-        num_inference_steps=50,
-        evolution_freq=1,
-        device=device,
-    ),
-    "step100": sample(
-        model,
-        scheduler,
-        sample_shape=(num_sample_points, data_dim),
-        num_inference_steps=100,
-        evolution_freq=1,
-        device=device,
-    ),
-    "step200": sample(
-        model,
-        scheduler,
-        sample_shape=(num_sample_points , data_dim),
-        num_inference_steps=200,
-        evolution_freq=1,
-        device=device,
-    ),
-    #    "step500": sample(model, scheduler, sample_shape=(1000, data_dim), num_inference_steps=500, evolution_freq=1, device=device),
-    #    "step1000": sample(model, scheduler, sample_shape=(1000, data_dim), num_inference_steps=1000, evolution_freq=1, device=device)
-}
-
-
-fig = plt.figure(figsize=(10, 5))
-for key, value in samples.items():
-    samples_updated = samples[key][0] * \
-        dataset.std.to(device) + dataset.mean.to(device)
-    loss, _ = chamfer_distance(
-        dataset[:].unsqueeze(0).to(device) * dataset.std.to(device)
-        + dataset.mean.to(device),
-        samples_updated.mean(dim=0).unsqueeze(0).unsqueeze(0).to(device),
     )
-    print(key, "\t", f"CD: {loss.item():.2f}")
-    if not args.no_wandb:
-        wandb.log({f"CD_{key}": loss.item(), "epoch": args.epochs})
-    error = []
-    for x in samples[key][1]:
-        x = x * dataset.std.to(device) + dataset.mean.to(device)
+    except:
+        print("error sample()", i)
+
+
+if not args.no_wandb:
+    #make the plot that will be logged to wandb
+    plt.figure(figsize=(10, 10))
+
+    for key, value in samples.items():
+        samples_updated = samples[key][0] * \
+            dataset.std.to(device) + dataset.mean.to(device)
         loss, _ = chamfer_distance(
             dataset[:].unsqueeze(0).to(device) * dataset.std.to(device)
             + dataset.mean.to(device),
-            x.mean(dim=0).unsqueeze(0).unsqueeze(0).to(device),
+            samples_updated.mean(dim=0).unsqueeze(0).unsqueeze(0).to(device),
         )
-        # print(f"{loss.item():.2f}", end=", ")
-        loss = loss.item()
-        error.append(loss)
-    # ax = plt.plot(error, label=key)
-    plt.plot(
-        [i / (len(error) - (1 if len(error) > 1 else 0))
-         for i in range(len(error))],
-        error,
-        label=key,
-        marker=None,
+        print(key, "\t", f"CD: {loss.item():.2f}")
+        wandb.log({f"CD_{key}": loss.item(), "epoch": args.epochs})
+        error = []
+        for x in samples[key][1]:
+            x = x * dataset.std.to(device) + dataset.mean.to(device)
+            loss, _ = chamfer_distance(
+                dataset[:].unsqueeze(0).to(device) * dataset.std.to(device)
+                + dataset.mean.to(device),
+                x.mean(dim=0).unsqueeze(0).unsqueeze(0).to(device),
+            )
+            # print(f"{loss.item():.2f}", end=", ")
+            loss = loss.item()
+            error.append(loss)
+        # ax = plt.plot(error, label=key)
+        plt.plot(
+            [i / (len(error) - (1 if len(error) > 1 else 0))
+            for i in range(len(error))],
+            error,
+            label=key,
+            marker=None,
+        )
+        # print()
+    plt.legend()
+    plt.title(
+        f"Diffusion model: {args.epochs} epochs, {args.num_train_timesteps} timesteps, {args.beta_schedule} schedule",
     )
-    # print()
-plt.legend()
-plt.title(
-    f"Diffusion model: {args.epochs} epochs, {args.num_train_timesteps} timesteps, {args.beta_schedule} schedule",
-)
-plt.xlabel("Evolution steps ratio")
-plt.ylabel("Chamfer distance")
-# ylog
-plt.yscale("log")
-store_dir = wandb.run.dir if not args.no_wandb else "/home/palakons/from_scratch"
-plt.savefig(
-    f"{store_dir}/diffusion_model_{args.epochs}_{args.num_train_timesteps}_{args.beta_schedule}.png"
-)
+    plt.xlabel("Evolution steps ratio")
+    plt.ylabel("Chamfer distance")
+    # ylog
+    plt.yscale("log")
+    # store_dir = wandb.run.dir if not args.no_wandb else "/home/palakons/from_scratch"
+    # plt.savefig(
+    #     f"{store_dir}/diffusion_model_{args.epochs}_{args.num_train_timesteps}_{args.beta_schedule}.png"
+    # )
+    wandb.log(
+        {
+            "plot": wandb.Image(plt),
+            "epoch": args.epochs,
+        }
+    )
 
 
-temp_dir = (
-    wandb.run.dir if not args.no_wandb else "/home/palakons/from_scratch"
-) + f"/evolutions"  # + f"/temp_{time.time()}"
-mkdir_cmd = f"mkdir -p {temp_dir}"
-os.system(mkdir_cmd)
+    # plot evolution
 
-# get GT  from dataloader
-gt_pc = next(iter(dataloader)).to(device)
-gt_pc = gt_pc * dataset.std.to(device) + dataset.mean.to(device)
-# print("gt_pc", gt_pc.shape) #gt_pc torch.Size([1, N*3])
-gt_pc = gt_pc.reshape(-1, 3)
-gt_pc = gt_pc.cpu().numpy()
+    key_to_plot = "step50"
+    
+
+    # get GT  from dataloader
+    gt_pc = next(iter(dataloader)).to(device) #one sample
+    gt_pc = gt_pc * dataset.std.to(device) + dataset.mean.to(device)
+    # print("gt_pc", gt_pc.shape) #gt_pc torch.Size([1, N*3])
+    gt_pc = gt_pc.reshape(-1, 3)
+    gt_pc = gt_pc.cpu().numpy()
+
+    key = key_to_plot
+    value = samples[key]
+
+    print(len(value[1]))
 
 
-for key, value in samples.items():
-    try:
-        temp = torch.stack(value[1], dim=0)
-        # print("temp", key, temp.shape)
-        samples_updated = temp.to(device) * dataset.std.to(
-            device
-        ) + dataset.mean.to(device)
-        # print("samples_updated", key, samples_updated.shape)
-    except:
-        print("error, maybe too larger", key)
-        continue
+    temp = torch.stack(value[1], dim=0)
+    # print("temp", key, temp.shape)
+    samples_updated = temp.to(device) * dataset.std.to(
+        device
+    ) + dataset.mean.to(device)
+    # print("samples_updated", key, samples_updated.shape)
     # print("samples_updated.reshape(-1,3).mean(dim=0)", samples_updated.reshape(-1,3).mean(dim=0))
     mean_coord_val = samples_updated.reshape(-1, 3).mean(dim=0).cpu()
     std_coord_val = samples_updated.reshape(-1, 3).std(dim=0).cpu()
@@ -580,56 +548,22 @@ for key, value in samples.items():
     # max_coord_val = max_coord_val.cpu()
     # print(key, "\tmin max, ", mean_coord_val, std_coord_val)
     for i, x in enumerate(samples_updated):
-        if i % args.visualize_freq != 0:
-            # print("skip", i)
-            continue
-        fig = plt.figure(figsize=(5, 5))
-        ax = fig.add_subplot(111, projection="3d")
-        # print("x",x.shape) #x torch.Size([1000, 3])
-
         x_shape = x.reshape(x.shape[0],-1, 3)
-        # print("x_shape",x_shape.shape) #x_shape torch.Size([1000, N, 3])
         x_shape = x_shape.cpu().numpy()
-        # small maeker
-        # ax.scatter(x[:, 0], x[:, 1], x[:, 2], label=f"{i}", marker=",")
-        #plot mwan of each point cloud
         x_mean =x_shape.mean(axis=0)
-        # print("x_mean", x_mean.shape) #x_mean (N, 3)
+        
+        #prepare 3d plot to be logged to wandb
+        #usign go
+        import plotly.graph_objects as go
+        fig = go.Figure(data=[go.Scatter3d(x=x_mean[:,0], y=x_mean[:,1], z=x_mean[:,2], mode='markers',name='sampled'),go.Scatter3d(x=gt_pc[:,0], y=gt_pc[:,1], z=gt_pc[:,2], mode='markers',name='gt')])
+                                           
+        #add legend
+        fig.update_layout(scene = dict(
+                    xaxis_title='X',
+                    yaxis_title='Y',
+                    zaxis_title='Z'),
+                    title=key)
+        wandb.log({f"evolution_{key}_{i*10}": wandb.Plotly(fig), "epoch": args.epochs})
+        
 
-        print("x_mean", x_mean)
-        print("gt_pc", gt_pc)
-        ax.scatter(x_mean[:, 0], x_mean[:, 1], x_mean[:, 2], label=f"{i}")
-        # plot gt
-        ax.scatter(gt_pc[:, 0], gt_pc[:, 1], gt_pc[:, 2],
-                   label="GT")
-
-        ax.set_title(
-            f"{i} {args.epochs} epochs, {args.num_train_timesteps} timesteps, {args.beta_schedule} schedule")
-        # equal
-        ax.set_aspect('equal')
-        # set min max
-        # sigma = 3
-        # ax.set_xlim(mean_coord_val[0]-sigma*std_coord_val[0], mean_coord_val[0]+sigma*std_coord_val[0])
-        # ax.set_ylim(mean_coord_val[1]-sigma*std_coord_val[1], mean_coord_val[1]+sigma*std_coord_val[1])
-        # ax.set_zlim(mean_coord_val[2]-sigma*std_coord_val[2], mean_coord_val[2]+sigma*std_coord_val[2])
-        ax.set_xlabel('X')
-        ax.set_ylabel('Y')
-        ax.set_zlabel('Z')
-        ax.legend()
-        plt.savefig(f"{temp_dir}/{key}_{i:06}.png")
-        # print(f"Save img at {temp_dir}/{key}_{i:06}.png")
-        plt.close()
-    # use ffmpeg to create video from image sorted by file name intemp_dir, 3Mbps video bitrate
-    # ffmpeg_cmd = f"ffmpeg -r 3 -i {temp_dir}/{key}_%06d.png  -pix_fmt yuv420p  -b:v 3M {temp_dir}/../{key}.mp4"
-    # print(ffmpeg_cmd)
-    # os.system(ffmpeg_cmd)
-    # print("video saved at", f"{temp_dir}/../{key}.mp4")
-    # remove images
-
-    # rm_cmd = f"rm {temp_dir}/{key}_*.png"
-    # os.system(rm_cmd)
-# # remove the empty dir
-# rm_cmd = f"rmdir {temp_dir}"
-# os.system(rm_cmd)
-if not args.no_wandb:
     wandb.finish()
