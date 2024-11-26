@@ -432,10 +432,6 @@ checkpoint = {
     "optimizer": optimizer.state_dict(),
     "args": args,
 }
-# save at /data/palakons/checkpoint/cp_{datetime.now().strftime("%Y%m%d-%H%M%S")}.pth
-checkpoint_fname = f"/data/palakons/checkpoint/cp_dm_{datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}.pth"
-torch.save(checkpoint, checkpoint_fname)
-print("checkpoint saved at", checkpoint_fname)
 
 
 losses = train_one_epoch(dataloader, model, optimizer, scheduler, criterion=criterion,
@@ -547,7 +543,7 @@ if not args.no_wandb:
     # min_coord_val = min_coord_val.cpu()
     # max_coord_val = max_coord_val.cpu()
     # print(key, "\tmin max, ", mean_coord_val, std_coord_val)
-    for i, x in enumerate(samples_updated):
+    for i, x in tqdm(enumerate(samples_updated)):
         x_shape = x.reshape(x.shape[0],-1, 3)
         x_shape = x_shape.cpu().numpy()
         x_mean =x_shape.mean(axis=0)
