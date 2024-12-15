@@ -1,9 +1,12 @@
+import pandas as pd
+from model.point_cloud_model import PointCloudModel
 import argparse
 import glob
 import os
 import time
 from datetime import datetime
 
+from pytorch3d.structures import Pointclouds
 import torch
 import torch.nn as nn
 from matplotlib import pyplot as plt
@@ -17,25 +20,71 @@ import wandb
 import numpy as np
 import random
 
+
 def set_seed(seed):
     torch.manual_seed(seed)
     random.seed(seed)
     np.random.seed(seed)
 
 
-# Dataset of n-dimensional point clouds
-class PointCloudDataset(Dataset):
-    def __init__(self, num_scene: int = 1000, num_points: int = 10):
+class PointCloudDataset(Dataset):  # normalized per axis, not per sample
+    def __init__(self, num_scene: int = 1000, num_points: int = 10,
+                 # add point_path, if none returns random
+                 point_path=None,  # point_path=None,
+                 ):
         super().__init__()
-        self.data = torch.randn(num_scene, num_points, 3) * torch.tensor([10, 100, 5])
-        print("data", self.data)
+        if point_path is not None:
+            point_path = point_path.split(",")
+            print("loading point cloud from", point_path[0])
+            # assert point_path is  a list
+            assert len(point_path) >= num_scene
+
+            if num_scene > 1:
+                raise ValueError("num_scene > 1 not supported, yet")
+
+            # load point cloud from point_path
+            # /data/palakons/dataset/astyx/scene/0/000000.txt
+            # load point cloud from point_path, as a text file, separate by space, use pandas
+            #
+            # X Y Z V_r Mag
+            # 0.108118820531769647 2.30565393293341492 -0.279097884893417358 0 48
+            # 1.18417095921774496 2.25506417530992165 -0.122170589864253998 0 48
+
+            # creat blank tensor dim (num_scene, num_points, 3)
+            self.data = torch.zeros(num_scene, num_points, 3)
+            # skip the first line
+            df = pd.read_csv(point_path[0], sep=" ",
+                             skip_blank_lines=True)
+            # keep only first 3 columns
+            df = df.iloc[:, :3]
+            # convert to tensor
+            temp_data = torch.tensor(df.values)
+            # if number of row < num_points, pick random row to fill
+            if temp_data.size(0) < num_points:
+                # pick random row
+                random_row = torch.randint(0, temp_data.size(
+                    0), (num_points - temp_data.size(0),))
+                # fill the rest with random row
+                temp_data = torch.cat([temp_data, temp_data[random_row]])
+            elif temp_data.size(0) > num_points:
+                # pick random row
+                random_row = torch.randint(0, temp_data.size(0), (num_points,))
+                temp_data = temp_data[random_row]
+
+            self.data[0, :, :] = temp_data
+
+        # Generate random point clouds
+        else:
+            self.data = torch.randn(num_scene, num_points, 3) * \
+                torch.tensor([10, 100, 5])
+        # print("data", self.data)
         self.mean = self.data.mean(dim=(0, 1))
         self.std = (
             self.data.std(dim=(0, 1))
             if num_scene * num_points > 1
             else torch.ones_like(self.mean)
         )
-        
+
         print("mean", self.mean, "std", self.std)
 
     def __len__(self) -> int:
@@ -45,11 +94,6 @@ class PointCloudDataset(Dataset):
         # Return pre-normalized data
         return (self.data[idx, :, :] - self.mean) / self.std
 
-# set_seed(42)
-# ds =PointCloudDataset(num_scene=1, num_points=3)
-# for i in ds:
-#     print(i)
-# exit()
 
 # Sinusoidal time embeddings
 
@@ -66,7 +110,7 @@ def get_sinusoidal_time_embedding(timesteps, embedding_dim):
 
 
 # Simple diffusion model with time embeddings concatenated to the data
-class SimpleDiffusionModel(nn.Module):
+class SimpleDiffusionModel3D(nn.Module):
     def __init__(
         self, data_dim, time_embedding_dim=16, hidden_dim=128, num_hidden_layers=6
     ):
@@ -85,30 +129,55 @@ class SimpleDiffusionModel(nn.Module):
         # Get time embeddings
         t_emb = get_sinusoidal_time_embedding(t, self.time_embedding_dim)
         # Concatenate x and t_emb
+        x = x.reshape(x.size(0), -1)
+        # print("x", x.shape, "t_emb", t_emb.shape)  #x torch.Size([1, 9]) t_emb torch.Size([1, 16])
         x_t = torch.cat([x, t_emb], dim=-1)
         # Pass through network
-        return self.net(x_t)
+        x_t = self.net(x_t)
+        return x_t.reshape(x.size(0), -1, 3)
 
 
-# CNN-based model
+#  PVCNN-Based
 
 
-class SimpleDiffusionModelCNN(nn.Module):
+class PVCNNDiffusionModel3D(nn.Module):
     def __init__(
-        self,
-        data_dim,
-        time_embedding_dim=16,
-        hidden_dim=128,
-        num_hidden_layers=6,
-        cnn_dim=64,
-        cnn_channels=1,
+        # pvcnnplusplus, pvcnn, simple
+        self, data_dim, point_cloud_model_embed_dim=64, point_cloud_model="pvcnn",
+            dropout=0.1,
+            width_multiplier=1,
+            voxel_resolution_multiplier=1,
     ):
         super().__init__()
 
-        # TODO: implement CNN-based model
+        self.in_channels = data_dim  # 3
+        self.out_channels = 3
+        self.scale_factor = 1.0
+        self.dropout = dropout
+        self.width_multiplier = width_multiplier
+        self.voxel_resolution_multiplier = voxel_resolution_multiplier
 
+        # Create point cloud model for processing point cloud at each diffusion step
+        self.point_cloud_model = PointCloudModel(
+            model_type=point_cloud_model,
+            embed_dim=point_cloud_model_embed_dim,
+            in_channels=self.in_channels,
+            out_channels=self.out_channels,
+            dropout=self.dropout,
+            width_multiplier=self.width_multiplier,
+            voxel_resolution_multiplier=self.voxel_resolution_multiplier,
+        )
 
-# https://discuss.pytorch.org/t/simple-implemetation-of-chamfer-distance-in-pytorch-for-2d-point-cloud-data/143083/2
+    def point_cloud_to_tensor(self, pc: Pointclouds, /, normalize: bool = False, scale: bool = False):
+        """Converts a point cloud to a tensor, with color if and only if self.predict_color"""
+        points = pc * (self.scale_factor if scale else 1)
+        return points
+
+    def forward(self, x, t):
+        # (B, N, 3) (B,) #x torch.Size([1, 100, 3]) t torch.Size([1])
+        x_t = self.point_cloud_model(x, t)
+
+        return x_t
 
 
 class PointCloudLoss(nn.Module):
@@ -132,20 +201,32 @@ class PointCloudLoss(nn.Module):
 
 
 # Training function
-def train_one_epoch(dataloader, model, optimizer, scheduler, criterion, device):
+def train_one_epoch(dataloader, model, optimizer, scheduler, args, criterion, device):
     model.train()
     losses = []
     for batch in dataloader:
         x = batch.to(device)
+        # print("x", x.shape)  # x torch.Size([1, 2, 3])
+        # expand dim 2 (last dim) from 3 to (3+ args.extra_channels ) with zero (one mroe channel)
+        x = torch.cat(
+            [x, torch.zeros((x.shape[0], x.shape[1], args.extra_channels)).to(device)], dim=-1)
+        # print("x", x.shape)  # x torch.Size([1, 2, 4])
+
+        # exit()
         timesteps = torch.randint(
             0, scheduler.config.num_train_timesteps, (x.size(0),), device=device
         ).long()
         noise = torch.randn_like(x)
+        # print("x", x.shape, "timesteps", timesteps.shape)
         noisy_x = scheduler.add_noise(x, noise, timesteps)
 
+        # print("noisy_x", noisy_x.shape, "timesteps", timesteps.shape)
+
         optimizer.zero_grad()
-        noisy_x = noisy_x.view(noisy_x.size(0), -1)
-        loss = criterion(model(noisy_x, timesteps).reshape(noise.shape), noise)
+        output = model(noisy_x, timesteps)
+        # print("output", output.shape)  # output torch.Size([1, 2, 3])
+        noise = noise[:, :, :3]
+        loss = criterion(output, noise)
         loss.backward()
         optimizer.step()
 
@@ -168,12 +249,12 @@ def train(
     checkpoint_fname = f"/data/palakons/checkpoint/cp_dm_{datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}.pth"
     for epoch in tqdm_range:
         losses = train_one_epoch(
-            dataloader, model, optimizer, scheduler, criterion, device
+            dataloader, model, optimizer, scheduler,  args, criterion, device
         )
         tqdm_range.set_description(f"loss: {sum(losses)/len(losses):.4f}")
         if not args.no_wandb:
             wandb.log({"loss": sum(losses) / len(losses), "epoch": epoch})
-        if epoch % args.checkpoint_freq == 0:
+        if not args.no_checkpoint and epoch % args.checkpoint_freq == 0:
             checkpoint = {
                 "model": model.state_dict(),
                 "optimizer": optimizer.state_dict(),
@@ -183,12 +264,12 @@ def train(
             torch.save(checkpoint, checkpoint_fname)
             print("checkpoint saved at", checkpoint_fname)
         if not args.no_wandb and epoch % args.visualize_freq == 0:
-            sampled_point,_ = sample(
+            sampled_point, _ = sample(
                 model,
-                scheduler,
+                scheduler, args,
                 sample_shape=(1, args.N, 3),
                 num_inference_steps=50,
-                evolution_freq=args.visualize_freq,
+                evolution_freq=args.evolution_freq,
                 device=device,
             )
             data_mean = dataloader.dataset.mean.to(device)
@@ -203,27 +284,29 @@ def train(
 
             sampled_point = sampled_point.cpu().numpy()
             gt_pc = gt_pc.cpu().numpy()
-            
-            
-            log_sample_to_wandb(sampled_point[0,:,:], gt_pc[0,:,:], f"for_visual", 50, epoch)
 
-    checkpoint = {
-        "model": model.state_dict(),
-        "optimizer": optimizer.state_dict(),
-        "args": args,
-    }
-    # save at /data/palakons/checkpoint/cp_{datetime.now().strftime("%Y%m%d-%H%M%S")}.pth
-    torch.save(checkpoint, checkpoint_fname)
-    print("checkpoint saved at", checkpoint_fname)
+            log_sample_to_wandb(
+                sampled_point[0, :, :], gt_pc[0,
+                                              :, :], f"for_visual", 50, epoch
+            )  # support M=1 only
+    if not args.no_checkpoint:
+        checkpoint = {
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "args": args,
+        }
+        # save at /data/palakons/checkpoint/cp_{datetime.now().strftime("%Y%m%d-%H%M%S")}.pth
+        torch.save(checkpoint, checkpoint_fname)
+        print("checkpoint saved at", checkpoint_fname)
 
     # print(f"Epoch {epoch+1} completed")
 
 
 # Sampling function
-@torch.no_grad()
+@ torch.no_grad()
 def sample(
     model,
-    scheduler,
+    scheduler, args,
     sample_shape,
     num_inference_steps=None,
     evolution_freq=None,
@@ -235,17 +318,30 @@ def sample(
 
     x = torch.randn(sample_shape, device=device)
     xs = []
-    for i,t in enumerate(tqdm(scheduler.timesteps.to(device), desc="Sampling")):
-        timesteps = torch.full((x.size(0),), t, device=device, dtype=torch.long)
-        x = x.reshape(x.size(0), -1)
-        x = scheduler.step(model(x, timesteps), t, x)[
-            "prev_sample"
-        ]
-        # print("sample_shape", sample_shape)
-        x=x.reshape(sample_shape)
+    for i, t in enumerate(tqdm(scheduler.timesteps.to(device), desc="Sampling")):
+        timesteps = torch.full(
+            (x.size(0),), t, device=device, dtype=torch.long)
+        # x = x.reshape(x.size(0), -1)
         # print("x", x.shape)
-        if evolution_freq is not None and i % evolution_freq == 0:
+        # exit()
+
+        x_4 = torch.cat(
+            [x, torch.zeros((x.shape[0], x.shape[1], args.extra_channels)).to(device)], dim=-1)
+        # print("x", x.shape, "timesteps", timesteps.shape)
+        output = model(x_4, timesteps)
+        # print("output", output.shape)  # output torch.Size([1, 2, 3])
+        # expanding outpu dim 2 (last dim) from 3 to 4 with zero (one mroe channel)
+
+        x = scheduler.step(output, t, x)["prev_sample"]
+        # print("sample_shape", sample_shape)
+        # x=x.reshape(sample_shape)
+        # print("x", x.shape)
+        if (
+            evolution_freq is not None and i % evolution_freq == 0
+        ) or i == num_inference_steps - 1:
             xs.append(x)
+    if num_inference_steps == 1:
+        xs.append(x)
     return x, xs
 
 
@@ -256,7 +352,8 @@ def parse_args():
     parser.add_argument(
         "--epochs", type=int, default=80, help="Number of training epochs"
     )
-    parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
+    parser.add_argument("--batch_size", type=int,
+                        default=32, help="Batch size")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument(
         "--N", type=int, default=1, help="Number of points in each point cloud"
@@ -273,18 +370,34 @@ def parse_args():
     parser.add_argument(
         "--beta_schedule", type=str, default="linear", help="Beta schedule"
     )
-    parser.add_argument("--no_wandb", action="store_true", help="Disable wandb logging")
+    parser.add_argument("--no_wandb", action="store_true",
+                        help="Disable wandb logging")
     parser.add_argument(
         "--visualize_freq", type=int, default=10, help="Visualize frequency"
     )
     parser.add_argument(
         "--n_hidden_layers", type=int, default=6, help="Number of hidden layers"
     )
-    parser.add_argument("--hidden_dim", type=int, default=128, help="Hidden dimension")
-    parser.add_argument("--loss_type", type=str, default="mse", help="Loss function")
-    parser.add_argument("--model", type=str, default="mlp", help="Model type")
+    parser.add_argument("--hidden_dim", type=int,
+                        default=128, help="Hidden dimension")
+    parser.add_argument("--loss_type", type=str,
+                        default="mse", help="Loss function")
+    parser.add_argument("--model", type=str,
+                        default="pvcnn", help="Model type")
     parser.add_argument(
         "--checkpoint_freq", type=int, default=100000, help="Checkpoint frequency"
+    )
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--no_checkpoint",
+                        action="store_true", help="No checkpoint")
+    parser.add_argument(
+        "--evolution_freq", type=int, default=10, help="Evolution frequency"
+    )
+    parser.add_argument(
+        "--extra_channels", type=int, default=0, help="Extra channels in PVCNN >=0"
+    )
+    parser.add_argument(
+        "--point_path", type=str, default=None, help="Path to point cloud"
     )
     return parser.parse_args()
 
@@ -295,7 +408,7 @@ def match_args(args1, args2):
     arga = vars(args1).copy()
     argb = vars(args2).copy()
     # remove checkpoint_freq,"epochs", "no_wandb" from both, if exist
-    for key in ["checkpoint_freq", "epochs", "no_wandb"]:
+    for key in ["checkpoint_freq", "epochs", "no_wandb", "no_checkpoint"]:
         if key in arga:
             del arga[key]
         if key in argb:
@@ -323,20 +436,18 @@ def match_args(args1, args2):
 
 
 def get_model(args, device="cpu"):
-    data_dim = args.N * 3
-    if args.model == "mlp":
-        return SimpleDiffusionModel(
+
+    if args.model == "mlp3d":
+        data_dim = args.N * 3
+        return SimpleDiffusionModel3D(
             data_dim=data_dim,
             time_embedding_dim=16,
             hidden_dim=args.hidden_dim,
             num_hidden_layers=args.n_hidden_layers,
         ).to(device)
-    elif args.model == "cnn":
-        return SimpleDiffusionModelCNN(
-            data_dim=data_dim,
-            hidden_dim=args.hidden_dim,
-            num_hidden_layers=args.n_hidden_layers,
-        ).to(device)
+    elif args.model == "pvcnn":
+        data_dim = args.extra_channels + 3
+        return PVCNNDiffusionModel3D(data_dim=data_dim,          point_cloud_model_embed_dim=args.hidden_dim, point_cloud_model="pvcnn",      dropout=0.1,            width_multiplier=1,            voxel_resolution_multiplier=1,).to(device)
     else:
         raise ValueError("model not supported")
 
@@ -373,7 +484,8 @@ def get_loss(args):
     else:
         raise ValueError("loss not supported")
 
-def log_sample_to_wandb(x, gt_pc, key, evo,epoch):
+
+def log_sample_to_wandb(x, gt_pc, key, evo, epoch):
     # x = x.cpu().numpy()
     # if gt_pc is not in cpu, move to cpu
     # gt_pc = gt_pc.cpu().numpy()
@@ -402,8 +514,15 @@ def log_sample_to_wandb(x, gt_pc, key, evo,epoch):
     )
     wandb.log({f"evolution_{key}_{evo}": wandb.Plotly(fig), "epoch": epoch})
 
+
 args = parse_args()
+if args.model != "pvcnn":
+    args.extra_channels = 0
+    print("extra_channels set to 0 for non-pvcnn model")
+else:
+    assert args.extra_channels >= 0, "extra_channels must be >=0 for pvcnn"
 print(args)
+set_seed(args.seed)
 
 
 if not args.no_wandb:
@@ -413,8 +532,11 @@ if not args.no_wandb:
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print("device", device)
-dataset = PointCloudDataset(num_scene=args.M, num_points=args.N)
+dataset = PointCloudDataset(
+    num_scene=args.M, num_points=args.N, point_path=args.point_path)
 dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
+
+# dataloader_train, dataloader_val, dataloader_vis = get_dataset(cfg)
 
 model = get_model(args, device=device)
 
@@ -430,20 +552,21 @@ scheduler = DDPMScheduler(
 CHECKPOINT_DIR = "/data/palakons/checkpoint"
 start_epoch = 0
 
-current_cp_fname = get_checkpoint_fname(args, CHECKPOINT_DIR)
-if current_cp_fname is not None:
-    current_cp = torch.load(current_cp_fname)
-    print("loading checkpoint",current_cp_fname)
-    model.load_state_dict(current_cp["model"])
-    optimizer.load_state_dict(current_cp["optimizer"])
-    start_epoch = current_cp["args"].epochs
-    print("start_epoch", start_epoch)
-    if not args.no_wandb:
-        wandb.run.summary.update(
-            {"start_epoch": start_epoch, "checkpoint": current_cp_fname}
-        )
-else:
-    print("no checkpoint found")
+if not args.no_checkpoint:
+    current_cp_fname = get_checkpoint_fname(args, CHECKPOINT_DIR)
+    if current_cp_fname is not None:
+        current_cp = torch.load(current_cp_fname)
+        print("loading checkpoint", current_cp_fname)
+        model.load_state_dict(current_cp["model"])
+        optimizer.load_state_dict(current_cp["optimizer"])
+        start_epoch = current_cp["args"].epochs
+        print("start_epoch", start_epoch)
+        if not args.no_wandb:
+            wandb.run.summary.update(
+                {"start_epoch": start_epoch, "checkpoint": current_cp_fname}
+            )
+    else:
+        print("no checkpoint found")
 
 criterion = get_loss(args)
 # Train the model
@@ -459,7 +582,7 @@ train(
 )
 
 losses = train_one_epoch(
-    dataloader, model, optimizer, scheduler, criterion=criterion, device=device
+    dataloader, model, optimizer, scheduler, args, criterion=criterion, device=device
 )
 if not args.no_wandb:
     wandb.log({"loss": sum(losses) / len(losses), "epoch": args.epochs - 1})
@@ -471,14 +594,13 @@ num_sample_points = 1
 samples = {}
 for i in [1, 5, 10, 50, 100]:
     samples[f"step{i}"] = sample(
-            model,
-            scheduler,
-            sample_shape=(num_sample_points, args.N, 3),
-            num_inference_steps=i,
-            evolution_freq=args.visualize_freq,
-            device=device,
-        )
-        
+        model,
+        scheduler, args,
+        sample_shape=(num_sample_points, args.N, 3),
+        num_inference_steps=i,
+        evolution_freq=args.evolution_freq,
+        device=device,
+    )
 
 
 # make the plot that will be logged to wandb
@@ -487,32 +609,46 @@ plt.figure(figsize=(10, 10))
 for key, value in samples.items():
     # print(samples[key][0].shape)
     # print("dataset.std",dataset.std.shape)
-    samples_updated = samples[key][0] * dataset.std.to(device) + dataset.mean.to(device)
+    samples_updated = samples[key][0] * \
+        dataset.std.to(device) + dataset.mean.to(device)
     # print("samples_updated", key, samples_updated.shape) #samples_updated step1 torch.Size([1, 1, 3])
     # #shape  dataset[:]
-    # print("dataset[:]", dataset[:].shape) #dataset[:] torch.Size([1, 1, 3])
-    loss, _ = chamfer_distance(
-        dataset[:].to(device) * dataset.std.to(device) + dataset.mean.to(device),
-        samples_updated.to(device),
-    )
-    print(key, "\t", f"CD: {loss.item():.2f}")
+    # print("dataset[:]", dataset[:].shape) #dataset[:] torch.Size([2, 1, 3])
+    cd_losses = []
+    for i in range(len(dataset)):
+        loss, _ = chamfer_distance(
+            dataset[i].unsqueeze(0).to(device) * dataset.std.to(device)
+            + dataset.mean.to(device),
+            samples_updated.to(device),
+        )
+        cd_losses.append(loss.item())
+
+    # log minumum loss
+
+    print(
+        key, "\t", f"CD: { min(cd_losses):.2f} at {cd_losses.index(min(cd_losses))}")
 
     if not args.no_wandb:
-        wandb.log({f"CD_{key}": loss.item(), "epoch": args.epochs})
+        wandb.log({f"CD_{key}": min(cd_losses), "epoch": args.epochs})
 
     error = []
+    assert len(samples[key][1]) > 1, "need more than 1 sample to plot"
     for x in samples[key][1]:
         x = x * dataset.std.to(device) + dataset.mean.to(device)
-        loss, _ = chamfer_distance(
-            dataset[:].to(device) * dataset.std.to(device) + dataset.mean.to(device),
-            x.to(device),
-        )
-        # print(f"{loss.item():.2f}", end=", ")
-        loss = loss.item()
-        error.append(loss)
+
+        cd_losses = []
+        for i in range(len(dataset)):
+            loss, _ = chamfer_distance(
+                dataset[i].unsqueeze(0).to(device) * dataset.std.to(device)
+                + dataset.mean.to(device),
+                x.to(device),
+            )
+            # print(f"{loss.item():.2f}", end=", ")
+            cd_losses.append(loss.item())
+        error.append(min(cd_losses))
     # ax = plt.plot(error, label=key)
     plt.plot(
-        [i / (len(error) - (1 if len(error) > 1 else 0)) for i in range(len(error))],
+        [i / (len(error) - 1) for i in range(len(error))],
         error,
         label=key,
         marker=None,
@@ -555,7 +691,8 @@ value = samples[key]
 
 temp = torch.stack(value[1], dim=0)
 # print("temp", key, temp.shape)
-samples_updated = temp.to(device) * dataset.std.to(device) + dataset.mean.to(device)
+samples_updated = temp.to(
+    device) * dataset.std.to(device) + dataset.mean.to(device)
 # print("samples_updated", key, samples_updated.shape)
 # print("samples_updated.reshape(-1,3).mean(dim=0)", samples_updated.reshape(-1,3).mean(dim=0))
 mean_coord_val = samples_updated.reshape(-1, 3).mean(dim=0).cpu()
@@ -564,13 +701,20 @@ std_coord_val = samples_updated.reshape(-1, 3).std(dim=0).cpu()
 # min_coord_val = min_coord_val.cpu()
 # max_coord_val = max_coord_val.cpu()
 # print(key, "\tmin max, ", mean_coord_val, std_coord_val)
-samples_updated = samples_updated.cpu().numpy() 
+samples_updated = samples_updated.cpu().numpy()
 
 if not args.no_wandb:
     for i, x in enumerate(samples_updated):
         # print("x", x.shape)
         # x_shape = x.reshape(x.shape[0], -1, 3)
-        log_sample_to_wandb(x[0,:,:], gt_pc, key, i*10, args.epochs)
+        log_sample_to_wandb(
+            x[0, :, :],
+            gt_pc,
+            key,
+            i * args.evolution_freq -
+            (1 if i == len(samples_updated) - 1 else 0),
+            args.epochs,
+        )
 
 if not args.no_wandb:
     wandb.finish()

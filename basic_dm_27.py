@@ -17,25 +17,25 @@ import wandb
 import numpy as np
 import random
 
+
 def set_seed(seed):
     torch.manual_seed(seed)
     random.seed(seed)
     np.random.seed(seed)
 
 
-# Dataset of n-dimensional point clouds
-class PointCloudDataset(Dataset):
+class PointCloudDataset(Dataset):  # normalized per axis, not per sample
     def __init__(self, num_scene: int = 1000, num_points: int = 10):
         super().__init__()
         self.data = torch.randn(num_scene, num_points, 3) * torch.tensor([10, 100, 5])
-        print("data", self.data)
+        # print("data", self.data)
         self.mean = self.data.mean(dim=(0, 1))
         self.std = (
             self.data.std(dim=(0, 1))
             if num_scene * num_points > 1
             else torch.ones_like(self.mean)
         )
-        
+
         print("mean", self.mean, "std", self.std)
 
     def __len__(self) -> int:
@@ -45,11 +45,6 @@ class PointCloudDataset(Dataset):
         # Return pre-normalized data
         return (self.data[idx, :, :] - self.mean) / self.std
 
-# set_seed(42)
-# ds =PointCloudDataset(num_scene=1, num_points=3)
-# for i in ds:
-#     print(i)
-# exit()
 
 # Sinusoidal time embeddings
 
@@ -66,7 +61,7 @@ def get_sinusoidal_time_embedding(timesteps, embedding_dim):
 
 
 # Simple diffusion model with time embeddings concatenated to the data
-class SimpleDiffusionModel(nn.Module):
+class SimpleDiffusionModel3D(nn.Module):
     def __init__(
         self, data_dim, time_embedding_dim=16, hidden_dim=128, num_hidden_layers=6
     ):
@@ -85,30 +80,15 @@ class SimpleDiffusionModel(nn.Module):
         # Get time embeddings
         t_emb = get_sinusoidal_time_embedding(t, self.time_embedding_dim)
         # Concatenate x and t_emb
+        x = x.reshape(x.size(0), -1)
+        # print("x", x.shape, "t_emb", t_emb.shape)  #x torch.Size([1, 9]) t_emb torch.Size([1, 16])
         x_t = torch.cat([x, t_emb], dim=-1)
         # Pass through network
-        return self.net(x_t)
+        x_t = self.net(x_t)
+        return x_t.reshape(x.size(0), -1, 3)
 
 
 # CNN-based model
-
-
-class SimpleDiffusionModelCNN(nn.Module):
-    def __init__(
-        self,
-        data_dim,
-        time_embedding_dim=16,
-        hidden_dim=128,
-        num_hidden_layers=6,
-        cnn_dim=64,
-        cnn_channels=1,
-    ):
-        super().__init__()
-
-        # TODO: implement CNN-based model
-
-
-# https://discuss.pytorch.org/t/simple-implemetation-of-chamfer-distance-in-pytorch-for-2d-point-cloud-data/143083/2
 
 
 class PointCloudLoss(nn.Module):
@@ -144,8 +124,7 @@ def train_one_epoch(dataloader, model, optimizer, scheduler, criterion, device):
         noisy_x = scheduler.add_noise(x, noise, timesteps)
 
         optimizer.zero_grad()
-        noisy_x = noisy_x.view(noisy_x.size(0), -1)
-        loss = criterion(model(noisy_x, timesteps).reshape(noise.shape), noise)
+        loss = criterion(model(noisy_x, timesteps), noise)
         loss.backward()
         optimizer.step()
 
@@ -173,7 +152,7 @@ def train(
         tqdm_range.set_description(f"loss: {sum(losses)/len(losses):.4f}")
         if not args.no_wandb:
             wandb.log({"loss": sum(losses) / len(losses), "epoch": epoch})
-        if epoch % args.checkpoint_freq == 0:
+        if not args.no_checkpoint and epoch % args.checkpoint_freq == 0:
             checkpoint = {
                 "model": model.state_dict(),
                 "optimizer": optimizer.state_dict(),
@@ -183,12 +162,12 @@ def train(
             torch.save(checkpoint, checkpoint_fname)
             print("checkpoint saved at", checkpoint_fname)
         if not args.no_wandb and epoch % args.visualize_freq == 0:
-            sampled_point,_ = sample(
+            sampled_point, _ = sample(
                 model,
                 scheduler,
                 sample_shape=(1, args.N, 3),
                 num_inference_steps=50,
-                evolution_freq=args.visualize_freq,
+                evolution_freq=args.evolution_freq,
                 device=device,
             )
             data_mean = dataloader.dataset.mean.to(device)
@@ -203,18 +182,19 @@ def train(
 
             sampled_point = sampled_point.cpu().numpy()
             gt_pc = gt_pc.cpu().numpy()
-            
-            
-            log_sample_to_wandb(sampled_point[0,:,:], gt_pc[0,:,:], f"for_visual", 50, epoch)
 
-    checkpoint = {
-        "model": model.state_dict(),
-        "optimizer": optimizer.state_dict(),
-        "args": args,
-    }
-    # save at /data/palakons/checkpoint/cp_{datetime.now().strftime("%Y%m%d-%H%M%S")}.pth
-    torch.save(checkpoint, checkpoint_fname)
-    print("checkpoint saved at", checkpoint_fname)
+            log_sample_to_wandb(
+                sampled_point[0, :, :], gt_pc[0, :, :], f"for_visual", 50, epoch
+            )  # support M=1 only
+    if not args.no_checkpoint:
+        checkpoint = {
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "args": args,
+        }
+        # save at /data/palakons/checkpoint/cp_{datetime.now().strftime("%Y%m%d-%H%M%S")}.pth
+        torch.save(checkpoint, checkpoint_fname)
+        print("checkpoint saved at", checkpoint_fname)
 
     # print(f"Epoch {epoch+1} completed")
 
@@ -235,17 +215,19 @@ def sample(
 
     x = torch.randn(sample_shape, device=device)
     xs = []
-    for i,t in enumerate(tqdm(scheduler.timesteps.to(device), desc="Sampling")):
+    for i, t in enumerate(tqdm(scheduler.timesteps.to(device), desc="Sampling")):
         timesteps = torch.full((x.size(0),), t, device=device, dtype=torch.long)
-        x = x.reshape(x.size(0), -1)
-        x = scheduler.step(model(x, timesteps), t, x)[
-            "prev_sample"
-        ]
+        # x = x.reshape(x.size(0), -1)
+        x = scheduler.step(model(x, timesteps), t, x)["prev_sample"]
         # print("sample_shape", sample_shape)
-        x=x.reshape(sample_shape)
+        # x=x.reshape(sample_shape)
         # print("x", x.shape)
-        if evolution_freq is not None and i % evolution_freq == 0:
+        if (
+            evolution_freq is not None and i % evolution_freq == 0
+        ) or i == num_inference_steps - 1:
             xs.append(x)
+    if num_inference_steps ==1:
+        xs.append(x)
     return x, xs
 
 
@@ -282,9 +264,14 @@ def parse_args():
     )
     parser.add_argument("--hidden_dim", type=int, default=128, help="Hidden dimension")
     parser.add_argument("--loss_type", type=str, default="mse", help="Loss function")
-    parser.add_argument("--model", type=str, default="mlp", help="Model type")
+    parser.add_argument("--model", type=str, default="mlp3d", help="Model type")
     parser.add_argument(
         "--checkpoint_freq", type=int, default=100000, help="Checkpoint frequency"
+    )
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--no_checkpoint", action="store_true", help="No checkpoint")
+    parser.add_argument(
+        "--evolution_freq", type=int, default=10, help="Evolution frequency"
     )
     return parser.parse_args()
 
@@ -295,7 +282,7 @@ def match_args(args1, args2):
     arga = vars(args1).copy()
     argb = vars(args2).copy()
     # remove checkpoint_freq,"epochs", "no_wandb" from both, if exist
-    for key in ["checkpoint_freq", "epochs", "no_wandb"]:
+    for key in ["checkpoint_freq", "epochs", "no_wandb", "no_checkpoint"]:
         if key in arga:
             del arga[key]
         if key in argb:
@@ -324,16 +311,10 @@ def match_args(args1, args2):
 
 def get_model(args, device="cpu"):
     data_dim = args.N * 3
-    if args.model == "mlp":
-        return SimpleDiffusionModel(
+    if args.model == "mlp3d":
+        return SimpleDiffusionModel3D(
             data_dim=data_dim,
             time_embedding_dim=16,
-            hidden_dim=args.hidden_dim,
-            num_hidden_layers=args.n_hidden_layers,
-        ).to(device)
-    elif args.model == "cnn":
-        return SimpleDiffusionModelCNN(
-            data_dim=data_dim,
             hidden_dim=args.hidden_dim,
             num_hidden_layers=args.n_hidden_layers,
         ).to(device)
@@ -373,7 +354,8 @@ def get_loss(args):
     else:
         raise ValueError("loss not supported")
 
-def log_sample_to_wandb(x, gt_pc, key, evo,epoch):
+
+def log_sample_to_wandb(x, gt_pc, key, evo, epoch):
     # x = x.cpu().numpy()
     # if gt_pc is not in cpu, move to cpu
     # gt_pc = gt_pc.cpu().numpy()
@@ -402,8 +384,10 @@ def log_sample_to_wandb(x, gt_pc, key, evo,epoch):
     )
     wandb.log({f"evolution_{key}_{evo}": wandb.Plotly(fig), "epoch": epoch})
 
+
 args = parse_args()
 print(args)
+set_seed(args.seed)
 
 
 if not args.no_wandb:
@@ -430,20 +414,21 @@ scheduler = DDPMScheduler(
 CHECKPOINT_DIR = "/data/palakons/checkpoint"
 start_epoch = 0
 
-current_cp_fname = get_checkpoint_fname(args, CHECKPOINT_DIR)
-if current_cp_fname is not None:
-    current_cp = torch.load(current_cp_fname)
-    print("loading checkpoint",current_cp_fname)
-    model.load_state_dict(current_cp["model"])
-    optimizer.load_state_dict(current_cp["optimizer"])
-    start_epoch = current_cp["args"].epochs
-    print("start_epoch", start_epoch)
-    if not args.no_wandb:
-        wandb.run.summary.update(
-            {"start_epoch": start_epoch, "checkpoint": current_cp_fname}
-        )
-else:
-    print("no checkpoint found")
+if not args.no_checkpoint:
+    current_cp_fname = get_checkpoint_fname(args, CHECKPOINT_DIR)
+    if current_cp_fname is not None:
+        current_cp = torch.load(current_cp_fname)
+        print("loading checkpoint", current_cp_fname)
+        model.load_state_dict(current_cp["model"])
+        optimizer.load_state_dict(current_cp["optimizer"])
+        start_epoch = current_cp["args"].epochs
+        print("start_epoch", start_epoch)
+        if not args.no_wandb:
+            wandb.run.summary.update(
+                {"start_epoch": start_epoch, "checkpoint": current_cp_fname}
+            )
+    else:
+        print("no checkpoint found")
 
 criterion = get_loss(args)
 # Train the model
@@ -471,14 +456,13 @@ num_sample_points = 1
 samples = {}
 for i in [1, 5, 10, 50, 100]:
     samples[f"step{i}"] = sample(
-            model,
-            scheduler,
-            sample_shape=(num_sample_points, args.N, 3),
-            num_inference_steps=i,
-            evolution_freq=args.visualize_freq,
-            device=device,
-        )
-        
+        model,
+        scheduler,
+        sample_shape=(num_sample_points, args.N, 3),
+        num_inference_steps=i,
+        evolution_freq=args.evolution_freq,
+        device=device,
+    )
 
 
 # make the plot that will be logged to wandb
@@ -490,29 +474,41 @@ for key, value in samples.items():
     samples_updated = samples[key][0] * dataset.std.to(device) + dataset.mean.to(device)
     # print("samples_updated", key, samples_updated.shape) #samples_updated step1 torch.Size([1, 1, 3])
     # #shape  dataset[:]
-    # print("dataset[:]", dataset[:].shape) #dataset[:] torch.Size([1, 1, 3])
-    loss, _ = chamfer_distance(
-        dataset[:].to(device) * dataset.std.to(device) + dataset.mean.to(device),
-        samples_updated.to(device),
-    )
-    print(key, "\t", f"CD: {loss.item():.2f}")
+    # print("dataset[:]", dataset[:].shape) #dataset[:] torch.Size([2, 1, 3])
+    cd_losses = []
+    for i in range(len(dataset)):
+        loss, _ = chamfer_distance(
+            dataset[i].unsqueeze(0).to(device) * dataset.std.to(device)
+            + dataset.mean.to(device),
+            samples_updated.to(device),
+        )
+        cd_losses.append(loss.item())
+
+    # log minumum loss
+
+    print(key, "\t", f"CD: { min(cd_losses):.2f} at {cd_losses.index(min(cd_losses))}")
 
     if not args.no_wandb:
-        wandb.log({f"CD_{key}": loss.item(), "epoch": args.epochs})
+        wandb.log({f"CD_{key}": min(cd_losses), "epoch": args.epochs})
 
     error = []
+    assert len(samples[key][1]) > 1, "need more than 1 sample to plot"
     for x in samples[key][1]:
         x = x * dataset.std.to(device) + dataset.mean.to(device)
-        loss, _ = chamfer_distance(
-            dataset[:].to(device) * dataset.std.to(device) + dataset.mean.to(device),
-            x.to(device),
-        )
-        # print(f"{loss.item():.2f}", end=", ")
-        loss = loss.item()
-        error.append(loss)
+
+        cd_losses = []
+        for i in range(len(dataset)):
+            loss, _ = chamfer_distance(
+                dataset[i].unsqueeze(0).to(device) * dataset.std.to(device)
+                + dataset.mean.to(device),
+                x.to(device),
+            )
+            # print(f"{loss.item():.2f}", end=", ")
+            cd_losses.append(loss.item())
+        error.append(min(cd_losses))
     # ax = plt.plot(error, label=key)
     plt.plot(
-        [i / (len(error) - (1 if len(error) > 1 else 0)) for i in range(len(error))],
+        [i / (len(error) - 1) for i in range(len(error))],
         error,
         label=key,
         marker=None,
@@ -564,13 +560,19 @@ std_coord_val = samples_updated.reshape(-1, 3).std(dim=0).cpu()
 # min_coord_val = min_coord_val.cpu()
 # max_coord_val = max_coord_val.cpu()
 # print(key, "\tmin max, ", mean_coord_val, std_coord_val)
-samples_updated = samples_updated.cpu().numpy() 
+samples_updated = samples_updated.cpu().numpy()
 
 if not args.no_wandb:
     for i, x in enumerate(samples_updated):
         # print("x", x.shape)
         # x_shape = x.reshape(x.shape[0], -1, 3)
-        log_sample_to_wandb(x[0,:,:], gt_pc, key, i*10, args.epochs)
+        log_sample_to_wandb(
+            x[0, :, :],
+            gt_pc,
+            key,
+            i * args.evolution_freq - (1 if i == len(samples_updated) - 1 else 0),
+            args.epochs,
+        )
 
 if not args.no_wandb:
     wandb.finish()
