@@ -80,7 +80,7 @@ def train(
                 args,
                 model,
                 dataloader,
-                num_batches=1, 
+                num_batches=1,
                 ever_k=args.num_time_steps_to_visualize,
                 # output_dir="/data/palakons/dataset/vis",
                 output_dir="vis",
@@ -97,7 +97,8 @@ def train(
                 # print("gt.shape", gt.shape)
 
                 criteria = nn.MSELoss(reduction="mean")
-                newloss = criteria(output.points_padded().reshape(-1,3).to("cpu") , batch[0].reshape(-1,3).to("cpu")).item()
+                newloss = criteria(output.points_padded(
+                ).reshape(-1, 3).to("cpu"), batch[0].reshape(-1, 3).to("cpu")).item()
                 # print("newloss", newloss)
                 wandb.log({"sampling_loss": newloss, "epoch": epoch})
                 fig = go.Figure(
@@ -244,7 +245,8 @@ def parse_args():
     parser.add_argument(
         "--epochs", type=int, default=80, help="Number of training epochs"
     )
-    parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
+    parser.add_argument("--batch_size", type=int,
+                        default=32, help="Batch size")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument(
         "--N", type=int, default=1000, help="Number of points in each point cloud"
@@ -252,7 +254,8 @@ def parse_args():
     parser.add_argument(
         "--M", type=int, default=1, help="Number of point cloud scenes to load"
     )
-    parser.add_argument("--config", type=str, help="Path to config file (optional)")
+    parser.add_argument("--config", type=str,
+                        help="Path to config file (optional)")
     parser.add_argument("--no_wandb", action="store_true", help="Log to wandb")
     parser.add_argument(
         "--n_hidden_layers", type=int, default=1, help="Number of hidden layers"
@@ -269,7 +272,8 @@ def parse_args():
     parser.add_argument(
         "--num_time_steps", type=int, default=100, help="Number of time steps"
     )
-    parser.add_argument( "--num_time_steps_to_visualize", type=int, default=10, help="Number of time steps to visualize")
+    parser.add_argument("--num_time_steps_to_visualize", type=int,
+                        default=10, help="Number of time steps to visualize")
     parser.add_argument(
         "--ema_decay",
         type=float,
@@ -277,10 +281,13 @@ def parse_args():
         help="Exponential moving average decay",
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--start_epoch", type=int, default=0, help="Start epoch")
+    parser.add_argument("--start_epoch", type=int,
+                        default=0, help="Start epoch")
 
-    parser.add_argument("--beta_start", type=float, default=1e-5, help="Beta start")
-    parser.add_argument("--beta_end", type=float, default=8e-3, help="Beta end")
+    parser.add_argument("--beta_start", type=float,
+                        default=1e-5, help="Beta start")
+    parser.add_argument("--beta_end", type=float,
+                        default=8e-3, help="Beta end")
     parser.add_argument(
         "--beta_schedule", type=str, default="linear", help="Beta schedule"
     )
@@ -373,13 +380,42 @@ def main():
         not args.no_wandb,
         args,
     )
+    output, all_outputs = visualize(
+        args,
+        model,
+        dataloader,
+        num_batches=1,
+        ever_k=args.num_time_steps_to_visualize,
+        # output_dir="/data/palakons/dataset/vis",
+        output_dir="vis",
+    )
+    # take real data
+    data = next(iter(dataloader))
+    gt = data.detach().cpu().numpy()
+    sampled_point_cloud = output.points_padded().detach().cpu().numpy()
+    # print("gt.shape", gt.shape)  # gt.shape (1, 1000, 3)
+    # print("output.points_padded().shape", output.points_padded().shape)
+    # output.points_padded().shape torch.Size([1, 1000, 3])
 
-    # Sample New Point Cloud
+    # mean adn std for gt
+    gt_mean = gt.mean(axis=1)
+    gt_std = gt.std(axis=1)
+    # print("gt_mean.shape", gt_mean.shape)  # gt_mean.shape (1, 3)
+    # print("gt_std.shape", gt_std.shape)  # gt_std.shape (1, 3)
+    print("gt_mean", gt_mean, "gt_std", gt_std)
+    # mean adn std for output
+    output_mean = sampled_point_cloud.mean(axis=1)
+    output_std = sampled_point_cloud.std(axis=1)
+    # print("output_mean.shape", output_mean.shape)  # output_mean.shape (1, 3)
+    # print("output_std.shape", output_std.shape)  # output_std.shape (1, 3)
+    print("output_mean", output_mean, "output_std", output_std)
+    # for each in all_outputs
+    for i, o in enumerate(all_outputs):
+        o_pc = o.points_padded().detach().cpu().numpy()
+        o_mean = o_pc.mean(axis=1)
+        o_std = o_pc.std(axis=1)
+        print(f"evolution {i} mean", o_mean, f"evolution {i} std", o_std)
 
-    # sampled_point_cloud = sample(model, args.N)
-
-    # #sacle back to original scale
-    # sampled_point_cloud = sampled_point_cloud.cpu().numpy() * dataset.sigma + dataset.mu
     if not args.no_wandb:
         wandb.finish()
 

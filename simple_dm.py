@@ -39,7 +39,8 @@ class PointCloudDiffusionModel(nn.Module):
         # Create diffusion model schedulers which define the sampling timesteps
         scheduler_kwargs = {}
         scheduler_kwargs.update(
-            dict(beta_start=beta_start, beta_end=beta_end, beta_schedule=beta_schedule)
+            dict(beta_start=beta_start, beta_end=beta_end,
+                 beta_schedule=beta_schedule)
         )
         self.schedulers_map = {
             "ddpm": DDPMScheduler(**scheduler_kwargs, clip_sample=False),
@@ -137,7 +138,8 @@ class PointCloudDiffusionModel(nn.Module):
         # eta (η) is only used with the DDIMScheduler, it will be ignored for other schedulers.
         # eta corresponds to η in DDIM paper: https://arxiv.org/abs/2010.02502
         # and should be between [0, 1]
-        accepts_eta = "eta" in set(inspect.signature(scheduler.step).parameters.keys())
+        accepts_eta = "eta" in set(inspect.signature(
+            scheduler.step).parameters.keys())
         extra_step_kwargs = {"eta": eta} if accepts_eta else {}
 
         # Loop over timesteps
@@ -158,12 +160,17 @@ class PointCloudDiffusionModel(nn.Module):
             # noise_pred = self.point_cloud_model(
             #     x_t_input, t.reshape(1).expand(B))
             input_xt = torch.cat([x_t], dim=1).to(self.device)
+            # add time embedding
             input_t = torch.Tensor([t]).long().to(self.device)
+
+            # print("input_xt", input_xt.shape, input_t.shape) #input_xt torch.Size([1, 6]) torch.Size([1])
 
             noise_pred = self.point_cloud_block_model(input_xt, input_t)
             # print("noise_pred",noise_pred.shape) noise_pred torch.Size([1, 3000])
             # Step
-            x_t = scheduler.step(noise_pred, t, x_t, **extra_step_kwargs).prev_sample
+            x_t = scheduler.step(noise_pred, t, x_t,   **extra_step_kwargs
+                                 ).prev_sample
+            # pred_original_sample
 
             # Append to output list if desired
             # print(return_all_outputs ,
@@ -182,7 +189,7 @@ class PointCloudDiffusionModel(nn.Module):
         if return_all_outputs:
             # ( sample_steps, N, D)
             all_outputs = torch.stack(all_outputs, dim=0)
-            # print("all_outputs", all_outputs.shape) #ll_outputs torch.Size([11, 1, 1000, 3])   
+            # print("all_outputs", all_outputs.shape) #ll_outputs torch.Size([11, 1, 1000, 3])
             all_outputs = [
                 self.tensor_to_point_cloud(o)
                 for o in all_outputs
@@ -213,7 +220,8 @@ class SinusoidalEmbeddings(nn.Module):
         super().__init__()
         position = torch.arange(time_steps).unsqueeze(1).float()
         div = torch.exp(
-            torch.arange(0, embed_dim, 2).float() * -(math.log(10000.0) / embed_dim)
+            torch.arange(0, embed_dim, 2).float() * -
+            (math.log(10000.0) / embed_dim)
         )
         embeddings = torch.zeros(time_steps, embed_dim, requires_grad=False)
         embeddings[:, 0::2] = torch.sin(position * div)
@@ -231,7 +239,8 @@ class SinusoidalEmbeddings(nn.Module):
 class DDPM_Scheduler(nn.Module):
     def __init__(self, num_time_steps: int = 1000):
         super().__init__()
-        self.beta = torch.linspace(1e-4, 0.02, num_time_steps, requires_grad=False)
+        self.beta = torch.linspace(
+            1e-4, 0.02, num_time_steps, requires_grad=False)
         alpha = 1 - self.beta
         self.alpha = torch.cumprod(alpha, dim=0).requires_grad_(False)
         self.num_time_steps = num_time_steps
@@ -260,8 +269,10 @@ class BetaDerivatives:
 
         # calculations required for diffusion q(x_t | x_{t-1}) and others
         self.sqrt_alphas_cumprod = torch.sqrt(self.alphas_cumprod)
-        self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - self.alphas_cumprod)
-        self.log_one_minus_alphas_cumprod = torch.log(1.0 - self.alphas_cumprod)
+        self.sqrt_one_minus_alphas_cumprod = torch.sqrt(
+            1.0 - self.alphas_cumprod)
+        self.log_one_minus_alphas_cumprod = torch.log(
+            1.0 - self.alphas_cumprod)
 
     def _gather(self, a, t):
         """
@@ -307,7 +318,8 @@ def get_beta_schedule(schedule_type, beta_start, beta_end, num_diffusion_timeste
         return torch.linspace(beta_start, beta_end, num_diffusion_timesteps)
     elif schedule_type == "quadratic":
         return (
-            torch.linspace(beta_start**0.5, beta_end**0.5, num_diffusion_timesteps) ** 2
+            torch.linspace(beta_start**0.5, beta_end**0.5,
+                           num_diffusion_timesteps) ** 2
         )
     elif schedule_type == "cosine":
         timesteps = torch.linspace(
@@ -345,7 +357,8 @@ def get_timestep_embedding(timesteps, embedding_dim):
 
     # Compute frequencies for the sinusoidal embeddings
     frequencies = torch.exp(
-        -math.log(10000) * torch.arange(0, half_dim, dtype=torch.float32) / half_dim
+        -math.log(10000) * torch.arange(0, half_dim,
+                                        dtype=torch.float32) / half_dim
     ).to(timesteps.device)
     # Create sinusoidal embeddings
     sinusoidal_embedding = torch.outer(
@@ -397,14 +410,17 @@ class SimpleDiffusionBlock(nn.Module):
         num_time_steps,
         n_hidden_layers=1,
         require_time_embedding=True,
+
     ):
         super(SimpleDiffusionBlock, self).__init__()
-        self.fc1 = nn.Linear(N * 3, hidden_dim)
+        self.time_embedding_dim = 4
+        self.fc1 = nn.Linear(N * 3+self.time_embedding_dim, hidden_dim)
         self.hidden = nn.ModuleList()
         for i in range(n_hidden_layers):
             self.hidden.append(nn.Linear(hidden_dim, hidden_dim))
         self.fc3 = nn.Linear(hidden_dim, N * 3)
-        self.timestep_embedding = SinusoidalEmbeddings(num_time_steps, embed_dim=N * 3)
+        self.timestep_embedding = SinusoidalEmbeddings(
+            num_time_steps, embed_dim=self.time_embedding_dim)
         self.require_time_embedding = require_time_embedding
 
     def forward(self, x, t):  # 1.0133
@@ -412,7 +428,11 @@ class SimpleDiffusionBlock(nn.Module):
         if self.require_time_embedding:
             x = x.reshape(x.shape[0], -1)
             t_embedding = self.timestep_embedding(x, t)
-            x = x + t_embedding
+            # x = x + t_embedding
+            x = torch.cat([x, t_embedding], dim=1)
+            # x,t torch.Size([1, 10]) torch.Size([1, 4])
+            # x,t torch.Size([1, 10]) torch.Size([1, 4])
+            # print("x,t", x.size(), t_embedding.size())#x, t torch.Size([1, 10]) torch.Size([1, 4])
         # Forward pass through the network
         x = F.relu(self.fc1(x))
         for layer in self.hidden:
@@ -436,7 +456,8 @@ class SimpleDiffusion(nn.Module):
         for i in range(n_hidden_layers):
             self.hidden.append(nn.Linear(hidden_dim, hidden_dim))
         self.fc3 = nn.Linear(hidden_dim, N * 3)
-        self.timestep_embedding = SinusoidalEmbeddings(num_time_steps, embed_dim=N * 3)
+        self.timestep_embedding = SinusoidalEmbeddings(
+            num_time_steps, embed_dim=N * 3)
         self.require_time_embedding = require_time_embedding
 
     def forward_2(self, x, t):  # 1.0143
