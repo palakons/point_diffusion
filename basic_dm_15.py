@@ -421,7 +421,8 @@ def parse_args():
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--no_checkpoint",
-                        action="store_true", help="No checkpoint")
+                        # action="store_true",
+                          help="No checkpoint")
     parser.add_argument(
         "--evolution_freq", type=int, default=10, help="Evolution frequency"
     )
@@ -558,7 +559,7 @@ set_seed(args.seed)
 
 
 if not args.no_wandb:
-    wandb.init(project="point_cloud_diffusion", config=vars(args))
+    wandb.init(project="point_cloud_diffusion", config=vars(args),settings=wandb.Settings(_service_wait=3000))
 # Set up device, dataset, dataloader, model, optimizer, and scheduler
 
 
