@@ -1,6 +1,6 @@
 import pandas as pd
 import argparse
-import open3d as o3d
+# import open3d as o3d
 import glob
 from datetime import datetime
 
@@ -61,8 +61,8 @@ class PointCloudDataset(Dataset):  # normalized per axis, not per sample
                 temp_data = torch.tensor(df.values)
             elif point_path[0].endswith(".ply"):
                 # load ply file
-
-                pcd = o3d.io.read_point_cloud(point_path[0])
+                raise ValueError("only support txt files")
+                # pcd = o3d.io.read_point_cloud(point_path[0])
 
                 # Print basic information about the point cloud
                 # print(pcd)
