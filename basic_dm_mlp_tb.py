@@ -482,8 +482,8 @@ def log_sample_to_tb(x, gt_pc, key, evo, epoch):
 
     all_tensor = torch.cat([sampled_tensor, gt_pc_tensor], dim=0)
 
-    color_sampled = torch.tensor([[1, 0, 0] for _ in range(sampled_tensor.shape[0])]) #color: red
-    color_gt = torch.tensor([[0, 1, 0] for _ in range(gt_pc_tensor.shape[0])]) #color: green
+    color_sampled = torch.tensor([[255, 0, 0] for _ in range(sampled_tensor.shape[0])]) #color: red
+    color_gt = torch.tensor([[0, 255, 0] for _ in range(gt_pc_tensor.shape[0])]) #color: green
 
     all_color = torch.cat([color_sampled, color_gt], dim=0)
     # print("shape", all_tensor.shape, all_color.shape)
@@ -492,6 +492,7 @@ def log_sample_to_tb(x, gt_pc, key, evo, epoch):
     all_color = all_color.unsqueeze(0)
     writer.add_mesh(f"PointCloud_{key}_{evo}", vertices=all_tensor, colors=all_color, 
                     global_step=epoch)
+    
 
 
 
@@ -506,7 +507,7 @@ set_seed(args.seed)
 
 
 if not args.no_tensorboard:
-    writer = SummaryWriter(log_dir=args.tb_log_dir)
+    writer = SummaryWriter(log_dir=args.tb_log_dir+f"/{datetime.now().strftime('%Y-%m-%d-%H-%M-%S.%f')}")
 # Set up device, dataset, dataloader, model, optimizer, and scheduler
 
 
