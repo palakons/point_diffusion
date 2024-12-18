@@ -646,6 +646,7 @@ if not args.no_tensorboard:
     writer.add_figure( f"Evolution",plt.gcf(), args.epochs)
     plt.close()
 
+print("done evo plots")
 # plot evolution
 
 key_to_plot = "step50"
@@ -677,6 +678,7 @@ samples_updated = samples_updated.cpu().numpy()
 
 if not args.no_tensorboard:
     for i, x in enumerate(samples_updated):
+        print("working on", i)
         # print("x", x.shape)
         # x_shape = x.reshape(x.shape[0], -1, 3)
         log_sample_to_tb(
