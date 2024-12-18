@@ -508,7 +508,8 @@ set_seed(args.seed)
 
 if not args.no_tensorboard:
     writer = SummaryWriter(log_dir=args.tb_log_dir+f"/{datetime.now().strftime('%Y-%m-%d-%H-%M-%S.%f')}")
-# Set up device, dataset, dataloader, model, optimizer, and scheduler
+
+        
 
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -564,6 +565,7 @@ train(
 losses = train_one_epoch(
     dataloader, model, optimizer, scheduler, args, criterion=criterion, device=device
 )
+metric_dict = {"Loss": sum(losses) / len(losses)}
 if not args.no_tensorboard:
     writer.add_scalar("Loss/epoch", sum(losses) / len(losses), args.epochs - 1)
 
@@ -608,9 +610,11 @@ if not args.no_tensorboard:
 
         print(
             key, "\t", f"CD: { min(cd_losses):.2f} at {cd_losses.index(min(cd_losses))}")
-
         if not args.no_tensorboard:
             writer.add_scalar(f"CD_{key}", min(cd_losses), args.epochs)
+            
+            #add cd to metric_dict
+            metric_dict = {**{f"CD_{key}": min(cd_losses)},**metric_dict}
 
         error = []
         assert len(samples[key][1]) > 1, "need more than 1 sample to plot"
@@ -691,4 +695,6 @@ if not args.no_tensorboard:
         )
 
 if not args.no_tensorboard:
+    hparam_dict = vars(args)
+    writer.add_hparams(hparam_dict, metric_dict)
     writer.close()
