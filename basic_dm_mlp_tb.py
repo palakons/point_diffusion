@@ -361,7 +361,7 @@ def parse_args():
                         default=False,
                         help="Disable tensorboard logging")
     parser.add_argument(
-        "--visualize_freq", type=int, default=10, help="Visualize frequency"
+        "--visualize_freq", type=int, default=1000, help="Visualize frequency"
     )
     parser.add_argument(
         "--n_hidden_layers", type=int, default=4, help="Number of hidden layers"
@@ -486,8 +486,12 @@ def log_sample_to_tb(x, gt_pc, key, evo, epoch):
     color_gt = torch.tensor([[0, 1, 0] for _ in range(gt_pc_tensor.shape[0])]) #color: green
 
     all_color = torch.cat([color_sampled, color_gt], dim=0)
-    
-    writer.add_mesh(f"PointCloud_{key}_{evo}", vertices=all_tensor, colors=all_color, global_step=epoch)
+    # print("shape", all_tensor.shape, all_color.shape)
+    #add dimension to tensor to dim 0
+    all_tensor = all_tensor.unsqueeze(0)
+    all_color = all_color.unsqueeze(0)
+    writer.add_mesh(f"PointCloud_{key}_{evo}", vertices=all_tensor, colors=all_color, 
+                    global_step=epoch)
 
 
 
