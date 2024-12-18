@@ -677,8 +677,7 @@ std_coord_val = samples_updated.reshape(-1, 3).std(dim=0).cpu()
 samples_updated = samples_updated.cpu().numpy()
 
 if not args.no_tensorboard:
-    for i, x in enumerate(samples_updated):
-        print("working on", i)
+    for i, x in tqdm(enumerate(samples_updated)):
         # print("x", x.shape)
         # x_shape = x.reshape(x.shape[0], -1, 3)
         log_sample_to_tb(
