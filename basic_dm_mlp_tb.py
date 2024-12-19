@@ -24,11 +24,15 @@ def set_seed(seed):
 
 
 class PointCloudDataset(Dataset):  # normalized per axis, not per sample
-    def __init__(self, num_scene: int = 1000, num_points: int = 10,
-                 # add point_path, if none returns random
-                 point_path=None,  # point_path=None,
+    def __init__(self, args
                  ):
         super().__init__()
+        num_points = args.N
+        num_scene = args.M
+        point_path = args.point_path
+        norm_method = args.norm_method
+
+
         if point_path is not None:
             point_path = point_path.split(",")
             print("loading point cloud from", point_path[0])
@@ -106,20 +110,28 @@ class PointCloudDataset(Dataset):  # normalized per axis, not per sample
                 torch.tensor([10, 100, 5])
         # print("data", self.data)
         self.mean = self.data.mean(dim=(0, 1))
-        self.std = (
-            self.data.std(dim=(0, 1))
-            if num_scene * num_points > 1
-            else torch.ones_like(self.mean)
-        )
+        if norm_method == "std":
+            self.factor = (
+                self.data.std(dim=(0, 1))
+                if num_scene * num_points > 1
+                else torch.ones_like(self.mean)
+            )
+        elif norm_method == "min-max":
+            print("min-max",torch.min(torch.min(self.data,dim=0)[0],dim=0)[0], torch.max(torch.max(self.data,dim=0)[0],dim=0)[0])
+            self.factor = (
+                torch.max(torch.max(self.data,dim=0)[0],dim=0)[0] -torch.min(torch.min(self.data,dim=0)[0],dim=0)[0]
+                if num_scene * num_points > 1
+                else torch.ones_like(self.mean)
+            )
 
-        print("mean", self.mean, "std", self.std)
+        print("mean", self.mean, "factor", self.factor)
 
     def __len__(self) -> int:
         return self.data.size(0)
 
     def __getitem__(self, idx: int) -> torch.Tensor:
         # Return pre-normalized data
-        return (self.data[idx, :, :] - self.mean) / self.std
+        return (self.data[idx, :, :] - self.mean) / self.factor
 
 
 # Sinusoidal time embeddings
@@ -259,11 +271,11 @@ def train(
                 device=device,
             )
             data_mean = dataloader.dataset.mean.to(device)
-            data_std = dataloader.dataset.std.to(device)
+            data_factor = dataloader.dataset.factor.to(device)
             # get GT  from dataloader
             gt_pc = next(iter(dataloader)).to(device)  # one sample
-            gt_pc = gt_pc * data_std + data_mean
-            sampled_point = sampled_point * data_std + data_mean
+            gt_pc = gt_pc * data_factor + data_mean
+            sampled_point = sampled_point * data_factor + data_mean
 
             cd_loss, _ = chamfer_distance(gt_pc, sampled_point)
             
@@ -390,6 +402,9 @@ def parse_args():
     )
     parser.add_argument("--tb_log_dir", type=str, default="./logs",
                         help="Path to store tensorboard logs")
+    parser.add_argument("--run_name", type=str, default="", help="Run name")
+    #normilzation method, std or min-max
+    parser.add_argument("--norm_method", type=str, default="std", help="Normalization method")
     return parser.parse_args()
 
 
@@ -507,15 +522,14 @@ set_seed(args.seed)
 
 
 if not args.no_tensorboard:
-    writer = SummaryWriter(log_dir=args.tb_log_dir+f"/{datetime.now().strftime('%Y-%m-%d-%H-%M-%S.%f')}")
+    writer = SummaryWriter(log_dir=args.tb_log_dir+f"/{args.run_name if  args.run_name else datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}")
 
         
 
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print("device", device)
-dataset = PointCloudDataset(
-    num_scene=args.M, num_points=args.N, point_path=args.point_path)
+dataset = PointCloudDataset(args)
 dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
 
 # dataloader_train, dataloader_val, dataloader_vis = get_dataset(cfg)
@@ -593,14 +607,14 @@ if not args.no_tensorboard:
         # print(samples[key][0].shape)
         # print("dataset.std",dataset.std.shape)
         samples_updated = samples[key][0] * \
-            dataset.std.to(device) + dataset.mean.to(device)
+            dataset.factor.to(device) + dataset.mean.to(device)
         # print("samples_updated", key, samples_updated.shape) #samples_updated step1 torch.Size([1, 1, 3])
         # #shape  dataset[:]
         # print("dataset[:]", dataset[:].shape) #dataset[:] torch.Size([2, 1, 3])
         cd_losses = []
         for i in range(len(dataset)):
             loss, _ = chamfer_distance(
-                dataset[i].unsqueeze(0).to(device) * dataset.std.to(device)
+                dataset[i].unsqueeze(0).to(device) * dataset.factor.to(device)
                 + dataset.mean.to(device),
                 samples_updated.to(device),
             )
@@ -619,12 +633,12 @@ if not args.no_tensorboard:
         error = []
         assert len(samples[key][1]) > 1, "need more than 1 sample to plot"
         for x in samples[key][1]:
-            x = x * dataset.std.to(device) + dataset.mean.to(device)
+            x = x * dataset.factor.to(device) + dataset.mean.to(device)
 
             cd_losses = []
             for i in range(len(dataset)):
                 loss, _ = chamfer_distance(
-                    dataset[i].unsqueeze(0).to(device) * dataset.std.to(device)
+                    dataset[i].unsqueeze(0).to(device) * dataset.factor.to(device)
                     + dataset.mean.to(device),
                     x.to(device),
                 )
@@ -658,7 +672,7 @@ key_to_plot = "step50"
 
 # get GT  from dataloader
 gt_pc = next(iter(dataloader)).to(device)  # one sample
-gt_pc = gt_pc * dataset.std.to(device) + dataset.mean.to(device)
+gt_pc = gt_pc * dataset.factor.to(device) + dataset.mean.to(device)
 # print("gt_pc", gt_pc.shape) #gt_pc torch.Size([1, N*3])
 gt_pc = gt_pc.reshape(-1, 3)
 gt_pc = gt_pc.cpu().numpy()
@@ -670,11 +684,11 @@ value = samples[key]
 temp = torch.stack(value[1], dim=0)
 # print("temp", key, temp.shape)
 samples_updated = temp.to(
-    device) * dataset.std.to(device) + dataset.mean.to(device)
+    device) * dataset.factor.to(device) + dataset.mean.to(device)
 # print("samples_updated", key, samples_updated.shape)
 # print("samples_updated.reshape(-1,3).mean(dim=0)", samples_updated.reshape(-1,3).mean(dim=0))
-mean_coord_val = samples_updated.reshape(-1, 3).mean(dim=0).cpu()
-std_coord_val = samples_updated.reshape(-1, 3).std(dim=0).cpu()
+# mean_coord_val = samples_updated.reshape(-1, 3).mean(dim=0).cpu()
+# factor_coord_val = samples_updated.reshape(-1, 3).factor(dim=0).cpu()
 # move to cpu
 # min_coord_val = min_coord_val.cpu()
 # max_coord_val = max_coord_val.cpu()
