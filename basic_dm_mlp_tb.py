@@ -223,7 +223,9 @@ def train_one_epoch(dataloader, model, optimizer, scheduler, args, criterion, de
         output = model(noisy_x, timesteps)
         # print("output", output.shape)  # output torch.Size([1, 2, 3])
         noise = noise[:, :, :3]
-        loss = criterion(output, noise)
+        noise_in_noisy_x = noisy_x[:, :, :3] - x[:, :, :3]
+        # loss = criterion(output, noise)
+        loss = criterion(output, noise_in_noisy_x)
         loss.backward()
         optimizer.step()
 
@@ -510,205 +512,209 @@ def log_sample_to_tb(x, gt_pc, key, evo, epoch):
     
 
 
+def main():
 
-args = parse_args()
-if args.model != "pvcnn":
-    args.extra_channels = 0
-    print("extra_channels set to 0 for non-pvcnn model")
-else:
-    assert args.extra_channels >= 0, "extra_channels must be >=0 for pvcnn"
-print(args)
-set_seed(args.seed)
-
-
-if not args.no_tensorboard:
-    writer = SummaryWriter(log_dir=args.tb_log_dir+f"/{args.run_name if  args.run_name else datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}")
-
-        
-
-
-device = "cuda" if torch.cuda.is_available() else "cpu"
-print("device", device)
-dataset = PointCloudDataset(args)
-dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
-
-# dataloader_train, dataloader_val, dataloader_vis = get_dataset(cfg)
-
-model = get_model(args, device=device)
-
-if not args.no_tensorboard:
-    writer.add_scalar("model_params", sum(p.numel() for p in model.parameters()))
-
-optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-# linear, scaled_linear, or squaredcos_cap_v2.
-scheduler = DDPMScheduler(
-    num_train_timesteps=args.num_train_timesteps, beta_schedule=args.beta_schedule
-)
-
-CHECKPOINT_DIR = "/data/palakons/checkpoint"
-start_epoch = 0
-
-if not args.no_checkpoint:
-    current_cp_fname = get_checkpoint_fname(args, CHECKPOINT_DIR)
-    if current_cp_fname is not None:
-        current_cp = torch.load(current_cp_fname)
-        print("loading checkpoint", current_cp_fname)
-        model.load_state_dict(current_cp["model"])
-        optimizer.load_state_dict(current_cp["optimizer"])
-        start_epoch = current_cp["args"].epochs
-        print("start_epoch", start_epoch)
-        if not args.no_tensorboard:
-            raise ValueError("not implemented")
-
+    args = parse_args()
+    if args.model != "pvcnn":
+        args.extra_channels = 0
+        print("extra_channels set to 0 for non-pvcnn model")
     else:
-        print("no checkpoint found")
+        assert args.extra_channels >= 0, "extra_channels must be >=0 for pvcnn"
+    print(args)
+    set_seed(args.seed)
 
-criterion = get_loss(args)
-# Train the model
-train(
-    model,
-    dataloader,
-    optimizer,
-    scheduler,
-    args,
-    device=device,
-    start_epoch=start_epoch,
-    criterion=criterion,
-)
 
-losses = train_one_epoch(
-    dataloader, model, optimizer, scheduler, args, criterion=criterion, device=device
-)
-metric_dict = {"Loss": sum(losses) / len(losses)}
-if not args.no_tensorboard:
-    writer.add_scalar("Loss/epoch", sum(losses) / len(losses), args.epochs - 1)
+    if not args.no_tensorboard:
+        writer = SummaryWriter(log_dir=args.tb_log_dir+f"/{args.run_name if  args.run_name else datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}")
 
-# samples, _ = sample(model, scheduler, sample_shape=( 1000, data_dim), device=device)
+            
 
-# Sample from the model
-num_sample_points = 1
-samples = {}
-for i in [1, 5, 10, 50, 100]:
-    samples[f"step{i}"] = sample(
-        model,
-        scheduler, args,
-        sample_shape=(num_sample_points, args.N, 3),
-        num_inference_steps=i,
-        evolution_freq=args.evolution_freq,
-        device=device,
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print("device", device)
+    dataset = PointCloudDataset(args)
+    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
+
+    # dataloader_train, dataloader_val, dataloader_vis = get_dataset(cfg)
+
+    model = get_model(args, device=device)
+
+    if not args.no_tensorboard:
+        writer.add_scalar("model_params", sum(p.numel() for p in model.parameters()))
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    # linear, scaled_linear, or squaredcos_cap_v2.
+    scheduler = DDPMScheduler(
+        num_train_timesteps=args.num_train_timesteps, beta_schedule=args.beta_schedule
     )
 
+    CHECKPOINT_DIR = "/data/palakons/checkpoint"
+    start_epoch = 0
 
-if not args.no_tensorboard:
-    # make the plot that will be logged to tb
-    plt.figure(figsize=(10, 10))
+    if not args.no_checkpoint:
+        current_cp_fname = get_checkpoint_fname(args, CHECKPOINT_DIR)
+        if current_cp_fname is not None:
+            current_cp = torch.load(current_cp_fname)
+            print("loading checkpoint", current_cp_fname)
+            model.load_state_dict(current_cp["model"])
+            optimizer.load_state_dict(current_cp["optimizer"])
+            start_epoch = current_cp["args"].epochs
+            print("start_epoch", start_epoch)
+            if not args.no_tensorboard:
+                raise ValueError("not implemented")
 
-    for key, value in samples.items():
-        # print(samples[key][0].shape)
-        # print("dataset.std",dataset.std.shape)
-        samples_updated = samples[key][0] * \
-            dataset.factor.to(device) + dataset.mean.to(device)
-        # print("samples_updated", key, samples_updated.shape) #samples_updated step1 torch.Size([1, 1, 3])
-        # #shape  dataset[:]
-        # print("dataset[:]", dataset[:].shape) #dataset[:] torch.Size([2, 1, 3])
-        cd_losses = []
-        for i in range(len(dataset)):
-            loss, _ = chamfer_distance(
-                dataset[i].unsqueeze(0).to(device) * dataset.factor.to(device)
-                + dataset.mean.to(device),
-                samples_updated.to(device),
-            )
-            cd_losses.append(loss.item())
+        else:
+            print("no checkpoint found")
 
-        # log minumum loss
+    criterion = get_loss(args)
+    # Train the model
+    train(
+        model,
+        dataloader,
+        optimizer,
+        scheduler,
+        args,
+        device=device,
+        start_epoch=start_epoch,
+        criterion=criterion,
+    )
 
-        print(
-            key, "\t", f"CD: { min(cd_losses):.2f} at {cd_losses.index(min(cd_losses))}")
-        if not args.no_tensorboard:
-            writer.add_scalar(f"CD_{key}", min(cd_losses), args.epochs)
-            
-            #add cd to metric_dict
-            metric_dict = {**{f"CD_{key}": min(cd_losses)},**metric_dict}
+    losses = train_one_epoch(
+        dataloader, model, optimizer, scheduler, args, criterion=criterion, device=device
+    )
+    metric_dict = {"Loss": sum(losses) / len(losses)}
+    if not args.no_tensorboard:
+        writer.add_scalar("Loss/epoch", sum(losses) / len(losses), args.epochs - 1)
 
-        error = []
-        assert len(samples[key][1]) > 1, "need more than 1 sample to plot"
-        for x in samples[key][1]:
-            x = x * dataset.factor.to(device) + dataset.mean.to(device)
+    # samples, _ = sample(model, scheduler, sample_shape=( 1000, data_dim), device=device)
 
+    # Sample from the model
+    num_sample_points = 1
+    samples = {}
+    for i in [1, 5, 10, 50, 100]:
+        samples[f"step{i}"] = sample(
+            model,
+            scheduler, args,
+            sample_shape=(num_sample_points, args.N, 3),
+            num_inference_steps=i,
+            evolution_freq=args.evolution_freq,
+            device=device,
+        )
+
+
+    if not args.no_tensorboard:
+        # make the plot that will be logged to tb
+        plt.figure(figsize=(10, 10))
+
+        for key, value in samples.items():
+            # print(samples[key][0].shape)
+            # print("dataset.std",dataset.std.shape)
+            samples_updated = samples[key][0] * \
+                dataset.factor.to(device) + dataset.mean.to(device)
+            # print("samples_updated", key, samples_updated.shape) #samples_updated step1 torch.Size([1, 1, 3])
+            # #shape  dataset[:]
+            # print("dataset[:]", dataset[:].shape) #dataset[:] torch.Size([2, 1, 3])
             cd_losses = []
             for i in range(len(dataset)):
                 loss, _ = chamfer_distance(
                     dataset[i].unsqueeze(0).to(device) * dataset.factor.to(device)
                     + dataset.mean.to(device),
-                    x.to(device),
+                    samples_updated.to(device),
                 )
-                # print(f"{loss.item():.2f}", end=", ")
                 cd_losses.append(loss.item())
-            error.append(min(cd_losses))
-        # ax = plt.plot(error, label=key)
-        plt.plot(
-            [i / (len(error) - 1) for i in range(len(error))],
-            error,
-            label=key,
-            marker=None,
+
+            # log minumum loss
+
+            print(
+                key, "\t", f"CD: { min(cd_losses):.2f} at {cd_losses.index(min(cd_losses))}")
+            if not args.no_tensorboard:
+                writer.add_scalar(f"CD_{key}", min(cd_losses), args.epochs)
+                
+                #add cd to metric_dict
+                metric_dict = {**{f"CD_{key}": min(cd_losses)},**metric_dict}
+
+            error = []
+            assert len(samples[key][1]) > 1, "need more than 1 sample to plot"
+            for x in samples[key][1]:
+                x = x * dataset.factor.to(device) + dataset.mean.to(device)
+
+                cd_losses = []
+                for i in range(len(dataset)):
+                    loss, _ = chamfer_distance(
+                        dataset[i].unsqueeze(0).to(device) * dataset.factor.to(device)
+                        + dataset.mean.to(device),
+                        x.to(device),
+                    )
+                    # print(f"{loss.item():.2f}", end=", ")
+                    cd_losses.append(loss.item())
+                error.append(min(cd_losses))
+            # ax = plt.plot(error, label=key)
+            plt.plot(
+                [i / (len(error) - 1) for i in range(len(error))],
+                error,
+                label=key,
+                marker=None,
+            )
+            # print()
+        plt.legend()
+        plt.title(
+            f"Diffusion model: {args.epochs} epochs, {args.num_train_timesteps} timesteps, {args.beta_schedule} schedule",
         )
-        # print()
-    plt.legend()
-    plt.title(
-        f"Diffusion model: {args.epochs} epochs, {args.num_train_timesteps} timesteps, {args.beta_schedule} schedule",
-    )
-    plt.xlabel("Evolution steps ratio")
-    plt.ylabel("Chamfer distance")
-    # ylog
-    plt.yscale("log")
-    
-    writer.add_figure( f"Evolution",plt.gcf(), args.epochs)
-    plt.close()
+        plt.xlabel("Evolution steps ratio")
+        plt.ylabel("Chamfer distance")
+        # ylog
+        plt.yscale("log")
+        
+        writer.add_figure( f"Evolution",plt.gcf(), args.epochs)
+        plt.close()
 
-print("done evo plots")
-# plot evolution
+    print("done evo plots")
+    # plot evolution
 
-key_to_plot = "step50"
+    key_to_plot = "step50"
 
-# get GT  from dataloader
-gt_pc = next(iter(dataloader)).to(device)  # one sample
-gt_pc = gt_pc * dataset.factor.to(device) + dataset.mean.to(device)
-# print("gt_pc", gt_pc.shape) #gt_pc torch.Size([1, N*3])
-gt_pc = gt_pc.reshape(-1, 3)
-gt_pc = gt_pc.cpu().numpy()
+    # get GT  from dataloader
+    gt_pc = next(iter(dataloader)).to(device)  # one sample
+    gt_pc = gt_pc * dataset.factor.to(device) + dataset.mean.to(device)
+    # print("gt_pc", gt_pc.shape) #gt_pc torch.Size([1, N*3])
+    gt_pc = gt_pc.reshape(-1, 3)
+    gt_pc = gt_pc.cpu().numpy()
 
-key = key_to_plot
-value = samples[key]
+    key = key_to_plot
+    value = samples[key]
 
 
-temp = torch.stack(value[1], dim=0)
-# print("temp", key, temp.shape)
-samples_updated = temp.to(
-    device) * dataset.factor.to(device) + dataset.mean.to(device)
-# print("samples_updated", key, samples_updated.shape)
-# print("samples_updated.reshape(-1,3).mean(dim=0)", samples_updated.reshape(-1,3).mean(dim=0))
-# mean_coord_val = samples_updated.reshape(-1, 3).mean(dim=0).cpu()
-# factor_coord_val = samples_updated.reshape(-1, 3).factor(dim=0).cpu()
-# move to cpu
-# min_coord_val = min_coord_val.cpu()
-# max_coord_val = max_coord_val.cpu()
-# print(key, "\tmin max, ", mean_coord_val, std_coord_val)
-samples_updated = samples_updated.cpu().numpy()
+    temp = torch.stack(value[1], dim=0)
+    # print("temp", key, temp.shape)
+    samples_updated = temp.to(
+        device) * dataset.factor.to(device) + dataset.mean.to(device)
+    # print("samples_updated", key, samples_updated.shape)
+    # print("samples_updated.reshape(-1,3).mean(dim=0)", samples_updated.reshape(-1,3).mean(dim=0))
+    # mean_coord_val = samples_updated.reshape(-1, 3).mean(dim=0).cpu()
+    # factor_coord_val = samples_updated.reshape(-1, 3).factor(dim=0).cpu()
+    # move to cpu
+    # min_coord_val = min_coord_val.cpu()
+    # max_coord_val = max_coord_val.cpu()
+    # print(key, "\tmin max, ", mean_coord_val, std_coord_val)
+    samples_updated = samples_updated.cpu().numpy()
 
-if not args.no_tensorboard:
-    for i, x in tqdm(enumerate(samples_updated)):
-        # print("x", x.shape)
-        # x_shape = x.reshape(x.shape[0], -1, 3)
-        log_sample_to_tb(
-            x[0, :, :],
-            gt_pc,
-            key,
-            i * args.evolution_freq -
-            (1 if i == len(samples_updated) - 1 else 0),
-            args.epochs,
-        )
+    if not args.no_tensorboard:
+        for i, x in tqdm(enumerate(samples_updated)):
+            # print("x", x.shape)
+            # x_shape = x.reshape(x.shape[0], -1, 3)
+            log_sample_to_tb(
+                x[0, :, :],
+                gt_pc,
+                key,
+                i * args.evolution_freq -
+                (1 if i == len(samples_updated) - 1 else 0),
+                args.epochs,
+            )
 
-if not args.no_tensorboard:
-    hparam_dict = vars(args)
-    writer.add_hparams(hparam_dict, metric_dict)
-    writer.close()
+    if not args.no_tensorboard:
+        hparam_dict = vars(args)
+        writer.add_hparams(hparam_dict, metric_dict)
+        writer.close()
+
+if __name__ == "__main__":
+    main()
