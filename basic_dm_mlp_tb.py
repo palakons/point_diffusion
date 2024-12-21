@@ -32,7 +32,6 @@ class PointCloudDataset(Dataset):  # normalized per axis, not per sample
         point_path = args.point_path
         norm_method = args.norm_method
 
-
         if point_path is not None:
             point_path = point_path.split(",")
             print("loading point cloud from", point_path[0])
@@ -117,9 +116,11 @@ class PointCloudDataset(Dataset):  # normalized per axis, not per sample
                 else torch.ones_like(self.mean)
             )
         elif norm_method == "min-max":
-            print("min-max",torch.min(torch.min(self.data,dim=0)[0],dim=0)[0], torch.max(torch.max(self.data,dim=0)[0],dim=0)[0])
+            print("min-max", torch.min(torch.min(self.data, dim=0)
+                  [0], dim=0)[0], torch.max(torch.max(self.data, dim=0)[0], dim=0)[0])
             self.factor = (
-                torch.max(torch.max(self.data,dim=0)[0],dim=0)[0] -torch.min(torch.min(self.data,dim=0)[0],dim=0)[0]
+                torch.max(torch.max(self.data, dim=0)[0], dim=0)[
+                    0] - torch.min(torch.min(self.data, dim=0)[0], dim=0)[0]
                 if num_scene * num_points > 1
                 else torch.ones_like(self.mean)
             )
@@ -174,7 +175,6 @@ class SimpleDiffusionModel3D(nn.Module):
         # Pass through network
         x_t = self.net(x_t)
         return x_t.reshape(x.size(0), -1, 3)
-
 
 
 class PointCloudLoss(nn.Module):
@@ -241,7 +241,7 @@ def train(
     args,
     device="cpu",
     start_epoch=0,
-    criterion=nn.MSELoss(),
+    criterion=nn.MSELoss(), writer=None
 ):
     model.train()
     tqdm_range = trange(start_epoch, args.epochs, desc="Epoch")
@@ -280,7 +280,7 @@ def train(
             sampled_point = sampled_point * data_factor + data_mean
 
             cd_loss, _ = chamfer_distance(gt_pc, sampled_point)
-            
+
             writer.add_scalar("CD/epoch", cd_loss, epoch)
 
             sampled_point = sampled_point.cpu().numpy()
@@ -288,7 +288,7 @@ def train(
 
             log_sample_to_tb(
                 sampled_point[0, :, :], gt_pc[0,
-                                              :, :], f"for_visual", 50, epoch
+                                              :, :], f"for_visual", 50, epoch, writer
             )  # support M=1 only
     if not args.no_checkpoint:
         checkpoint = {
@@ -371,7 +371,7 @@ def parse_args():
     parser.add_argument(
         "--beta_schedule", type=str, default="linear", help="Beta schedule"
     )
-    parser.add_argument("--no_tensorboard", #action="store_true", 
+    parser.add_argument("--no_tensorboard",  # action="store_true",
                         default=False,
                         help="Disable tensorboard logging")
     parser.add_argument(
@@ -392,7 +392,7 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--no_checkpoint", default=True,
                         # action="store_true",
-                          help="No checkpoint")
+                        help="No checkpoint")
     parser.add_argument(
         "--evolution_freq", type=int, default=10, help="Evolution frequency"
     )
@@ -400,13 +400,14 @@ def parse_args():
     #     "--extra_channels", type=int, default=0, help="Extra channels in PVCNN >=0"
     # )
     parser.add_argument(
-        "--point_path", type=str, default=None, help="Path to point cloud" #either txt or ply
+        "--point_path", type=str, default=None, help="Path to point cloud"  # either txt or ply
     )
     parser.add_argument("--tb_log_dir", type=str, default="./logs",
                         help="Path to store tensorboard logs")
     parser.add_argument("--run_name", type=str, default="", help="Run name")
-    #normilzation method, std or min-max
-    parser.add_argument("--norm_method", type=str, default="std", help="Normalization method")
+    # normilzation method, std or min-max
+    parser.add_argument("--norm_method", type=str,
+                        default="std", help="Normalization method")
     return parser.parse_args()
 
 
@@ -493,23 +494,24 @@ def get_loss(args):
         raise ValueError("loss not supported")
 
 
-def log_sample_to_tb(x, gt_pc, key, evo, epoch):
-    sampled_tensor = torch.tensor(x,dtype=torch.float)
-    gt_pc_tensor = torch.tensor(gt_pc,dtype=torch.float)
+def log_sample_to_tb(x, gt_pc, key, evo, epoch, writer):
+    sampled_tensor = torch.tensor(x, dtype=torch.float)
+    gt_pc_tensor = torch.tensor(gt_pc, dtype=torch.float)
 
     all_tensor = torch.cat([sampled_tensor, gt_pc_tensor], dim=0)
 
-    color_sampled = torch.tensor([[255, 0, 0] for _ in range(sampled_tensor.shape[0])]) #color: red
-    color_gt = torch.tensor([[0, 255, 0] for _ in range(gt_pc_tensor.shape[0])]) #color: green
+    color_sampled = torch.tensor(
+        [[255, 0, 0] for _ in range(sampled_tensor.shape[0])])  # color: red
+    color_gt = torch.tensor(
+        [[0, 255, 0] for _ in range(gt_pc_tensor.shape[0])])  # color: green
 
     all_color = torch.cat([color_sampled, color_gt], dim=0)
     # print("shape", all_tensor.shape, all_color.shape)
-    #add dimension to tensor to dim 0
+    # add dimension to tensor to dim 0
     all_tensor = all_tensor.unsqueeze(0)
     all_color = all_color.unsqueeze(0)
-    writer.add_mesh(f"PointCloud_{key}_{evo}", vertices=all_tensor, colors=all_color, 
+    writer.add_mesh(f"PointCloud_{key}_{evo}", vertices=all_tensor, colors=all_color,
                     global_step=epoch)
-    
 
 
 def main():
@@ -523,12 +525,9 @@ def main():
     print(args)
     set_seed(args.seed)
 
-
     if not args.no_tensorboard:
-        writer = SummaryWriter(log_dir=args.tb_log_dir+f"/{args.run_name if  args.run_name else datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}")
-
-            
-
+        writer = SummaryWriter(
+            log_dir=args.tb_log_dir+f"/{args.run_name if  args.run_name else datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print("device", device)
@@ -540,7 +539,8 @@ def main():
     model = get_model(args, device=device)
 
     if not args.no_tensorboard:
-        writer.add_scalar("model_params", sum(p.numel() for p in model.parameters()))
+        writer.add_scalar("model_params", sum(p.numel()
+                          for p in model.parameters()))
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     # linear, scaled_linear, or squaredcos_cap_v2.
@@ -576,7 +576,7 @@ def main():
         args,
         device=device,
         start_epoch=start_epoch,
-        criterion=criterion,
+        criterion=criterion, writer=writer
     )
 
     losses = train_one_epoch(
@@ -584,7 +584,8 @@ def main():
     )
     metric_dict = {"Loss": sum(losses) / len(losses)}
     if not args.no_tensorboard:
-        writer.add_scalar("Loss/epoch", sum(losses) / len(losses), args.epochs - 1)
+        writer.add_scalar("Loss/epoch", sum(losses) /
+                          len(losses), args.epochs - 1)
 
     # samples, _ = sample(model, scheduler, sample_shape=( 1000, data_dim), device=device)
 
@@ -601,7 +602,6 @@ def main():
             device=device,
         )
 
-
     if not args.no_tensorboard:
         # make the plot that will be logged to tb
         plt.figure(figsize=(10, 10))
@@ -617,7 +617,8 @@ def main():
             cd_losses = []
             for i in range(len(dataset)):
                 loss, _ = chamfer_distance(
-                    dataset[i].unsqueeze(0).to(device) * dataset.factor.to(device)
+                    dataset[i].unsqueeze(0).to(device) *
+                    dataset.factor.to(device)
                     + dataset.mean.to(device),
                     samples_updated.to(device),
                 )
@@ -629,9 +630,9 @@ def main():
                 key, "\t", f"CD: { min(cd_losses):.2f} at {cd_losses.index(min(cd_losses))}")
             if not args.no_tensorboard:
                 writer.add_scalar(f"CD_{key}", min(cd_losses), args.epochs)
-                
-                #add cd to metric_dict
-                metric_dict = {**{f"CD_{key}": min(cd_losses)},**metric_dict}
+
+                # add cd to metric_dict
+                metric_dict = {**{f"CD_{key}": min(cd_losses)}, **metric_dict}
 
             error = []
             assert len(samples[key][1]) > 1, "need more than 1 sample to plot"
@@ -641,7 +642,8 @@ def main():
                 cd_losses = []
                 for i in range(len(dataset)):
                     loss, _ = chamfer_distance(
-                        dataset[i].unsqueeze(0).to(device) * dataset.factor.to(device)
+                        dataset[i].unsqueeze(0).to(
+                            device) * dataset.factor.to(device)
                         + dataset.mean.to(device),
                         x.to(device),
                     )
@@ -664,8 +666,8 @@ def main():
         plt.ylabel("Chamfer distance")
         # ylog
         plt.yscale("log")
-        
-        writer.add_figure( f"Evolution",plt.gcf(), args.epochs)
+
+        writer.add_figure(f"Evolution", plt.gcf(), args.epochs)
         plt.close()
 
     print("done evo plots")
@@ -682,7 +684,6 @@ def main():
 
     key = key_to_plot
     value = samples[key]
-
 
     temp = torch.stack(value[1], dim=0)
     # print("temp", key, temp.shape)
@@ -708,13 +709,14 @@ def main():
                 key,
                 i * args.evolution_freq -
                 (1 if i == len(samples_updated) - 1 else 0),
-                args.epochs,
+                args.epochs, writer
             )
 
     if not args.no_tensorboard:
         hparam_dict = vars(args)
         writer.add_hparams(hparam_dict, metric_dict)
         writer.close()
+
 
 if __name__ == "__main__":
     main()
