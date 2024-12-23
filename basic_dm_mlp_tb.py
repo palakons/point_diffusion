@@ -319,7 +319,7 @@ def sample(
 
     x = torch.randn(sample_shape, device=device)
     xs = []
-    for i, t in enumerate(tqdm(scheduler.timesteps.to(device), desc="Sampling"),leave=False):
+    for i, t in enumerate(tqdm(scheduler.timesteps.to(device), desc="Sampling",leave=False)):
         timesteps = torch.full(
             (x.size(0),), t, device=device, dtype=torch.long)
         # x = x.reshape(x.size(0), -1)
