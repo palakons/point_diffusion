@@ -622,8 +622,10 @@ def main():
     set_seed(args.seed)
 
     if not args.no_tensorboard:
+        log_dir = args.tb_log_dir+f"/{args.run_name if  args.run_name else datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}"
         writer = SummaryWriter(
-            log_dir=args.tb_log_dir+f"/{args.run_name if  args.run_name else datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}")
+            log_dir= log_dir )  
+        print("tensorboard log at", log_dir)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print("device", device)
