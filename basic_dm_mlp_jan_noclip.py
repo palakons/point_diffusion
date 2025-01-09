@@ -324,6 +324,8 @@ def train(
             writer.add_scalar("Loss/epoch", sum(losses) / len(losses), epoch)
 
         if not args.no_checkpoint and epoch % args.checkpoint_freq == 0:
+            temp_epochs = args.epochs
+            args.epochs = epoch
             checkpoint = {
                 "model": model.state_dict(),
                 "optimizer": optimizer.state_dict(),
@@ -331,6 +333,7 @@ def train(
             }
             # save at /data/palakons/checkpoint/cp_{datetime.now().strftime("%Y%m%d-%H%M%S")}.pth
             torch.save(checkpoint, checkpoint_fname)
+            args.epochs = temp_epochs
             print("checkpoint saved at", checkpoint_fname)
         if not args.no_tensorboard and epoch % args.visualize_freq == 0:
             sampled_point, xts, x0s, steps = sample(
@@ -622,9 +625,10 @@ def main():
     set_seed(args.seed)
 
     if not args.no_tensorboard:
-        log_dir = args.tb_log_dir+f"/{args.run_name if  args.run_name else datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}"
+        log_dir = args.tb_log_dir + \
+            f"/{args.run_name if  args.run_name else datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}"
         writer = SummaryWriter(
-            log_dir= log_dir )  
+            log_dir=log_dir)
         print("tensorboard log at", log_dir)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
