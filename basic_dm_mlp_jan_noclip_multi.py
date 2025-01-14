@@ -387,20 +387,27 @@ def train(
             gt_pcs =  dataloader.dataset.data.to(device)
             
             plot_sample_multi_gt(gt_pcs, xts, x0s, steps, args, epoch, fname=None)
-            gt_pc = gt_pc * data_factor + data_mean
+            gt_pcs = gt_pcs * data_factor + data_mean
             sampled_point = sampled_point * data_factor + data_mean
 
-            cd_loss, _ = chamfer_distance(gt_pc, sampled_point)
+            # cd_loss, _ = chamfer_distance(gt_pcs, sampled_point)
+            cd_losses = []
+            for i, gt_pc in enumerate(gt_pcs):
+                cd_loss_i, _ = chamfer_distance(gt_pc.unsqueeze(0) , sampled_point)
+                cd_losses.append(cd_loss_i.item())
 
-            writer.add_scalar("CD/epoch", cd_loss, epoch)
+
+            writer.add_scalar("CD_min/epoch", min(cd_losses), epoch)
+            writer.add_scalar("CD_max/epoch", max(cd_losses), epoch)
+            writer.add_scalar("CD_mean/epoch", sum(cd_losses) / len(cd_losses), epoch)
 
             sampled_point = sampled_point.cpu().numpy()
             gt_pcs = gt_pcs.cpu().numpy()
 
-            log_sample_to_tb(
-                sampled_point[0, :, :], gt_pcs[0,
-                                              :, :], f"for_visual", 50, epoch, writer
-            )  # support M=1 only
+            # log_sample_to_tb(
+            #     sampled_point[0, :, :], gt_pcs[0,
+            #                                   :, :], f"for_visual", 50, epoch, writer
+            # )  # support M=1 only
     if not args.no_checkpoint or True:
         checkpoint = {
             "model": model.state_dict(),
