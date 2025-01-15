@@ -15,6 +15,7 @@ from tqdm import tqdm, trange
 import numpy as np
 import random
 from torch.utils.tensorboard import SummaryWriter
+import os
 
 
 def set_seed(seed):
@@ -32,17 +33,35 @@ class PointCloudDataset(Dataset):  # normalized per axis, not per sample
         point_path = args.point_path
         norm_method = args.norm_method
 
+
         if point_path is not None:
+            #assert if point_path is not a file, but a dir
+
             point_path = point_path.split(",")
-            # assert point_path is  a list
-            assert len(point_path) >= num_scene
+            # get all files in point_path
+
+            #list files in the dir
+            files_list = []
+            for each_path in point_path:
+
+                assert os.path.isdir(each_path), f"point_path {each_path} must be a directory"
+                
+                files_name = os.listdir(each_path)
+                # if ends with txt or ply,
+                for file_name in files_name:
+                    if file_name.endswith(".txt") or file_name.endswith(".ply"):
+                        files_list.append(os.path.join(each_path, file_name))
+
+
+
+            assert len(files_list) >= num_scene
 
             # if num_scene > 1:
             #     raise ValueError("num_scene > 1 not supported, yet")
 
-            # load point cloud from point_path
+            # load point cloud from files_list
             # /data/palakons/dataset/astyx/scene/0/000000.txt
-            # load point cloud from point_path, as a text file, separate by space, use pandas
+            # load point cloud from files_list, as a text file, separate by space, use pandas
             #
             # X Y Z V_r Mag
             # 0.108118820531769647 2.30565393293341492 -0.279097884893417358 0 48
@@ -51,12 +70,12 @@ class PointCloudDataset(Dataset):  # normalized per axis, not per sample
             # creat blank tensor dim (num_scene, num_points, 3)
             self.data = torch.zeros(num_scene, num_points, 3)
 
-            # get "num_scene" indices from range(len(point_path))            
-            use_point_path =  random.sample(point_path, num_scene)
+            # get "num_scene" indices from range(len(files_list))            
+            use_files_list =  random.sample(files_list, num_scene)
 
             # skip the first line
             # assert it is either txt or  ply files
-            for i, point_file_path in enumerate(use_point_path):
+            for i, point_file_path in enumerate(use_files_list):
                 print(f"loading {point_file_path}")
                 
 
