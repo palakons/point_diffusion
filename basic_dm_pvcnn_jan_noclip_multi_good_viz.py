@@ -345,8 +345,8 @@ def plot_sample_multi_gt(gts, xts, x0s, steps, args, epoch, fname,input_pc_file_
 
     
     #plot the last step, xts[-1], which would equal to x0s[-1]
-    xt = xts[-1].cpu().numpy()
-    x0 = x0s[-1].cpu().numpy()
+    xt = xts[-1].cpu().numpy()[0]
+    x0 = x0s[-1].cpu().numpy()[0]
 
     #find gt with least chamfer distance to xt[-1]
     min_cd = 1e10
@@ -354,7 +354,7 @@ def plot_sample_multi_gt(gts, xts, x0s, steps, args, epoch, fname,input_pc_file_
     min_gt_idx = None
     for i,gt in enumerate(gts):
         gtt =torch.tensor(gt).unsqueeze(0)
-        xtt = torch.tensor(xt)
+        xtt = torch.tensor(xt).unsqueeze(0)
         # print("gtt",gtt.shape, "xtt",xtt.shape)
         cd, _ = chamfer_distance(gtt, xtt)
         if cd<min_cd:
@@ -362,16 +362,19 @@ def plot_sample_multi_gt(gts, xts, x0s, steps, args, epoch, fname,input_pc_file_
             min_gt = gt
             min_gt_idx = i
 
+    fname_min_gt = input_pc_file_list[min_gt_idx].split("/")[-1]
+
     step = steps[-1].cpu().numpy()
 
     # print("shapes", xt.shape, x0.shape, min_gt.shape) #shapes (1, 100, 3) (1, 100, 3) (100, 3)
 
 
+    #---plot combined
     fig = plt.figure(figsize=(10, 10))
     ax = fig.add_subplot(111, projection='3d')
-    ax.scatter(xt[0,:, 0], xt[0,:, 1], xt[0,:, 2], c='r', marker='o', label=f'xt step {step}')
+    ax.scatter(xt[:, 0], xt[:, 1], xt[:, 2], c='r', marker='o', label=f'xt step {step}')
     #plot min_gt
-    ax.scatter(min_gt[:, 0], min_gt[:, 1], min_gt[:, 2], c='g', marker='o', label=f'gt_{min_gt_idx}: {input_pc_file_list[min_gt_idx]}')
+    ax.scatter(min_gt[:, 0], min_gt[:, 1], min_gt[:, 2], c='g', marker='o', label=f'gt_{min_gt_idx}: {fname_min_gt}')
     ax.set_title(f"xt: step {step}")
     ax.legend()
     factor_window = 1.
@@ -385,11 +388,12 @@ def plot_sample_multi_gt(gts, xts, x0s, steps, args, epoch, fname,input_pc_file_
     plt.savefig(fname.replace(".png","_last_step.png"))
     plt.close()
 
-    for label, pcs in zip(["xt", "x0", "gt"], [xt[0], x0[0], min_gt]):
+    #---plot each
+    for label, pcs in zip(["xt", "x0", "gt"], [xt, x0, min_gt]):
         fig = plt.figure(figsize=(10, 10))
         ax = fig.add_subplot(111, projection='3d')
         ax.scatter(pcs[:, 0], pcs[:, 1], pcs[:, 2], c='g' if label == "gt" else 'r', marker=',')
-        ax.set_title(f"{label} step {step}"+( f" {input_pc_file_list[min_gt_idx]}" if label=="gt" else ""))
+        ax.set_title(f"{label} step {step}"+( f" {fname_min_gt}" if label=="gt" else ""))
         ax.set_xlim(mean_gt[0]-factor_window*range_gt[0],
                     mean_gt[0]+factor_window*range_gt[0])
         ax.set_ylim(mean_gt[1]-factor_window*range_gt[1],
@@ -400,6 +404,32 @@ def plot_sample_multi_gt(gts, xts, x0s, steps, args, epoch, fname,input_pc_file_
         plt.savefig(fname.replace(".png",f"_{label}.png"))
         plt.close()
 
+    #---plot distance by color
+    color_map_name = "gist_rainbow" #https://matplotlib.org/stable/tutorials/colors/colormaps.html
+    # plot gt, with color based on distance to xt
+    fig = plt.figure(figsize=(10, 10))
+    ax = fig.add_subplot(111, projection='3d')
+    diff=dist=matrix = min_gt[None,:,:] - xt[:,None,:] # (100, 100, 3)
+    print("diff", diff.shape)
+    #norm2 distance
+    dist = np.linalg.norm(diff, axis=-1)
+    print("dist", dist.shape)
+    #least distance for each gt
+    min_dist = np.min(dist, axis=0)
+    print("min_dist", min_dist.shape)
+    plot = ax.scatter(min_gt[:, 0], min_gt[:, 1], min_gt[:, 2], c=min_dist, cmap=color_map_name, marker='o')
+    fig.colorbar(plot, ax=ax)
+    ax.set_title(f"gt_{min_gt_idx}: {fname_min_gt}")
+    ax.set_xlim(mean_gt[0]-factor_window*range_gt[0],
+                mean_gt[0]+factor_window*range_gt[0])
+    ax.set_ylim(mean_gt[1]-factor_window*range_gt[1],
+
+                mean_gt[1]+factor_window*range_gt[1])
+    ax.set_zlim(mean_gt[2]-factor_window*range_gt[2],
+                mean_gt[2]+factor_window*range_gt[2])
+    plt.tight_layout()
+    plt.savefig(fname.replace(".png","_gt_color_dist.png"))
+    plt.close()
         
 
 
@@ -438,7 +468,7 @@ def train(
             torch.save(checkpoint, checkpoint_fname)
             args.epochs = temp_epochs
             print("checkpoint saved at", checkpoint_fname)
-        if not args.no_tensorboard and epoch % args.visualize_freq == 0:
+        if not args.no_tensorboard and (epoch+1) % args.visualize_freq == 0:
             sampled_point, xts, x0s, steps = sample(
                 model,
                 scheduler, args,
@@ -454,7 +484,6 @@ def train(
 
             plot_sample_multi_gt(gt_pcs, xts, x0s, steps,
                                  args, epoch,None,dataloader.dataset.use_files_list)
-            exit()
             gt_pcs = gt_pcs * data_factor + data_mean
             sampled_point = sampled_point * data_factor + data_mean
 
