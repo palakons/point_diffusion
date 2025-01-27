@@ -617,7 +617,7 @@ def parse_args():
         description="Train a diffusion model for point clouds"
     )
     parser.add_argument(
-        "--epochs", type=int, default=30, help="Number of training epochs"
+        "--epochs", type=int, default=20*20, help="Number of training epochs"
     )
     parser.add_argument("--batch_size", type=int,
                         default=1, help="Batch size")
@@ -625,7 +625,7 @@ def parse_args():
     parser.add_argument(
         "--N", type=int, default=16384, help="Number of points in each point cloud"
     )
-    parser.add_argument(
+    parser.add_argument( 
         "--M", type=int, default=1, help="Number of point cloud scenes to load"
     )
     parser.add_argument(
@@ -641,7 +641,7 @@ def parse_args():
                         default=False,
                         help="Disable tensorboard logging")
     parser.add_argument(
-        "--visualize_freq", type=int, default=1000, help="Visualize frequency"
+        "--visualize_freq", type=int, default=8, help="Visualize frequency"
     )
     parser.add_argument(
         "--n_hidden_layers", type=int, default=1, help="Number of hidden layers"
@@ -670,7 +670,7 @@ def parse_args():
     )
     parser.add_argument("--tb_log_dir", type=str, default="./logs",
                         help="Path to store tensorboard logs")
-    parser.add_argument("--run_name", type=str, default="", help="Run name")
+    parser.add_argument("--run_name", type=str, default="first-27-jan", help="Run name")
     # normilzation method, std or min-max
     parser.add_argument("--norm_method", type=str,
                         default="std", help="Normalization method")
