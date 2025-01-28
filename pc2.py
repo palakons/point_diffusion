@@ -205,7 +205,8 @@ def plot_multi_gt(gts,  args,input_pc_file_list,  fname ):
         input_pc_file_list = [f"gt_{i}" for i in range(len(gts))]
     for i, (gt,input_fname) in enumerate(zip(gts,input_pc_file_list)):   
         ax = fig.add_subplot(n_row, row_width, i+1, projection='3d')
-        ax.scatter(gt[:, 0], gt[:, 1], gt[:, 2], c='g', marker='o', label='gt')
+        #use smallest marker
+        ax.scatter(gt[:, 0], gt[:, 1], gt[:, 2], c='g', marker=',')
         ax.set_title(f"gt {i}: {input_fname}")
         factor_window = .5
         ax.set_xlim(mean_gt[0]-factor_window*range_gt[0],
@@ -217,6 +218,7 @@ def plot_multi_gt(gts,  args,input_pc_file_list,  fname ):
     plt.tight_layout()
     plt.savefig(fname)
     print(f"saved at {fname}")
+    plt.close()
 
 
 
@@ -226,10 +228,21 @@ def plot_sample_multi_gt(gts, xts, x0s, steps, args, epoch, fname,input_pc_file_
     xts: list of xt (not unnormalized)
     x0s: list of x0 pridcted from each step (not unnormalized)
     '''
+    if False:
+        try:
+            inputs = {"gts": gts, "xts": xts, "x0s": x0s, "steps": steps, "args": args, "epoch": epoch, "fname": fname, "input_pc_file_list": input_pc_file_list, "gts_device": gts.device, "xts_device": xts[0].device, "x0s_device": x0s[0].device}
+            #save to sample_multi_gt.pkl
+            import pickle
+            with open("sample_multi_gt.pkl", "wb") as f:
+                pickle.dump(inputs, f)
+        except Exception as e:
+            print("error saving sample_multi_gt.pkl",e)
+        
+
     if input_pc_file_list is None:
         input_pc_file_list = [f"gt_{i}" for i in range(len(gts))]
 
-    plot_multi_gt(gts,  args, input_pc_file_list, fname=None)
+    # plot_multi_gt(gts,  args, input_pc_file_list, fname=None)
     if fname is None:
         dir_name = f"logs/outputs/" +   args.run_name.replace("/", "_")
         #mkdir
@@ -255,8 +268,8 @@ def plot_sample_multi_gt(gts, xts, x0s, steps, args, epoch, fname,input_pc_file_
 
         ax = fig.add_subplot(2, len(xts), i+1, projection='3d')
 
-        ax.scatter(xt[:, 0], xt[:, 1], xt[:, 2], c='r', marker='o', label='xt')
-        ax.scatter(x0[:, 0], x0[:, 1], x0[:, 2], c='b', marker='o', label='x0')
+        ax.scatter(xt[:, 0], xt[:, 1], xt[:, 2], c='r', marker=',', label='xt')
+        ax.scatter(x0[:, 0], x0[:, 1], x0[:, 2], c='b', marker=',', label='x0')
         # ax.scatter(gts[:, 0], gts[:, 1], gts[:, 2], c='g', marker='o', label='gt')
         ax.set_title(f"step {step}")
         ax.legend()
@@ -282,9 +295,9 @@ def plot_sample_multi_gt(gts, xts, x0s, steps, args, epoch, fname,input_pc_file_
         step = step.cpu().numpy()
         ax2 = fig.add_subplot(2, len(xts), i+1+len(xts), projection='3d')
         ax2.scatter(xt[:, 0], xt[:, 1], xt[:, 2],
-                    c='r', marker='o', label='xt')
+                    c='r', marker=',', label='xt')
         ax2.scatter(x0[:, 0], x0[:, 1], x0[:, 2],
-                    c='b', marker='o', label='x0')
+                    c='b', marker=',', label='x0')
         # ax2.scatter(gts[:, 0], gts[:, 1], gts[:, 2],
         #             c='g', marker='o', label='gt')
         ax2.set_title(f"step {step}")
@@ -307,11 +320,14 @@ def plot_sample_multi_gt(gts, xts, x0s, steps, args, epoch, fname,input_pc_file_
     min_cd = 1e10
     min_gt = None
     min_gt_idx = None
-    for i,gt in enumerate(gts):
+    cd_losses = []
+    
+    for i,gt in enumerate(tqdm(gts, desc="best gts", leave=False)):
         gtt =torch.tensor(gt).unsqueeze(0)
         xtt = torch.tensor(xt).unsqueeze(0)
         # print("gtt",gtt.shape, "xtt",xtt.shape)
         cd, _ = chamfer_distance(gtt, xtt)
+        cd_losses.append(cd.item())
         if cd<min_cd:
             min_cd = cd
             min_gt = gt
@@ -329,18 +345,18 @@ def plot_sample_multi_gt(gts, xts, x0s, steps, args, epoch, fname,input_pc_file_
     ax = fig.add_subplot(111, projection='3d')
     ax.scatter(xt[:, 0], xt[:, 1], xt[:, 2], c='r', marker='o', label=f'xt step {step}')
     #plot min_gt
-    ax.scatter(min_gt[:, 0], min_gt[:, 1], min_gt[:, 2], c='g', marker='o', label=f'gt_{min_gt_idx}: {fname_min_gt}')
+    ax.scatter(min_gt[:, 0], min_gt[:, 1], min_gt[:, 2], c='g', marker=',', label=f'gt_{min_gt_idx}: {fname_min_gt}')
     ax.set_title(f"xt: step {step}")
     ax.legend()
     factor_window = 1.
-    ax.set_xlim(mean_gt[0]-factor_window*range_gt[0],
-                mean_gt[0]+factor_window*range_gt[0])
-    ax.set_ylim(mean_gt[1]-factor_window*range_gt[1],
-                mean_gt[1]+factor_window*range_gt[1])
-    ax.set_zlim(mean_gt[2]-factor_window*range_gt[2],
-                mean_gt[2]+factor_window*range_gt[2])
     plt.tight_layout()
     plt.savefig(fname.replace(".png","_last_step.png"))
+    
+    #read the plot axis limits
+    x_equal_lim=ax.get_xlim()
+    y_equal_lim=ax.get_ylim()
+    z_equal_lim=ax.get_zlim()
+
     plt.close()
 
     #---plot each
@@ -349,12 +365,9 @@ def plot_sample_multi_gt(gts, xts, x0s, steps, args, epoch, fname,input_pc_file_
         ax = fig.add_subplot(111, projection='3d')
         ax.scatter(pcs[:, 0], pcs[:, 1], pcs[:, 2], c='g' if label == "gt" else 'r', marker=',')
         ax.set_title(f"{label} step {step}"+( f" {fname_min_gt}" if label=="gt" else ""))
-        ax.set_xlim(mean_gt[0]-factor_window*range_gt[0],
-                    mean_gt[0]+factor_window*range_gt[0])
-        ax.set_ylim(mean_gt[1]-factor_window*range_gt[1],
-                    mean_gt[1]+factor_window*range_gt[1])
-        ax.set_zlim(mean_gt[2]-factor_window*range_gt[2],
-                    mean_gt[2]+factor_window*range_gt[2])
+        ax.set_xlim(x_equal_lim)
+        ax.set_ylim(y_equal_lim)
+        ax.set_zlim(z_equal_lim)
         plt.tight_layout()  
         plt.savefig(fname.replace(".png",f"_{label}.png"))
         plt.close()
@@ -365,26 +378,25 @@ def plot_sample_multi_gt(gts, xts, x0s, steps, args, epoch, fname,input_pc_file_
     fig = plt.figure(figsize=(10, 10))
     ax = fig.add_subplot(111, projection='3d')
     diff=dist=matrix = min_gt[None,:,:] - xt[:,None,:] # (100, 100, 3)
-    print("diff", diff.shape)
+    # print("diff", diff.shape)
     #norm2 distance
     dist = np.linalg.norm(diff, axis=-1)
-    print("dist", dist.shape)
+    # print("dist", dist.shape)
     #least distance for each gt
     min_dist = np.min(dist, axis=0)
-    print("min_dist", min_dist.shape)
+    # print("min_dist", min_dist.shape)
     plot = ax.scatter(min_gt[:, 0], min_gt[:, 1], min_gt[:, 2], c=min_dist, cmap=color_map_name, marker='o')
     fig.colorbar(plot, ax=ax)
     ax.set_title(f"gt_{min_gt_idx}: {fname_min_gt}")
-    ax.set_xlim(mean_gt[0]-factor_window*range_gt[0],
-                mean_gt[0]+factor_window*range_gt[0])
-    ax.set_ylim(mean_gt[1]-factor_window*range_gt[1],
-
-                mean_gt[1]+factor_window*range_gt[1])
-    ax.set_zlim(mean_gt[2]-factor_window*range_gt[2],
-                mean_gt[2]+factor_window*range_gt[2])
+    ax.set_xlim(x_equal_lim)
+    ax.set_ylim(y_equal_lim)
+    ax.set_zlim(z_equal_lim)
     plt.tight_layout()
     plt.savefig(fname.replace(".png","_gt_color_dist.png"))
     plt.close()
+    
+
+    return cd_losses
         
 
 
@@ -424,7 +436,7 @@ def train(
         if not args.no_tensorboard:
             writer.add_scalar("Loss/epoch", sum(losses) / len(losses), epoch)
 
-        if not args.no_checkpoint and epoch % args.checkpoint_freq == 0:
+        if not args.no_checkpoint and (epoch+1) % args.checkpoint_freq == 0:
             temp_epochs = args.epochs
             args.epochs = epoch
             checkpoint = {
@@ -436,7 +448,7 @@ def train(
             torch.save(checkpoint, checkpoint_fname)
             args.epochs = temp_epochs
             print("checkpoint saved at", checkpoint_fname)
-        if not args.no_tensorboard and (epoch+1) % args.visualize_freq == 0:
+        if not args.no_tensorboard and (epoch+1*0) % args.visualize_freq == 0:
 
             batch = next(iter(dataloader))
             batch = batch.to(device)
@@ -464,32 +476,66 @@ def train(
             # all samples
             # gt_pcs = dataloader.dataset.data.to(device)
 
-            gt_pcs = [pcpm.point_cloud_to_tensor(batch.sequence_point_cloud, normalize=True, scale=True) for batch in dataloader.dataset]
+            gt_pcs_all = [pcpm.point_cloud_to_tensor(batch.sequence_point_cloud, normalize=True, scale=True) for batch in dataloader.dataset]
             # for i,gt_pc in enumerate(gt_pcs):
             #     print("gt_pc",i,gt_pc.shape)
             #keep only the sample with 16384 points
-            gt_pcs = [gt_pc for gt_pc in gt_pcs if gt_pc.shape[1]==16384]
+            gt_pcs = [gt_pc for gt_pc in gt_pcs_all if gt_pc.shape[1]==16384]
             #stack all gt_pcs 
             gt_pcs = torch.cat(gt_pcs, dim=0).to(device)
 
             # print("gt_pcs",gt_pcs.shape) #gt_pcs torch.Size([141, 16384, 3])
             # exit()
 
-            plot_sample_multi_gt(gt_pcs, xts, x0s, steps,
+            cd_losses = plot_sample_multi_gt(gt_pcs, xts, x0s, steps,
                                  args, epoch,None,None)
             # gt_pcs = gt_pcs * data_factor + data_mean
             # sampled_point = sampled_point * data_factor + data_mean
 
             # cd_loss, _ = chamfer_distance(gt_pcs, sampled_point)
-            cd_losses = []
-            for i,gt_pc  in enumerate(gt_pcs):
-                # print("gt_pc",i,gt_pc.shape)
-                # print("sampled_point",sampled_point.shape)
-                # gt_pc 0 torch.Size([16384, 3])
-                # sampled_point torch.Size([4, 16384, 3])
-                cd_loss_i, _ = chamfer_distance(
-                    gt_pc.unsqueeze(0), sampled_point)
-                cd_losses.append(cd_loss_i.item())
+            # cd_losses = []
+            # for i,gt_pc  in enumerate(gt_pcs):
+            #     # print("gt_pc",i,gt_pc.shape)
+            #     # print("sampled_point",sampled_point.shape)
+            #     # gt_pc 0 torch.Size([16384, 3])
+            #     # sampled_point torch.Size([4, 16384, 3])
+            #     cd_loss_i, _ = chamfer_distance(
+            #         gt_pc.unsqueeze(0), sampled_point)
+            #     cd_losses.append(cd_loss_i.item())
+            try:
+                #save image_rgb, mask at the best cd_loss
+                best_cd_loss = min(cd_losses)
+                best_cd_loss_idx = cd_losses.index(best_cd_loss)
+                best_cd_loss_gt = gt_pcs[best_cd_loss_idx]
+                best_cd_loss_gt = best_cd_loss_gt.cpu().numpy()
+
+                print("best_cd_loss",best_cd_loss,"best_cd_loss_idx",best_cd_loss_idx)
+                print("len(cd_losses)",len(cd_losses))
+                print("len(gt_pcs)",len(gt_pcs))
+                print("len(datset)",len(dataloader.dataset))
+
+                carry = 0
+                for i, (batch,gt_pc) in enumerate(zip(dataloader.dataset,gt_pcs)):
+                    if gt_pc.shape[1]!=16384:
+                        carry+=1
+                    if i == best_cd_loss_idx+carry:
+                        print("best_cd_loss_idx",best_cd_loss_idx,"carry",carry,"i",i)
+                        best_image_rgb = batch.image_rgb
+                        best_mask = batch.fg_probability
+                        #save image_rgb, mask
+                        dir_name = f"logs/outputs/" +   args.run_name.replace("/", "_")
+                        #mkdir
+                        if not os.path.exists(dir_name):
+                            os.makedirs(dir_name)
+                        fname = f"{dir_name}/image_rgb_M{args.M}.png"
+                        plt.imsave(fname, best_image_rgb[0].cpu().numpy().transpose(1,2,0))
+                        fname = f"{dir_name}/mask_M{args.M}.png"
+                        plt.imsave(fname, best_mask[0].cpu().numpy().transpose(1,2,0))
+
+                        break
+                
+            except Exception as e:
+                print("error cannot save image",e)
 
             writer.add_scalar("CD_min/epoch", min(cd_losses), epoch)
             writer.add_scalar("CD_max/epoch", max(cd_losses), epoch)
@@ -617,7 +663,7 @@ def parse_args():
         description="Train a diffusion model for point clouds"
     )
     parser.add_argument(
-        "--epochs", type=int, default=20*20, help="Number of training epochs"
+        "--epochs", type=int, default= 20*20, help="Number of training epochs"
     )
     parser.add_argument("--batch_size", type=int,
                         default=1, help="Batch size")
@@ -641,7 +687,7 @@ def parse_args():
                         default=False,
                         help="Disable tensorboard logging")
     parser.add_argument(
-        "--visualize_freq", type=int, default=8, help="Visualize frequency"
+        "--visualize_freq", type=int, default=8*0+1, help="Visualize frequency"
     )
     parser.add_argument(
         "--n_hidden_layers", type=int, default=1, help="Number of hidden layers"
@@ -653,10 +699,10 @@ def parse_args():
     parser.add_argument("--model", type=str,
                         default="pc2", help="Model type")
     parser.add_argument(
-        "--checkpoint_freq", type=int, default=100000, help="Checkpoint frequency"
+        "--checkpoint_freq", type=int, default=10, help="Checkpoint frequency"
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--no_checkpoint", default=True,
+    parser.add_argument("--no_checkpoint", default=False,
                         # action="store_true",
                         help="No checkpoint")
     parser.add_argument(
@@ -670,7 +716,7 @@ def parse_args():
     )
     parser.add_argument("--tb_log_dir", type=str, default="./logs",
                         help="Path to store tensorboard logs")
-    parser.add_argument("--run_name", type=str, default="first-27-jan", help="Run name")
+    parser.add_argument("--run_name", type=str, default="first-27-jan-400", help="Run name")
     # normilzation method, std or min-max
     parser.add_argument("--norm_method", type=str,
                         default="std", help="Normalization method")
