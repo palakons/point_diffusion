@@ -8,6 +8,7 @@ from pathlib import Path
 from torch import Tensor
 from typing import Optional, Union
 import inspect
+from pytorch3d.vis.plotly_vis import get_camera_wireframe
 
 from pytorch3d.renderer.cameras import CamerasBase
 from pytorch3d.implicitron.dataset.json_index_dataset_map_provider_v2 import (
@@ -221,26 +222,25 @@ def plot_multi_gt(gts,  args,input_pc_file_list,  fname ):
     plt.close()
 
 
-def plot_sample_multi_gt(gts, xts, x0s, steps, args, epoch, fname,input_pc_file_list,point_size=.1,camera=None, image_rgb=None, mask=None):
-    '''
-    gts: ground truth point cloud, multi M (not unnormalized)
-    xts: list of xt (not unnormalized)
-    x0s: list of x0 pridcted from each step (not unnormalized)
-    '''
-        
-    if False:
-        try:
-            inputs = {"gts": gts, "xts": xts, "x0s": x0s, "steps": steps, "args": args, "epoch": epoch, "fname": fname, "input_pc_file_list": input_pc_file_list, "gts_device": gts.device, "xts_device": xts[0].device, "x0s_device": x0s[0].device, "camera": camera, "image_rgb": image_rgb, "mask": mask,"camera_device":camera.device,"image_rgb_device":image_rgb.device,"mask_device":mask.device}
-            #save to sample_multi_gt.pkl
-            import pickle
-            with open("sample_multi_gt.pkl", "wb") as f:
-                pickle.dump(inputs, f)
-        except Exception as e:
-            print("error saving sample_multi_gt.pkl",e)
-        exit()
 
-    if input_pc_file_list is None:
-        input_pc_file_list = [f"gt_{i}" for i in range(len(gts))]
+def plot_cameras(ax, cameras, color: str = "blue"):
+    """
+    Plots a set of `cameras` objects into the maplotlib axis `ax` with
+    color `color`.
+    """
+    cam_wires_canonical = get_camera_wireframe().cuda()[None]
+    cam_trans = cameras.get_world_to_view_transform().inverse()
+    cam_wires_trans = cam_trans.transform_points(cam_wires_canonical)
+    plot_handles = []
+    for wire in cam_wires_trans:
+        # the Z and Y axes are flipped intentionally here!
+        x_, z_, y_ = wire.detach().cpu().numpy().T.astype(float)
+        (h,) = ax.plot(x_, y_, z_, color=color, linewidth=0.3)
+        plot_handles.append(h)
+    return plot_handles
+
+def plot_sample_condition(gt, xts, x0s, steps, args, epoch, fname,point_size=.1,camera=None, image_rgb=None, mask=None):
+    assert gt.shape[0] == 1, "gt should have shape (1, N, 3)"
 
     # plot_multi_gt(gts,  args, input_pc_file_list, fname=None)
     if fname is None:
@@ -249,16 +249,10 @@ def plot_sample_multi_gt(gts, xts, x0s, steps, args, epoch, fname,input_pc_file_
         if not os.path.exists(dir_name):
             os.makedirs(dir_name)        
         fname = f"{dir_name}/sample_ep{epoch:09d}_M{args.M}.png"
+    print("fname",fname)
 
-    gts = gts.cpu().numpy()
-    # find minimum from axes 0 and 1
-    min_gt = gts.min(axis=0).min(axis=0)
-    max_gt = gts.max(axis=0).max(axis=0)
-    mean_gt = gts.mean(axis=0).mean(axis=0)
-    range_gt = max_gt-min_gt
-
-    min_all = min_gt.copy()
-    max_all = max_gt.copy()
+    gt = gt.cpu().numpy()
+    gt = gt[0]
 
     if False:
 
@@ -318,47 +312,27 @@ def plot_sample_multi_gt(gts, xts, x0s, steps, args, epoch, fname,input_pc_file_
     xt = xts[-1].cpu().numpy()[0]
     x0 = x0s[-1].cpu().numpy()[0]
 
-    #find gt with least chamfer distance to xt[-1]
-    min_cd = 1e10
-    min_gt = None
-    min_gt_idx = None
-    cd_losses = []
-
-    gts = torch.tensor(gts).to("cuda:0")
-    xt = torch.tensor(xt).to("cuda:0")
-    
-    for i,gt in enumerate(tqdm(gts, desc="best gts", leave=False)):
-        
-        gtt =gt.unsqueeze(0)
-        xtt = xt.unsqueeze(0)
-        # print("gtt",gtt.shape, "xtt",xtt.shape)
-        cd, _ = chamfer_distance(gtt, xtt)
-        cd_losses.append(cd.item())
-        if cd<min_cd:
-            min_cd = cd
-            min_gt = gt.cpu().numpy()
-            min_gt_idx = i
-    
-    gts = gts.detach().cpu().numpy()
-    xt = xt.detach().cpu().numpy()
-    
-            
-    fname_min_gt = input_pc_file_list[min_gt_idx].split("/")[-1]
 
     step = steps[-1].cpu().numpy()
-
-    # print("shapes", xt.shape, x0.shape, min_gt.shape) #shapes (1, 100, 3) (1, 100, 3) (100, 3)
-    
 
     #---plot combined
     fig = plt.figure(figsize=(10, 10))
     ax = fig.add_subplot(111, projection='3d')
-    ax.scatter(xt[:, 0], xt[:, 1], xt[:, 2], c='r', marker='o', label=f'xt step {step}',s=point_size)
-    #plot min_gt
-    ax.scatter(min_gt[:, 0], min_gt[:, 1], min_gt[:, 2], c='g', marker=',', label=f'gt_{min_gt_idx}: {fname_min_gt}',s=point_size)
+    ax.scatter(xt[:, 0], xt[:, 1], xt[:, 2], c='r', marker=',', label=f'xt step {step}',s=point_size)
+    ax.scatter(gt[:, 0], gt[:, 1], gt[:, 2], c='g', marker=',', label=f'gt',s=point_size)
     ax.set_title(f"xt: step {step}")
     ax.legend()
     factor_window = 1.
+    ax.set_xlabel('X')
+    ax.set_ylabel('Y')
+    ax.set_zlabel('Z')
+
+    if camera is not None:
+        #plot frustrum
+        print("camera",camera[0])
+        plot_cameras(ax, camera[0], color = "blue")
+
+        pass 
     plt.tight_layout()
     plt.savefig(fname.replace(".png","_last_step.png"))
     # print("saved at",fname.replace(".png","_last_step.png"))
@@ -372,14 +346,17 @@ def plot_sample_multi_gt(gts, xts, x0s, steps, args, epoch, fname,input_pc_file_
 
     #---plot each
     # for label, pcs in zip(["xt", "x0", "gt"], [xt, x0, min_gt]):
-    for label, pcs in zip(["xt", "gt"], [xt, min_gt]):
+    for label, pcs in zip(["xt", "gt"], [xt, gt]):
         fig = plt.figure(figsize=(10, 10))
         ax = fig.add_subplot(111, projection='3d')
         ax.scatter(pcs[:, 0], pcs[:, 1], pcs[:, 2], c='g' if label == "gt" else 'r', marker=',',s=point_size)
-        ax.set_title(f"{label} step {step}"+( f" {fname_min_gt}" if label=="gt" else ""))
+        ax.set_title(f"{label} step {step}")
         ax.set_xlim(x_equal_lim)
         ax.set_ylim(y_equal_lim)
         ax.set_zlim(z_equal_lim)
+        ax.set_xlabel('X')
+        ax.set_ylabel('Y')
+        ax.set_zlabel('Z')
         plt.tight_layout()  
         plt.savefig(fname.replace(".png",f"_{label}.png"))
 
@@ -390,26 +367,38 @@ def plot_sample_multi_gt(gts, xts, x0s, steps, args, epoch, fname,input_pc_file_
     # plot gt, with color based on distance to xt
     fig = plt.figure(figsize=(10, 10))
     ax = fig.add_subplot(111, projection='3d')
-    diff=dist=matrix = min_gt[None,:,:] - xt[:,None,:] # (100, 100, 3)
-    # print("diff", diff.shape)
+    # print("xt", xt.shape)
+    # print("gt", gt.shape)
+    # xt (16384, 3)
+    # gt (1, 16384, 3)
+    diff = gt[None,:,:] - xt[:,None,:] # (100, 100, 3)
+    print("diff", diff.shape)
     #norm2 distance
     dist = np.linalg.norm(diff, axis=-1)
-    # print("dist", dist.shape)
+    print("dist", dist.shape)
     #least distance for each gt
     min_dist = np.min(dist, axis=0)
-    # print("min_dist", min_dist.shape)
-    plot = ax.scatter(min_gt[:, 0], min_gt[:, 1], min_gt[:, 2], c=min_dist, cmap=color_map_name, marker=',',s=point_size)
-    fig.colorbar(plot, ax=ax)
-    ax.set_title(f"gt_{min_gt_idx}: {fname_min_gt}")
+    print("min_dist", min_dist.shape)
+    plot = ax.scatter(gt[:, 0], gt[:, 1], gt[:, 2], c=min_dist, cmap=color_map_name, marker=',',s=point_size)
+
+    # fig.colorbar(plot, ax=ax)
+    from mpl_toolkits.axes_grid1.inset_locator import inset_axes
+
+    # Create an inset for the color bar
+    cax = inset_axes(ax, width="5%", height="50%", loc='lower left', borderpad=1)
+
+    # Add the color bar to the inset
+    fig.colorbar(plot, cax=cax)
+    ax.set_title(f"gt")
     ax.set_xlim(x_equal_lim)
     ax.set_ylim(y_equal_lim)
     ax.set_zlim(z_equal_lim)
+    ax.set_xlabel('X')
+    ax.set_ylabel('Y')
+    ax.set_zlabel('Z')
     plt.tight_layout()
     plt.savefig(fname.replace(".png","_gt_color_dist.png"))
     plt.close()
-    
-
-    return cd_losses
 
 
 
@@ -459,7 +448,7 @@ def train(
             # save at /data/palakons/checkpoint/cp_{datetime.now().strftime("%Y%m%d-%H%M%S")}.pth
             torch.save(checkpoint, checkpoint_fname)
             args.epochs = temp_epochs
-        if not args.no_tensorboard and (epoch+1*0) % args.visualize_freq == 0:
+        if not args.no_tensorboard and (epoch+1) % args.visualize_freq == 0:
 
             batch = next(iter(dataloader))
             batch = batch.to(device)
@@ -481,100 +470,21 @@ def train(
                 device=device,
             )
 
-            ## plot_sample_conditioned_gt()
-            # data_mean = dataloader.dataset.mean.to(device)
-            # data_factor = dataloader.dataset.factor.to(device)
-            # all samples
-            # gt_pcs = dataloader.dataset.data.to(device)
-
-            gt_pcs_all = [pcpm.point_cloud_to_tensor(batch.sequence_point_cloud, normalize=True, scale=True) for batch in dataloader.dataset]
-            # for i,gt_pc in enumerate(gt_pcs):
-            #     print("gt_pc",i,gt_pc.shape)
-            #keep only the sample with 16384 points
-            gt_pcs = [gt_pc for gt_pc in gt_pcs_all if gt_pc.shape[1]==16384]
-            #stack all gt_pcs 
-            gt_pcs = torch.cat(gt_pcs, dim=0).to(device)
 
             # print("gt_pcs",gt_pcs.shape) #gt_pcs torch.Size([141, 16384, 3])
             # exit()
+            pc_condition = pcpm.point_cloud_to_tensor(pc[:1], normalize=True, scale=True)
+            # print("pc_condition",pc_condition.shape)
+            # print("sampled_point",sampled_point.shape)
+            # pc_condition torch.Size([1, 16384, 3])
+            # sampled_point torch.Size([1, 16384, 3])
+            plot_sample_condition(pc_condition, xts, x0s, steps,
+                                 args, epoch,None,.1,camera=camera[0], image_rgb=image_rgb[:1], mask=mask[:1])
+            cd_loss,_ = chamfer_distance(sampled_point,pc_condition)
 
-            cd_losses = plot_sample_multi_gt(gt_pcs, xts, x0s, steps,
-                                 args, epoch,None,None,camera=camera[0], image_rgb=image_rgb[:1], mask=mask[:1])
-            # gt_pcs = gt_pcs * data_factor + data_mean
-            # sampled_point = sampled_point * data_factor + data_mean
-
-            # cd_loss, _ = chamfer_distance(gt_pcs, sampled_point)
-            # cd_losses = []
-            # for i,gt_pc  in enumerate(gt_pcs):
-            #     # print("gt_pc",i,gt_pc.shape)
-            #     # print("sampled_point",sampled_point.shape)
-            #     # gt_pc 0 torch.Size([16384, 3])
-            #     # sampled_point torch.Size([4, 16384, 3])
-            #     cd_loss_i, _ = chamfer_distance(
-            #         gt_pc.unsqueeze(0), sampled_point)
-            #     cd_losses.append(cd_loss_i.item())
-            try:
-                #save image_rgb, mask at the best cd_loss
-                best_cd_loss = min(cd_losses)
-                best_cd_loss_idx = cd_losses.index(best_cd_loss)
-                best_cd_loss_gt = gt_pcs[best_cd_loss_idx]
-                best_cd_loss_gt = best_cd_loss_gt.cpu().numpy()
-
-                # print("best_cd_loss",best_cd_loss,"best_cd_loss_idx",best_cd_loss_idx)
-                # print("len(cd_losses)",len(cd_losses))
-                # print("len(gt_pcs)",len(gt_pcs))
-                # print("len(datset)",len(dataloader.dataset))
-
-                carry = 0
-                for i, (batch,gt_pc) in enumerate(zip(dataloader.dataset,gt_pcs)):
-                    # print("carry",carry)
-                    # print("gt_pc",gt_pc.shape)
-                    # print("best_cd_loss_idx",best_cd_loss_idx)
-                    # print("i",i)
-                    if gt_pc.shape[0]!=16384:
-                        carry+=1
-                    if i == best_cd_loss_idx+carry:
-                        # print("best_cd_loss_idx",best_cd_loss_idx,"carry",carry,"i",i)
-                        best_image_rgb = batch.image_rgb
-                        best_mask = batch.fg_probability
-                        #save image_rgb, mask
-                        dir_name = f"logs/outputs/" +   args.run_name.replace("/", "_")
-                        #mkdir
-                        if not os.path.exists(dir_name):
-                            os.makedirs(dir_name)
-                        fname = f"{dir_name}/image_rgb_epoch_{epoch}_M{args.M}.png"
-                        # print("shape",best_image_rgb.shape)
-                        # print("mask shape",best_mask.shape)
-                        # hape torch.Size([3, 224, 224])
-                        # mask shape torch.Size([1, 224, 224])
-                        best_image= best_image_rgb.cpu().numpy().transpose(1,2,0)
-                        # print("best_image",best_image.shape)
-                        plt.imsave(fname,best_image )
-                        # print("saved at",fname)
-                        fname = f"{dir_name}/mask_epoch_{epoch}_M{args.M}.png"
-                        best_mask = best_mask.cpu().numpy().transpose(1,2,0)
-                        best_mask = np.repeat(best_mask, 3, axis=2)
-                        # print("best_mask",best_mask.shape)
-                        plt.imsave(fname, best_mask)
-                        # print("saved at",fname)
-
-                        break
-                
-            except Exception as e:
-                print("error cannot save image",e)
-
-            writer.add_scalar("CD_min/epoch", min(cd_losses), epoch)
-            writer.add_scalar("CD_max/epoch", max(cd_losses), epoch)
             writer.add_scalar(
-                "CD_mean/epoch", sum(cd_losses) / len(cd_losses), epoch)
+                "CD_condition/epoch", cd_loss.item() , epoch)
 
-            # sampled_point = sampled_point.cpu().numpy()
-            # gt_pcs = gt_pcs.cpu().numpy()
-
-            # log_sample_to_tb(
-            #     sampled_point[0, :, :], gt_pcs[0,
-            #                                   :, :], f"for_visual", 50, epoch, writer
-            # )  # support M=1 only
     if not args.no_checkpoint or True:
         checkpoint = {
             "model": model.state_dict(),
@@ -728,7 +638,7 @@ def parse_args():
         "--checkpoint_freq", type=int, default=10, help="Checkpoint frequency"
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--no_checkpoint", default=False,
+    parser.add_argument("--no_checkpoint", default=True,
                         # action="store_true",
                         help="No checkpoint")
     parser.add_argument(
