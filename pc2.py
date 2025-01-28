@@ -223,7 +223,8 @@ def plot_multi_gt(gts,  args,input_pc_file_list,  fname ):
 
 
 
-def plot_cameras(ax, cameras, color: str = "blue"):
+
+def get_camera_wires_trans(cameras):
     """
     Plots a set of `cameras` objects into the maplotlib axis `ax` with
     color `color`.
@@ -231,13 +232,108 @@ def plot_cameras(ax, cameras, color: str = "blue"):
     cam_wires_canonical = get_camera_wireframe().cuda()[None]
     cam_trans = cameras.get_world_to_view_transform().inverse()
     cam_wires_trans = cam_trans.transform_points(cam_wires_canonical)
-    plot_handles = []
-    for wire in cam_wires_trans:
-        # the Z and Y axes are flipped intentionally here!
-        x_, z_, y_ = wire.detach().cpu().numpy().T.astype(float)
-        (h,) = ax.plot(x_, y_, z_, color=color, linewidth=0.3)
-        plot_handles.append(h)
-    return plot_handles
+    return cam_wires_trans
+
+def plot_quadrants(point_list, color_list,name_list,fname,point_size=.5,title="",camera=None,ax_lims=None,color_map_name="gist_rainbow"):
+    
+    cam_wires_trans =get_camera_wires_trans(camera) if camera is not None else None
+    fig = plt.figure(figsize=(40, 40))
+    ax = fig.add_subplot(221, projection='3d')
+    for points, color, name in zip(point_list, color_list,name_list):
+        assert len(points.shape) == 2, "points should have shape (N, 3)"
+        assert points.shape[1] == 3, "points should have shape (N, 3)"
+        plot=ax.scatter(points[:, 0], points[:, 1], points[:, 2], c=color, marker=',', label=name,s=point_size, cmap=color_map_name)
+        #if color is not string
+        if not isinstance(color, str):
+            cax = inset_axes(ax, width="5%", height="50%", loc='lower left', borderpad=1)
+            fig.colorbar(plot, cax=cax)
+    ax.legend()
+    ax.set_xlabel('X')
+    ax.set_ylabel('Y')
+    ax.set_zlabel('Z')
+    
+    if camera is not None:
+        for wire in cam_wires_trans:
+            # the Z and Y axes are flipped intentionally here!
+            x_, z_, y_ = wire.detach().cpu().numpy().T.astype(float)
+            (h,) = ax.plot(x_, y_, z_, color='k', linewidth=0.3)
+    ax.set_title(title)
+    if ax_lims is not None:
+        ax.set_xlim(ax_lims[0])
+        ax.set_ylim(ax_lims[1])
+        ax.set_zlim(ax_lims[2])
+    ax.set_aspect('equal')
+    x_equal_lim=ax.get_xlim()
+    y_equal_lim=ax.get_ylim()
+    z_equal_lim=ax.get_zlim()
+
+    #next plot x-z, 2D
+    ax = fig.add_subplot(222)
+    for points, color, name in zip(point_list, color_list,name_list):
+        plot=ax.scatter(points[:, 0], points[:, 2], c=color, marker=',', label=name,s=point_size, cmap=color_map_name)
+        
+        if not isinstance(color, str):
+            cax = inset_axes(ax, width="5%", height="50%", loc='lower left', borderpad=1)
+            fig.colorbar(plot, cax=cax)
+    if camera is not None:
+        for wire in cam_wires_trans:
+            x_, z_, y_ = wire.detach().cpu().numpy().T.astype(float)
+            (h,) = ax.plot(x_, z_, color='k', linewidth=0.3)
+    ax.legend()
+    ax.set_xlabel('X')
+    ax.set_ylabel('Z')
+    
+    if ax_lims is not None:
+        ax.set_xlim(ax_lims[0])
+        ax.set_ylim(ax_lims[2])
+    ax.set_aspect('equal')
+
+    #next plot y-z, 2D
+    ax = fig.add_subplot(223)
+    for points, color, name in zip(point_list, color_list,name_list):
+        plot=ax.scatter(points[:, 1], points[:, 2], c=color, marker=',', label=name,s=point_size, cmap=color_map_name)
+        
+        if not isinstance(color, str):
+            cax = inset_axes(ax, width="5%", height="50%", loc='lower left', borderpad=1)
+            fig.colorbar(plot, cax=cax)
+    if camera is not None:
+        for wire in cam_wires_trans:
+            x_, z_, y_ = wire.detach().cpu().numpy().T.astype(float)
+            (h,) = ax.plot(y_, z_, color='k', linewidth=0.3)
+    ax.legend()
+    ax.set_xlabel('Y')
+    ax.set_ylabel('Z')
+    if ax_lims is not None:
+        ax.set_xlim(ax_lims[1])
+        ax.set_ylim(ax_lims[2])
+    ax.set_aspect('equal')
+
+    #next plot x-y, 2D
+    ax = fig.add_subplot(224)
+    for points, color, name in zip(point_list, color_list,name_list):
+        plot=ax.scatter(points[:, 0], points[:, 1], c=color, marker=',', label=name,s=point_size, cmap=color_map_name)
+        
+        if not isinstance(color, str):
+            cax = inset_axes(ax, width="5%", height="50%", loc='lower left', borderpad=1)
+            fig.colorbar(plot, cax=cax)
+    if camera is not None:
+        for wire in cam_wires_trans:
+            x_, z_, y_ = wire.detach().cpu().numpy().T.astype(float)
+            (h,) = ax.plot(x_, y_, color='k', linewidth=0.3)
+    ax.legend()
+    ax.set_xlabel('X')
+    ax.set_ylabel('Y')
+    if ax_lims is not None:
+        ax.set_xlim(ax_lims[0])
+        ax.set_ylim(ax_lims[1])
+    ax.set_aspect('equal')
+    
+    #end all plots
+
+    plt.tight_layout()
+    plt.savefig(fname)
+    plt.close()
+    return x_equal_lim, y_equal_lim, z_equal_lim
 
 def plot_sample_condition(gt, xts, x0s, steps, args, epoch, fname,point_size=.1,camera=None, image_rgb=None, mask=None):
     assert gt.shape[0] == 1, "gt should have shape (1, N, 3)"
@@ -249,156 +345,21 @@ def plot_sample_condition(gt, xts, x0s, steps, args, epoch, fname,point_size=.1,
         if not os.path.exists(dir_name):
             os.makedirs(dir_name)        
         fname = f"{dir_name}/sample_ep{epoch:09d}_M{args.M}.png"
-    print("fname",fname)
+    # print("fname",fname)
 
-    gt = gt.cpu().numpy()
-    gt = gt[0]
-
-    if False:
-
-        fig = plt.figure(figsize=(30, 10))
-        for i, (xt, x0, step) in enumerate(zip(xts, x0s, steps)):
-            xt = xt[0].cpu().numpy()
-            x0 = x0[0].cpu().numpy()
-            step = step.cpu().numpy()
-
-            ax = fig.add_subplot(2, len(xts), i+1, projection='3d')
-
-            ax.scatter(xt[:, 0], xt[:, 1], xt[:, 2], c='r', marker=',', label='xt')
-            ax.scatter(x0[:, 0], x0[:, 1], x0[:, 2], c='b', marker=',', label='x0')
-            # ax.scatter(gts[:, 0], gts[:, 1], gts[:, 2], c='g', marker='o', label='gt')
-            ax.set_title(f"step {step}")
-            ax.legend()
-            factor_window = 1.5
-            ax.set_xlim(mean_gt[0]-factor_window*range_gt[0],
-                        mean_gt[0]+factor_window*range_gt[0])
-            ax.set_ylim(mean_gt[1]-factor_window*range_gt[1],
-                        mean_gt[1]+factor_window*range_gt[1])
-            ax.set_zlim(mean_gt[2]-factor_window*range_gt[2],
-                        mean_gt[2]+factor_window*range_gt[2])
-            # print(min_all,x0.min(axis=0),xt.min(axis=0))
-            min_all = np.minimum(min_all, x0.min(axis=0), xt.min(axis=0))
-            max_all = np.maximum(max_all, x0.max(axis=0), xt.max(axis=0))
-
-        mean_all = (min_all+max_all)/2
-        range_all = np.maximum(abs(min_all-mean_all), abs(max_all-mean_all))
-        min_min = mean_all-range_all
-        max_max = mean_all+range_all
-
-        for i, (xt, x0, step) in enumerate(zip(xts, x0s, steps)):
-            xt = xt[0].cpu().numpy()
-            x0 = x0[0].cpu().numpy()
-            step = step.cpu().numpy()
-            ax2 = fig.add_subplot(2, len(xts), i+1+len(xts), projection='3d')
-            ax2.scatter(xt[:, 0], xt[:, 1], xt[:, 2],
-                        c='r', marker=',', label='xt')
-            ax2.scatter(x0[:, 0], x0[:, 1], x0[:, 2],
-                        c='b', marker=',', label='x0')
-            # ax2.scatter(gts[:, 0], gts[:, 1], gts[:, 2],
-            #             c='g', marker='o', label='gt')
-            ax2.set_title(f"step {step}")
-            ax2.legend()
-            ax2.set_xlim(min_min[0], max_max[0])
-            ax2.set_ylim(min_min[1], max_max[1])
-            ax2.set_zlim(min_min[2], max_max[2])
-
-        # plt.title(f"Evolution of point cloud at epoch {epoch}")
-        plt.tight_layout()
-        plt.savefig(fname)
-        plt.close() 
-
-    
-    #plot the last step, xts[-1], which would equal to x0s[-1]
+    gt = gt.cpu().numpy()[0]    
     xt = xts[-1].cpu().numpy()[0]
-    x0 = x0s[-1].cpu().numpy()[0]
 
-
-    step = steps[-1].cpu().numpy()
-
-    #---plot combined
-    fig = plt.figure(figsize=(10, 10))
-    ax = fig.add_subplot(111, projection='3d')
-    ax.scatter(xt[:, 0], xt[:, 1], xt[:, 2], c='r', marker=',', label=f'xt step {step}',s=point_size)
-    ax.scatter(gt[:, 0], gt[:, 1], gt[:, 2], c='g', marker=',', label=f'gt',s=point_size)
-    ax.set_title(f"xt: step {step}")
-    ax.legend()
-    factor_window = 1.
-    ax.set_xlabel('X')
-    ax.set_ylabel('Y')
-    ax.set_zlabel('Z')
-
-    if camera is not None:
-        #plot frustrum
-        print("camera",camera[0])
-        plot_cameras(ax, camera[0], color = "blue")
-
-        pass 
-    plt.tight_layout()
-    plt.savefig(fname.replace(".png","_last_step.png"))
-    # print("saved at",fname.replace(".png","_last_step.png"))
+    x_equal_lim, y_equal_lim, z_equal_lim=plot_quadrants([gt,xt], ["g","r"],["gt",'xt'],fname.replace(".png","_gt-xt.png"),point_size=1,title=f"epoch {epoch}",camera=camera)
     
-    #read the plot axis limits
-    x_equal_lim=ax.get_xlim()
-    y_equal_lim=ax.get_ylim()
-    z_equal_lim=ax.get_zlim()
+    plot_quadrants([gt], ["g"],["gt"],fname.replace(".png","_gt.png"),point_size=1,title=f"epoch {epoch}",camera=camera,ax_lims=[x_equal_lim,y_equal_lim,z_equal_lim])
+    plot_quadrants([xt], ["r"],["xt"],fname.replace(".png","_xt.png"),point_size=1,title=f"epoch {epoch}",camera=camera,ax_lims=[x_equal_lim,y_equal_lim,z_equal_lim])
 
-    plt.close()
-
-    #---plot each
-    # for label, pcs in zip(["xt", "x0", "gt"], [xt, x0, min_gt]):
-    for label, pcs in zip(["xt", "gt"], [xt, gt]):
-        fig = plt.figure(figsize=(10, 10))
-        ax = fig.add_subplot(111, projection='3d')
-        ax.scatter(pcs[:, 0], pcs[:, 1], pcs[:, 2], c='g' if label == "gt" else 'r', marker=',',s=point_size)
-        ax.set_title(f"{label} step {step}")
-        ax.set_xlim(x_equal_lim)
-        ax.set_ylim(y_equal_lim)
-        ax.set_zlim(z_equal_lim)
-        ax.set_xlabel('X')
-        ax.set_ylabel('Y')
-        ax.set_zlabel('Z')
-        plt.tight_layout()  
-        plt.savefig(fname.replace(".png",f"_{label}.png"))
-
-        plt.close()
-
-    #---plot distance by color
-    color_map_name = "gist_rainbow" #https://matplotlib.org/stable/tutorials/colors/colormaps.html
-    # plot gt, with color based on distance to xt
-    fig = plt.figure(figsize=(10, 10))
-    ax = fig.add_subplot(111, projection='3d')
-    # print("xt", xt.shape)
-    # print("gt", gt.shape)
-    # xt (16384, 3)
-    # gt (1, 16384, 3)
+    color_map_name = "gist_rainbow" 
     diff = gt[None,:,:] - xt[:,None,:] # (100, 100, 3)
-    print("diff", diff.shape)
-    #norm2 distance
     dist = np.linalg.norm(diff, axis=-1)
-    print("dist", dist.shape)
-    #least distance for each gt
     min_dist = np.min(dist, axis=0)
-    print("min_dist", min_dist.shape)
-    plot = ax.scatter(gt[:, 0], gt[:, 1], gt[:, 2], c=min_dist, cmap=color_map_name, marker=',',s=point_size)
-
-    # fig.colorbar(plot, ax=ax)
-    from mpl_toolkits.axes_grid1.inset_locator import inset_axes
-
-    # Create an inset for the color bar
-    cax = inset_axes(ax, width="5%", height="50%", loc='lower left', borderpad=1)
-
-    # Add the color bar to the inset
-    fig.colorbar(plot, cax=cax)
-    ax.set_title(f"gt")
-    ax.set_xlim(x_equal_lim)
-    ax.set_ylim(y_equal_lim)
-    ax.set_zlim(z_equal_lim)
-    ax.set_xlabel('X')
-    ax.set_ylabel('Y')
-    ax.set_zlabel('Z')
-    plt.tight_layout()
-    plt.savefig(fname.replace(".png","_gt_color_dist.png"))
-    plt.close()
+    plot_quadrants([gt], [min_dist],["error"],fname.replace(".png","_gt_color_dist.png"),point_size=1,title=f"epoch {epoch}",camera=camera,ax_lims=[x_equal_lim,y_equal_lim,z_equal_lim],color_map_name=color_map_name)        
 
 
 
@@ -599,7 +560,7 @@ def parse_args():
         description="Train a diffusion model for point clouds"
     )
     parser.add_argument(
-        "--epochs", type=int, default= 1000, help="Number of training epochs"
+        "--epochs", type=int, default= 2500, help="Number of training epochs"
     )
     parser.add_argument("--batch_size", type=int,
                         default=1, help="Batch size")
@@ -652,7 +613,7 @@ def parse_args():
     )
     parser.add_argument("--tb_log_dir", type=str, default="./logs",
                         help="Path to store tensorboard logs")
-    parser.add_argument("--run_name", type=str, default="first-27-jan-1000", help="Run name")
+    parser.add_argument("--run_name", type=str, default="first-27-jan-2500", help="Run name")
     # normilzation method, std or min-max
     parser.add_argument("--norm_method", type=str,
                         default="std", help="Normalization method")
