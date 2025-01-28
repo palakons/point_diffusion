@@ -221,13 +221,23 @@ def plot_multi_gt(gts,  args,input_pc_file_list,  fname ):
     plt.close()
 
 
-def plot_sample_multi_gt(gts, xts, x0s, steps, args, epoch, fname,input_pc_file_list,point_size=.1):
+def plot_sample_multi_gt(gts, xts, x0s, steps, args, epoch, fname,input_pc_file_list,point_size=.1,camera=None, image_rgb=None, mask=None):
     '''
     gts: ground truth point cloud, multi M (not unnormalized)
     xts: list of xt (not unnormalized)
     x0s: list of x0 pridcted from each step (not unnormalized)
     '''
         
+    if False:
+        try:
+            inputs = {"gts": gts, "xts": xts, "x0s": x0s, "steps": steps, "args": args, "epoch": epoch, "fname": fname, "input_pc_file_list": input_pc_file_list, "gts_device": gts.device, "xts_device": xts[0].device, "x0s_device": x0s[0].device, "camera": camera, "image_rgb": image_rgb, "mask": mask,"camera_device":camera.device,"image_rgb_device":image_rgb.device,"mask_device":mask.device}
+            #save to sample_multi_gt.pkl
+            import pickle
+            with open("sample_multi_gt.pkl", "wb") as f:
+                pickle.dump(inputs, f)
+        except Exception as e:
+            print("error saving sample_multi_gt.pkl",e)
+        exit()
 
     if input_pc_file_list is None:
         input_pc_file_list = [f"gt_{i}" for i in range(len(gts))]
@@ -429,6 +439,7 @@ def train(
     model.train()
     tqdm_range = trange(start_epoch, args.epochs, desc="Epoch")
     checkpoint_fname = f"/data/palakons/checkpoint/cp_dm_{datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}.pth"
+    print("checkpoint to be saved at", checkpoint_fname)
     for epoch in tqdm_range:
         losses = train_one_epoch(
             dataloader, model, optimizer, scheduler,  args, criterion, device
@@ -448,7 +459,6 @@ def train(
             # save at /data/palakons/checkpoint/cp_{datetime.now().strftime("%Y%m%d-%H%M%S")}.pth
             torch.save(checkpoint, checkpoint_fname)
             args.epochs = temp_epochs
-            print("checkpoint saved at", checkpoint_fname)
         if not args.no_tensorboard and (epoch+1*0) % args.visualize_freq == 0:
 
             batch = next(iter(dataloader))
@@ -489,7 +499,7 @@ def train(
             # exit()
 
             cd_losses = plot_sample_multi_gt(gt_pcs, xts, x0s, steps,
-                                 args, epoch,None,None)
+                                 args, epoch,None,None,camera=camera[0], image_rgb=image_rgb[:1], mask=mask[:1])
             # gt_pcs = gt_pcs * data_factor + data_mean
             # sampled_point = sampled_point * data_factor + data_mean
 
@@ -679,7 +689,7 @@ def parse_args():
         description="Train a diffusion model for point clouds"
     )
     parser.add_argument(
-        "--epochs", type=int, default= 700, help="Number of training epochs"
+        "--epochs", type=int, default= 1000, help="Number of training epochs"
     )
     parser.add_argument("--batch_size", type=int,
                         default=1, help="Batch size")
@@ -703,7 +713,7 @@ def parse_args():
                         default=False,
                         help="Disable tensorboard logging")
     parser.add_argument(
-        "--visualize_freq", type=int, default=8, help="Visualize frequency"
+        "--visualize_freq", type=int, default=10, help="Visualize frequency"
     )
     parser.add_argument(
         "--n_hidden_layers", type=int, default=1, help="Number of hidden layers"
@@ -732,7 +742,7 @@ def parse_args():
     )
     parser.add_argument("--tb_log_dir", type=str, default="./logs",
                         help="Path to store tensorboard logs")
-    parser.add_argument("--run_name", type=str, default="first-27-jan-700", help="Run name")
+    parser.add_argument("--run_name", type=str, default="first-27-jan-1000", help="Run name")
     # normilzation method, std or min-max
     parser.add_argument("--norm_method", type=str,
                         default="std", help="Normalization method")
