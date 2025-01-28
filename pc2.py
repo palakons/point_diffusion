@@ -221,22 +221,12 @@ def plot_multi_gt(gts,  args,input_pc_file_list,  fname ):
     plt.close()
 
 
-
-def plot_sample_multi_gt(gts, xts, x0s, steps, args, epoch, fname,input_pc_file_list):
+def plot_sample_multi_gt(gts, xts, x0s, steps, args, epoch, fname,input_pc_file_list,point_size=.1):
     '''
     gts: ground truth point cloud, multi M (not unnormalized)
     xts: list of xt (not unnormalized)
     x0s: list of x0 pridcted from each step (not unnormalized)
     '''
-    if False:
-        try:
-            inputs = {"gts": gts, "xts": xts, "x0s": x0s, "steps": steps, "args": args, "epoch": epoch, "fname": fname, "input_pc_file_list": input_pc_file_list, "gts_device": gts.device, "xts_device": xts[0].device, "x0s_device": x0s[0].device}
-            #save to sample_multi_gt.pkl
-            import pickle
-            with open("sample_multi_gt.pkl", "wb") as f:
-                pickle.dump(inputs, f)
-        except Exception as e:
-            print("error saving sample_multi_gt.pkl",e)
         
 
     if input_pc_file_list is None:
@@ -260,56 +250,58 @@ def plot_sample_multi_gt(gts, xts, x0s, steps, args, epoch, fname,input_pc_file_
     min_all = min_gt.copy()
     max_all = max_gt.copy()
 
-    fig = plt.figure(figsize=(30, 10))
-    for i, (xt, x0, step) in enumerate(zip(xts, x0s, steps)):
-        xt = xt[0].cpu().numpy()
-        x0 = x0[0].cpu().numpy()
-        step = step.cpu().numpy()
+    if False:
 
-        ax = fig.add_subplot(2, len(xts), i+1, projection='3d')
+        fig = plt.figure(figsize=(30, 10))
+        for i, (xt, x0, step) in enumerate(zip(xts, x0s, steps)):
+            xt = xt[0].cpu().numpy()
+            x0 = x0[0].cpu().numpy()
+            step = step.cpu().numpy()
 
-        ax.scatter(xt[:, 0], xt[:, 1], xt[:, 2], c='r', marker=',', label='xt')
-        ax.scatter(x0[:, 0], x0[:, 1], x0[:, 2], c='b', marker=',', label='x0')
-        # ax.scatter(gts[:, 0], gts[:, 1], gts[:, 2], c='g', marker='o', label='gt')
-        ax.set_title(f"step {step}")
-        ax.legend()
-        factor_window = 1.5
-        ax.set_xlim(mean_gt[0]-factor_window*range_gt[0],
-                    mean_gt[0]+factor_window*range_gt[0])
-        ax.set_ylim(mean_gt[1]-factor_window*range_gt[1],
-                    mean_gt[1]+factor_window*range_gt[1])
-        ax.set_zlim(mean_gt[2]-factor_window*range_gt[2],
-                    mean_gt[2]+factor_window*range_gt[2])
-        # print(min_all,x0.min(axis=0),xt.min(axis=0))
-        min_all = np.minimum(min_all, x0.min(axis=0), xt.min(axis=0))
-        max_all = np.maximum(max_all, x0.max(axis=0), xt.max(axis=0))
+            ax = fig.add_subplot(2, len(xts), i+1, projection='3d')
 
-    mean_all = (min_all+max_all)/2
-    range_all = np.maximum(abs(min_all-mean_all), abs(max_all-mean_all))
-    min_min = mean_all-range_all
-    max_max = mean_all+range_all
+            ax.scatter(xt[:, 0], xt[:, 1], xt[:, 2], c='r', marker=',', label='xt')
+            ax.scatter(x0[:, 0], x0[:, 1], x0[:, 2], c='b', marker=',', label='x0')
+            # ax.scatter(gts[:, 0], gts[:, 1], gts[:, 2], c='g', marker='o', label='gt')
+            ax.set_title(f"step {step}")
+            ax.legend()
+            factor_window = 1.5
+            ax.set_xlim(mean_gt[0]-factor_window*range_gt[0],
+                        mean_gt[0]+factor_window*range_gt[0])
+            ax.set_ylim(mean_gt[1]-factor_window*range_gt[1],
+                        mean_gt[1]+factor_window*range_gt[1])
+            ax.set_zlim(mean_gt[2]-factor_window*range_gt[2],
+                        mean_gt[2]+factor_window*range_gt[2])
+            # print(min_all,x0.min(axis=0),xt.min(axis=0))
+            min_all = np.minimum(min_all, x0.min(axis=0), xt.min(axis=0))
+            max_all = np.maximum(max_all, x0.max(axis=0), xt.max(axis=0))
 
-    for i, (xt, x0, step) in enumerate(zip(xts, x0s, steps)):
-        xt = xt[0].cpu().numpy()
-        x0 = x0[0].cpu().numpy()
-        step = step.cpu().numpy()
-        ax2 = fig.add_subplot(2, len(xts), i+1+len(xts), projection='3d')
-        ax2.scatter(xt[:, 0], xt[:, 1], xt[:, 2],
-                    c='r', marker=',', label='xt')
-        ax2.scatter(x0[:, 0], x0[:, 1], x0[:, 2],
-                    c='b', marker=',', label='x0')
-        # ax2.scatter(gts[:, 0], gts[:, 1], gts[:, 2],
-        #             c='g', marker='o', label='gt')
-        ax2.set_title(f"step {step}")
-        ax2.legend()
-        ax2.set_xlim(min_min[0], max_max[0])
-        ax2.set_ylim(min_min[1], max_max[1])
-        ax2.set_zlim(min_min[2], max_max[2])
+        mean_all = (min_all+max_all)/2
+        range_all = np.maximum(abs(min_all-mean_all), abs(max_all-mean_all))
+        min_min = mean_all-range_all
+        max_max = mean_all+range_all
 
-    # plt.title(f"Evolution of point cloud at epoch {epoch}")
-    plt.tight_layout()
-    plt.savefig(fname)
-    plt.close() 
+        for i, (xt, x0, step) in enumerate(zip(xts, x0s, steps)):
+            xt = xt[0].cpu().numpy()
+            x0 = x0[0].cpu().numpy()
+            step = step.cpu().numpy()
+            ax2 = fig.add_subplot(2, len(xts), i+1+len(xts), projection='3d')
+            ax2.scatter(xt[:, 0], xt[:, 1], xt[:, 2],
+                        c='r', marker=',', label='xt')
+            ax2.scatter(x0[:, 0], x0[:, 1], x0[:, 2],
+                        c='b', marker=',', label='x0')
+            # ax2.scatter(gts[:, 0], gts[:, 1], gts[:, 2],
+            #             c='g', marker='o', label='gt')
+            ax2.set_title(f"step {step}")
+            ax2.legend()
+            ax2.set_xlim(min_min[0], max_max[0])
+            ax2.set_ylim(min_min[1], max_max[1])
+            ax2.set_zlim(min_min[2], max_max[2])
+
+        # plt.title(f"Evolution of point cloud at epoch {epoch}")
+        plt.tight_layout()
+        plt.savefig(fname)
+        plt.close() 
 
     
     #plot the last step, xts[-1], which would equal to x0s[-1]
@@ -321,36 +313,45 @@ def plot_sample_multi_gt(gts, xts, x0s, steps, args, epoch, fname,input_pc_file_
     min_gt = None
     min_gt_idx = None
     cd_losses = []
+
+    gts = torch.tensor(gts).to("cuda:0")
+    xt = torch.tensor(xt).to("cuda:0")
     
     for i,gt in enumerate(tqdm(gts, desc="best gts", leave=False)):
-        gtt =torch.tensor(gt).unsqueeze(0)
-        xtt = torch.tensor(xt).unsqueeze(0)
+        
+        gtt =gt.unsqueeze(0)
+        xtt = xt.unsqueeze(0)
         # print("gtt",gtt.shape, "xtt",xtt.shape)
         cd, _ = chamfer_distance(gtt, xtt)
         cd_losses.append(cd.item())
         if cd<min_cd:
             min_cd = cd
-            min_gt = gt
+            min_gt = gt.cpu().numpy()
             min_gt_idx = i
+    
+    gts = gts.detach().cpu().numpy()
+    xt = xt.detach().cpu().numpy()
+    
             
     fname_min_gt = input_pc_file_list[min_gt_idx].split("/")[-1]
 
     step = steps[-1].cpu().numpy()
 
     # print("shapes", xt.shape, x0.shape, min_gt.shape) #shapes (1, 100, 3) (1, 100, 3) (100, 3)
-
+    
 
     #---plot combined
     fig = plt.figure(figsize=(10, 10))
     ax = fig.add_subplot(111, projection='3d')
-    ax.scatter(xt[:, 0], xt[:, 1], xt[:, 2], c='r', marker='o', label=f'xt step {step}')
+    ax.scatter(xt[:, 0], xt[:, 1], xt[:, 2], c='r', marker='o', label=f'xt step {step}',s=point_size)
     #plot min_gt
-    ax.scatter(min_gt[:, 0], min_gt[:, 1], min_gt[:, 2], c='g', marker=',', label=f'gt_{min_gt_idx}: {fname_min_gt}')
+    ax.scatter(min_gt[:, 0], min_gt[:, 1], min_gt[:, 2], c='g', marker=',', label=f'gt_{min_gt_idx}: {fname_min_gt}',s=point_size)
     ax.set_title(f"xt: step {step}")
     ax.legend()
     factor_window = 1.
     plt.tight_layout()
     plt.savefig(fname.replace(".png","_last_step.png"))
+    # print("saved at",fname.replace(".png","_last_step.png"))
     
     #read the plot axis limits
     x_equal_lim=ax.get_xlim()
@@ -360,16 +361,18 @@ def plot_sample_multi_gt(gts, xts, x0s, steps, args, epoch, fname,input_pc_file_
     plt.close()
 
     #---plot each
-    for label, pcs in zip(["xt", "x0", "gt"], [xt, x0, min_gt]):
+    # for label, pcs in zip(["xt", "x0", "gt"], [xt, x0, min_gt]):
+    for label, pcs in zip(["xt", "gt"], [xt, min_gt]):
         fig = plt.figure(figsize=(10, 10))
         ax = fig.add_subplot(111, projection='3d')
-        ax.scatter(pcs[:, 0], pcs[:, 1], pcs[:, 2], c='g' if label == "gt" else 'r', marker=',')
+        ax.scatter(pcs[:, 0], pcs[:, 1], pcs[:, 2], c='g' if label == "gt" else 'r', marker=',',s=point_size)
         ax.set_title(f"{label} step {step}"+( f" {fname_min_gt}" if label=="gt" else ""))
         ax.set_xlim(x_equal_lim)
         ax.set_ylim(y_equal_lim)
         ax.set_zlim(z_equal_lim)
         plt.tight_layout()  
         plt.savefig(fname.replace(".png",f"_{label}.png"))
+
         plt.close()
 
     #---plot distance by color
@@ -385,7 +388,7 @@ def plot_sample_multi_gt(gts, xts, x0s, steps, args, epoch, fname,input_pc_file_
     #least distance for each gt
     min_dist = np.min(dist, axis=0)
     # print("min_dist", min_dist.shape)
-    plot = ax.scatter(min_gt[:, 0], min_gt[:, 1], min_gt[:, 2], c=min_dist, cmap=color_map_name, marker='o')
+    plot = ax.scatter(min_gt[:, 0], min_gt[:, 1], min_gt[:, 2], c=min_dist, cmap=color_map_name, marker=',',s=point_size)
     fig.colorbar(plot, ax=ax)
     ax.set_title(f"gt_{min_gt_idx}: {fname_min_gt}")
     ax.set_xlim(x_equal_lim)
@@ -397,8 +400,6 @@ def plot_sample_multi_gt(gts, xts, x0s, steps, args, epoch, fname,input_pc_file_
     
 
     return cd_losses
-        
-
 
 
 
@@ -509,17 +510,21 @@ def train(
                 best_cd_loss_gt = gt_pcs[best_cd_loss_idx]
                 best_cd_loss_gt = best_cd_loss_gt.cpu().numpy()
 
-                print("best_cd_loss",best_cd_loss,"best_cd_loss_idx",best_cd_loss_idx)
-                print("len(cd_losses)",len(cd_losses))
-                print("len(gt_pcs)",len(gt_pcs))
-                print("len(datset)",len(dataloader.dataset))
+                # print("best_cd_loss",best_cd_loss,"best_cd_loss_idx",best_cd_loss_idx)
+                # print("len(cd_losses)",len(cd_losses))
+                # print("len(gt_pcs)",len(gt_pcs))
+                # print("len(datset)",len(dataloader.dataset))
 
                 carry = 0
                 for i, (batch,gt_pc) in enumerate(zip(dataloader.dataset,gt_pcs)):
-                    if gt_pc.shape[1]!=16384:
+                    # print("carry",carry)
+                    # print("gt_pc",gt_pc.shape)
+                    # print("best_cd_loss_idx",best_cd_loss_idx)
+                    # print("i",i)
+                    if gt_pc.shape[0]!=16384:
                         carry+=1
                     if i == best_cd_loss_idx+carry:
-                        print("best_cd_loss_idx",best_cd_loss_idx,"carry",carry,"i",i)
+                        # print("best_cd_loss_idx",best_cd_loss_idx,"carry",carry,"i",i)
                         best_image_rgb = batch.image_rgb
                         best_mask = batch.fg_probability
                         #save image_rgb, mask
