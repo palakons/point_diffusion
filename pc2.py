@@ -532,10 +532,21 @@ def train(
                         #mkdir
                         if not os.path.exists(dir_name):
                             os.makedirs(dir_name)
-                        fname = f"{dir_name}/image_rgb_M{args.M}.png"
-                        plt.imsave(fname, best_image_rgb[0].cpu().numpy().transpose(1,2,0))
-                        fname = f"{dir_name}/mask_M{args.M}.png"
-                        plt.imsave(fname, best_mask[0].cpu().numpy().transpose(1,2,0))
+                        fname = f"{dir_name}/image_rgb_epoch_{epoch}_M{args.M}.png"
+                        # print("shape",best_image_rgb.shape)
+                        # print("mask shape",best_mask.shape)
+                        # hape torch.Size([3, 224, 224])
+                        # mask shape torch.Size([1, 224, 224])
+                        best_image= best_image_rgb.cpu().numpy().transpose(1,2,0)
+                        # print("best_image",best_image.shape)
+                        plt.imsave(fname,best_image )
+                        # print("saved at",fname)
+                        fname = f"{dir_name}/mask_epoch_{epoch}_M{args.M}.png"
+                        best_mask = best_mask.cpu().numpy().transpose(1,2,0)
+                        best_mask = np.repeat(best_mask, 3, axis=2)
+                        # print("best_mask",best_mask.shape)
+                        plt.imsave(fname, best_mask)
+                        # print("saved at",fname)
 
                         break
                 
@@ -668,7 +679,7 @@ def parse_args():
         description="Train a diffusion model for point clouds"
     )
     parser.add_argument(
-        "--epochs", type=int, default= 20*20, help="Number of training epochs"
+        "--epochs", type=int, default= 700, help="Number of training epochs"
     )
     parser.add_argument("--batch_size", type=int,
                         default=1, help="Batch size")
@@ -692,7 +703,7 @@ def parse_args():
                         default=False,
                         help="Disable tensorboard logging")
     parser.add_argument(
-        "--visualize_freq", type=int, default=8*0+1, help="Visualize frequency"
+        "--visualize_freq", type=int, default=8, help="Visualize frequency"
     )
     parser.add_argument(
         "--n_hidden_layers", type=int, default=1, help="Number of hidden layers"
@@ -721,7 +732,7 @@ def parse_args():
     )
     parser.add_argument("--tb_log_dir", type=str, default="./logs",
                         help="Path to store tensorboard logs")
-    parser.add_argument("--run_name", type=str, default="first-27-jan-400", help="Run name")
+    parser.add_argument("--run_name", type=str, default="first-27-jan-700", help="Run name")
     # normilzation method, std or min-max
     parser.add_argument("--norm_method", type=str,
                         default="std", help="Normalization method")
