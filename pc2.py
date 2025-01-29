@@ -241,8 +241,12 @@ def plot_quadrants(
     fig = plt.figure(figsize=(fig_size_baseline, fig_size_baseline))
     ax = fig.add_subplot(221, projection="3d")
     for points, color, name in zip(point_list, color_list, name_list):
-        assert len(points.shape) == 2, f"{name} points should have shape (N, 3), not {points.shape}"
-        assert points.shape[1] == 3, f"{name} points should have shape (N, 3), not {points.shape}"
+        assert (
+            len(points.shape) == 2
+        ), f"{name} points should have shape (N, 3), not {points.shape}"
+        assert (
+            points.shape[1] == 3
+        ), f"{name} points should have shape (N, 3), not {points.shape}"
         plot = ax.scatter(
             points[:, 0],
             points[:, 1],
@@ -407,7 +411,7 @@ def plot_sample_condition(
             print("creating dir", dir_name)
             os.makedirs(dir_name)
         fname = f"{dir_name}/sample_ep_{epoch:05d}.png"
-    print("plot_sample_condition fname", fname)
+    # print("plot_sample_condition fname", fname)
 
     gt = gt.numpy()[0]
     xt = xts[-1].numpy()
@@ -519,7 +523,7 @@ def train(
                 num_inference_steps=50,
                 device=device,
                 pcpm=pcpm,
-            ) 
+            )
 
             pc_condition = pcpm.point_cloud_to_tensor(
                 pc[:1], normalize=True, scale=True
@@ -618,7 +622,6 @@ def sample(
         # dev image_rgb cuda:0
         # dev mask cuda:0
 
-
         noise_pred = model(x_t_input, t.reshape(1).expand(B))
 
         x_t = scheduler.step(noise_pred, t, x_t, **extra_step_kwargs)
@@ -639,7 +642,7 @@ def sample(
         # print("dev noise_pred", noise_pred.device)
         # print("dev output_prev", output_prev.device)
         # print("dev output_original_sample", output_original_sample.device)
-        
+
         # dev noise_pred cuda:0
         # dev output_prev cuda:0
         # dev output_original_sample cuda:0
@@ -661,7 +664,7 @@ def sample(
         x0t.append(output_original_sample)
     # print("shape xs", len(xs), "shape steps", len(steps), "shape x0t", len(x0t))
     # print("shape xs", xs[0].shape, "shape steps", steps[0].shape, "shape x0t", x0t[0].shape)
-    # shape xs 6 shape steps 6 shape x0t 6 
+    # shape xs 6 shape steps 6 shape x0t 6
     # shape xs torch.Size([1, 128, 3]) shape steps torch.Size([]) shape x0t torch.Size([1, 128, 3])
     xs = torch.concat(xs, dim=0)
     steps = torch.tensor(steps)
@@ -768,45 +771,26 @@ def sample(
 #     return args
 
 
-# def match_args(args1, args2):
-#     # if number of args1 != number of args2:
-#     # make copy of args1, args2
-#     arga = vars(args1).copy()
-#     argb = vars(args2).copy()
-#     # remove checkpoint_freq,"epochs", "no_tensorboard" from both, if exist
-#     for key in [
-#         "checkpoint_freq",
-#         "epochs",
-#         "no_tensorboard",
-#         "no_checkpoint",
-#         "tb_log_dir",
-#         "run_name",
-#         "visualize_freq",
-#     ]:
-#         if key in arga:
-#             del arga[key]
-#         if key in argb:
-#             del argb[key]
-
-#     # check if they are the same
-#     if len((arga)) != len((argb)):
-#         # print("number of args not the same")
-#         return False
-#     # check one by one if they are the same, except for epochs
-#     for key, value in arga.items():
-#         if value != (argb)[key]:
-#             # print(f"{key} not the same", value, "vs", (argb)[key])
-#             print(".", end="")
-#             return False
-#     print()
-#     return True
-
-#     # if checkpoint["args"].num_train_timesteps == args.num_train_timesteps and checkpoint["args"].beta_schedule == args.beta_schedule and checkpoint["args"].N == args.N and checkpoint["args"].M == args.M and checkpoint["args"].lr == args.lr and checkpoint["args"].batch_size == args.batch_size
-
-#     # for key, value in vars(args1).items():
-#     #     if value != vars(args2)[key]:
-#     #         return False
-#     # return True
+def match_args(cfg1: CO3DConfig, cfg2: CO3DConfig):
+    return (
+        cfg1.run.seed == cfg2.run.seed
+        and cfg1.run.num_inference_steps == cfg2.run.num_inference_steps
+        and cfg1.dataset.image_size == cfg2.dataset.image_size
+        and cfg1.model.beta_schedule == cfg2.model.beta_schedule
+        and cfg1.model.point_cloud_model_embed_dim
+        == cfg2.model.point_cloud_model_embed_dim
+        and cfg1.dataset.category == cfg2.dataset.category
+        and cfg1.dataset.type == cfg2.dataset.type
+        and cfg1.dataset.max_points == cfg2.dataset.max_points
+        and cfg1.optimizer.lr == cfg2.optimizer.lr
+        and cfg1.dataloader.batch_size == cfg2.dataloader.batch_size
+        and cfg1.dataloader.num_scenes == cfg2.dataloader.num_scenes
+        and cfg1.loss.loss_type == cfg2.loss.loss_type
+        and cfg1.optimizer.name == cfg2.optimizer.name
+        and cfg1.optimizer.weight_decay == cfg2.optimizer.weight_decay
+        and cfg1.optimizer.kwargs.betas[0] == cfg2.optimizer.kwargs.betas[0]
+        and cfg1.optimizer.kwargs.betas[1] == cfg2.optimizer.kwargs.betas[1]
+    )
 
 
 # PVCNN-Based
@@ -1084,26 +1068,26 @@ def get_model(cfg: ProjectConfig, device="cpu", pcpm=None):
     ).to(device)
 
 
-# def get_checkpoint_fname(args, CHECKPOINT_DIR):
-#     # check checkpoint
-#     files = glob.glob(f"{CHECKPOINT_DIR}/cp_dm_*.pth")
-#     max_epoch = 0
-#     current_cp_fname = None
-#     for fname in files:
-#         try:
-#             checkpoint = torch.load(fname)
-#             if match_args(checkpoint["args"], args):
-#                 if (
-#                     checkpoint["args"].epochs <= args.epochs
-#                     and checkpoint["args"].epochs > max_epoch
-#                 ):
-#                     max_epoch = checkpoint["args"].epochs
-#                     current_cp_fname = fname
-#                     # print("current_cp", current_cp_fname)
-#         except:
-#             print("error", fname)
-#             continue
-#     return current_cp_fname
+def get_checkpoint_fname(cfg: ProjectConfig, CHECKPOINT_DIR):
+    # check checkpoint
+    files = glob.glob(f"{CHECKPOINT_DIR}/cp_dm_*.pth")
+    max_epoch = 0
+    current_cp_fname = None
+    for fname in files:
+        try:
+            checkpoint = torch.load(fname)
+            if match_args(checkpoint["args"], cfg):
+                if (
+                    checkpoint["args"].run.max_steps <= cfg.run.max_steps
+                    and checkpoint["args"].run.max_steps > max_epoch
+                ):
+                    max_epoch = checkpoint["args"].run.max_steps
+                    current_cp_fname = fname
+                    # print("current_cp", current_cp_fname)
+        except:
+            print("error", fname)
+            continue
+    return current_cp_fname
 
 
 def get_loss(cfg: ProjectConfig):
@@ -1170,7 +1154,24 @@ def main(cfg: ProjectConfig):
 
     model = get_model(cfg, device=device, pcpm=pcpm)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.optimizer.lr)
+    if cfg.optimizer.name == "Adam":
+        optimizer = torch.optim.Adam(
+            model.parameters(),
+            lr=cfg.optimizer.lr,
+            weight_decay=cfg.optimizer.weight_decay,
+            betas=cfg.optimizer.kwargs.betas,
+        )
+    elif cfg.optimizer.name == "AdamW":
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=cfg.optimizer.lr,
+            weight_decay=cfg.optimizer.weight_decay,
+            betas=cfg.optimizer.kwargs.betas,
+        )
+    else:
+        raise ValueError(
+            f"optimizer {cfg.optimizer.name} not supported, pick Adam or AdamW"
+        )
     # linear, scaled_linear, or squaredcos_cap_v2.
     assert cfg.run.diffusion_scheduler == "ddpm", "only ddpm supported"
     scheduler = DDPMScheduler(
@@ -1182,7 +1183,11 @@ def main(cfg: ProjectConfig):
         beta_end=cfg.model.beta_end,
     )
     start_epoch = 0
-    current_cp_fname = cfg.checkpoint.resume
+
+    current_cp_fname = None
+    if cfg.checkpoint.resume_training:
+        current_cp_fname = get_checkpoint_fname(cfg, "checkpoint_pc2")
+    
     if current_cp_fname is not None:
         current_cp = torch.load(current_cp_fname)
         print("loading checkpoint", current_cp_fname)
@@ -1315,7 +1320,11 @@ def main(cfg: ProjectConfig):
         "num_scenes": cfg.dataloader.num_scenes,
         "loss_type": cfg.loss.loss_type,
         "optimizer": cfg.optimizer.name,
+        "optimizer_decay": cfg.optimizer.weight_decay,
+        "optimizer_beta_0": cfg.optimizer.kwargs.betas[0],
+        "optimizer_beta_1": cfg.optimizer.kwargs.betas[1],
     }
+
 
     writer.add_hparams(hparam_dict, metric_dict)
     writer.close()
