@@ -2,6 +2,7 @@ from math import ceil, sqrt
 import pandas as pd
 import argparse
 import open3d as o3d
+import hydra
 import glob
 from datetime import datetime
 from pathlib import Path
@@ -12,7 +13,9 @@ from pytorch3d.vis.plotly_vis import get_camera_wireframe
 
 from pytorch3d.renderer.cameras import CamerasBase
 from pytorch3d.implicitron.dataset.json_index_dataset_map_provider_v2 import (
-    JsonIndexDatasetMapProviderV2, registry)
+    JsonIndexDatasetMapProviderV2,
+    registry,
+)
 from pytorch3d.implicitron.tools.config import expand_args_fields
 from omegaconf import DictConfig
 from config.structured import CO3DConfig, DataloaderConfig, ProjectConfig
@@ -28,15 +31,17 @@ from pytorch3d.loss import chamfer_distance
 from tqdm import tqdm, trange
 import numpy as np
 import random
-from torch.utils.tensorboard import SummaryWriter 
+from torch.utils.tensorboard import SummaryWriter
 from model.point_cloud_model import PointCloudModel
 from model.projection_model import PointCloudProjectionModel
 from pytorch3d.structures import Pointclouds
 import os
-from pytorch3d.implicitron.dataset.data_loader_map_provider import \
-    SequenceDataLoaderMapProvider
+from pytorch3d.implicitron.dataset.data_loader_map_provider import (
+    SequenceDataLoaderMapProvider,
+)
 from torch.utils.data import SequentialSampler
-from pytorch3d.implicitron.dataset.dataset_map_provider import (    DatasetMap)
+from pytorch3d.implicitron.dataset.dataset_map_provider import DatasetMap
+from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 
 
 def set_seed(seed):
@@ -45,10 +50,7 @@ def set_seed(seed):
     np.random.seed(seed)
 
 
-
 # Sinusoidal time embeddings
-
-
 def get_sinusoidal_time_embedding(timesteps, embedding_dim):
     half_dim = embedding_dim // 2
     emb = torch.exp(
@@ -76,152 +78,101 @@ class PointCloudLoss(nn.Module):
         # y_true = y_true.view(-1, self.npoints, 3)
         # y_pred = y_pred.view(-1, self.npoints, 3)
         chamfer = chamfer_distance(y_true, y_pred)[0]
+        if self.emd_weight == 0:
+            return chamfer
         emd = self.sinkhorn_loss(y_true, y_pred)
         return (1 - self.emd_weight) * chamfer + self.emd_weight * emd
 
 
 # Training function
-def train_one_epoch(dataloader, model, optimizer, scheduler, args, criterion, device):
+def train_one_epoch(
+    dataloader, model, optimizer, scheduler, cfg: ProjectConfig, criterion, device,pcpm:PointCloudProjectionModel
+):
+    assert pcpm is not None, "pcpm must be provided"
     model.train()
-    losses = []
 
-    pcpm=PointCloudProjectionModel( image_size=224,
-image_feature_model='vit_small_patch16_224_msn'  ,
-use_local_colors=True,
-use_local_features=True,
-use_global_features=False,
-use_mask=True,
-use_distance_transform=True,
-predict_shape=True,
-predict_color=False,
-color_channels=3,
-colors_mean=.5,
-colors_std=.5,
-scale_factor=1,).to(device)
-
-    
-    # image_size: int,
-    # image_feature_model: str,
-    # use_local_colors: bool = True,
-    # use_local_features: bool = True,
-    # use_global_features: bool = False,
-    # use_mask: bool = True,
-    # use_distance_transform: bool = True,
-    # predict_shape: bool = True,
-    # predict_color: bool = False,
-    # process_color: bool = False,
-    # image_color_channels: int = 3,  # for the input image, not the points
-    # color_channels: int = 3,  # for the points, not the input image
-    # colors_mean: float = 0.5,
-    # colors_std: float = 0.5,
-    # scale_factor: float = 1.0,
-    # # Rasterization settings
-    # raster_point_radius: float = 0.0075,  # point size
-    # raster_points_per_pixel: int = 1,  # a single point per pixel, for now
-    # bin_size: int = 0,
-
+    batch_losses = []
     for batch in dataloader:
         batch = batch.to(device)
-        pc=batch.sequence_point_cloud
-        camera=batch.camera
-        image_rgb=batch.image_rgb
-        mask=batch.fg_probability
-
+        pc = batch.sequence_point_cloud
+        camera = batch.camera
+        image_rgb = batch.image_rgb
+        mask = batch.fg_probability
         x_0 = pcpm.point_cloud_to_tensor(pc, normalize=True, scale=True)
-        # print("x_0 type",type(x_0)) #<class 'pytorch3d.implicitron.dataset.frame_data.FrameData'>
-        # print("x_0 shape",x_0.shape) #x_0 shape torch.Size([8, 16384, 3])
 
         B, N, D = x_0.shape
         noise = torch.randn_like(x_0)
-        # print("noise shape",noise.shape) #noise shape torch.Size([4, 16384, 3])
-
-        # print("B", B, "N", N, "D", D) #B 8 N 16384 D 3 
-        
-        # exit()
         timesteps = torch.randint(
-            0, scheduler.config.num_train_timesteps, (B,), device=device,dtype=torch.long)
-        
-        # print("x", x.shape, "timesteps", timesteps.shape)
-        x_t = scheduler.add_noise(x_0, noise, timesteps) #noisy_x
+            0,
+            scheduler.config.num_train_timesteps,
+            (B,),
+            device=device,
+            dtype=torch.long,
+        )
 
+        x_t = scheduler.add_noise(x_0, noise, timesteps)  # noisy_x
+        x_t_input = pcpm.get_input_with_conditioning(
+            x_t, camera=camera, image_rgb=image_rgb, mask=mask, t=timesteps
+        )
 
-        # print("noisy_x", noisy_x.shape, "timesteps", timesteps.shape)
-        # Conditioning
-        #print location of each variable, cuda or cpu
-        # print("x_t", x_t.device, "camera", camera.device, "image_rgb", image_rgb.device, "mask", mask.device, "timesteps", timesteps.device) #x_t cuda:0 camera cuda:0 image_rgb cuda:0 mask cuda:0 timesteps cuda:0 
-        # print("train")
-        # print("x_t.shape", x_t.shape)
-        # print("image_rgb.shape", image_rgb.shape) 
-        # print("mask.shape", mask.shape)
-        # print('camera', len(camera))
-
-        # x_t.shape torch.Size([4, 16384, 3])
-        # image_rgb.shape torch.Size([4, 3, 224, 224])
-        # mask.shape torch.Size([4, 1, 224, 224])
-
-        x_t_input = pcpm.get_input_with_conditioning(x_t, camera=camera, 
-            image_rgb=image_rgb, mask=mask, t=timesteps)
-        # print("x_t_input", x_t_input.shape) #x_t_input torch.Size([8, 16384, 392])
         optimizer.zero_grad()
-        # print("x_t_input", x_t_input.shape) #x_t_input torch.Size([8, 16384, 392])   
         noise_pred = model(x_t_input, timesteps)
-        # print("output", output.shape)  # output torch.Size([1, 2, 3])
-
         if not noise_pred.shape == noise.shape:
-            # raise ValueError(f'{noise_pred.shape=} and {noise.shape=}')
-            raise ValueError(f'{noise_pred.shape} and {noise.shape} not equal')
-        # print("noise_pred", noise_pred.shape, "noise", noise.shape) #noise_pred torch.Size([8, 16384, 3]) noise torch.Size([8, 16384, 3])
-        # noise = noise[:, :, :3]
+            raise ValueError(f"{noise_pred.shape} and {noise.shape} not equal")
+
         loss = criterion(noise_pred, noise)
         loss.backward()
         optimizer.step()
+        batch_losses.append(loss.item())
 
-        losses.append(loss.item())
-
-    return losses
-
-
-def plot_multi_gt(gts,  args,input_pc_file_list,  fname ):
-    if fname is None:
-        dir_name = f"logs/outputs/" +   args.run_name.replace("/", "_")
-        #mkdir
-        if not os.path.exists(dir_name):
-            os.makedirs(dir_name)
-        fname = f"{dir_name}/gts_M{args.M}.png"
-    gts = gts.cpu().numpy()
-    min_gt = gts.min(axis=0).min(axis=0)
-    max_gt = gts.max(axis=0).max(axis=0)
-    mean_gt = gts.mean(axis=0).mean(axis=0)
-    range_gt = max_gt-min_gt
-
-    # print("shpae", gts.shape)
-    # print("min_gt", min_gt.shape, "max_gt", max_gt.shape, "mean_gt", mean_gt.shape, "range_gt", range_gt.shape)
-    # exit()
-
-    row_width = int(ceil(sqrt(len(gts))))
-    n_row = int(ceil(len(gts) / row_width ))
-    fig = plt.figure(figsize=(10*row_width, 10*n_row))
-    # print("n_row", n_row, "row_width", row_width)
-    if input_pc_file_list is None:
-        input_pc_file_list = [f"gt_{i}" for i in range(len(gts))]
-    for i, (gt,input_fname) in enumerate(zip(gts,input_pc_file_list)):   
-        ax = fig.add_subplot(n_row, row_width, i+1, projection='3d')
-        #use smallest marker
-        ax.scatter(gt[:, 0], gt[:, 1], gt[:, 2], c='g', marker=',')
-        ax.set_title(f"gt {i}: {input_fname}")
-        factor_window = .5
-        ax.set_xlim(mean_gt[0]-factor_window*range_gt[0],
-                    mean_gt[0]+factor_window*range_gt[0])
-        ax.set_ylim(mean_gt[1]-factor_window*range_gt[1],
-                    mean_gt[1]+factor_window*range_gt[1])
-        ax.set_zlim(mean_gt[2]-factor_window*range_gt[2],
-                    mean_gt[2]+factor_window*range_gt[2])
-    plt.tight_layout()
-    plt.savefig(fname)
-    print(f"saved at {fname}")
-    plt.close()
+    return batch_losses
 
 
+# def plot_multi_gt(gts, args, input_pc_file_list, fname):
+#     if fname is None:
+#         dir_name = f"logs/outputs/" + args.run_name.replace("/", "_")
+#         # mkdir
+#         if not os.path.exists(dir_name):
+#             os.makedirs(dir_name)
+#         fname = f"{dir_name}/gts_M{args.M}.png"
+#     gts = gts.cpu().numpy()
+#     min_gt = gts.min(axis=0).min(axis=0)
+#     max_gt = gts.max(axis=0).max(axis=0)
+#     mean_gt = gts.mean(axis=0).mean(axis=0)
+#     range_gt = max_gt - min_gt
+
+#     # print("shpae", gts.shape)
+#     # print("min_gt", min_gt.shape, "max_gt", max_gt.shape, "mean_gt", mean_gt.shape, "range_gt", range_gt.shape)
+#     # exit()
+
+#     row_width = int(ceil(sqrt(len(gts))))
+#     n_row = int(ceil(len(gts) / row_width))
+#     fig = plt.figure(figsize=(10 * row_width, 10 * n_row))
+#     # print("n_row", n_row, "row_width", row_width)
+#     if input_pc_file_list is None:
+#         input_pc_file_list = [f"gt_{i}" for i in range(len(gts))]
+#     for i, (gt, input_fname) in enumerate(zip(gts, input_pc_file_list)):
+#         ax = fig.add_subplot(n_row, row_width, i + 1, projection="3d")
+#         # use smallest marker
+#         ax.scatter(gt[:, 0], gt[:, 1], gt[:, 2], c="g", marker=",")
+#         ax.set_title(f"gt {i}: {input_fname}")
+#         factor_window = 0.5
+#         ax.set_xlim(
+#             mean_gt[0] - factor_window * range_gt[0],
+#             mean_gt[0] + factor_window * range_gt[0],
+#         )
+#         ax.set_ylim(
+#             mean_gt[1] - factor_window * range_gt[1],
+#             mean_gt[1] + factor_window * range_gt[1],
+#         )
+#         ax.set_zlim(
+#             mean_gt[2] - factor_window * range_gt[2],
+#             mean_gt[2] + factor_window * range_gt[2],
+#         )
+#     plt.tight_layout()
+#     plt.savefig(fname)
+#     print(f"saved at {fname}")
+#     plt.close()
 
 
 def get_camera_wires_trans(cameras):
@@ -234,133 +185,234 @@ def get_camera_wires_trans(cameras):
     cam_wires_trans = cam_trans.transform_points(cam_wires_canonical)
     return cam_wires_trans
 
-def plot_quadrants(point_list, color_list,name_list,fname,point_size=.5,title="",camera=None,ax_lims=None,color_map_name="gist_rainbow"):
-    
-    cam_wires_trans =get_camera_wires_trans(camera) if camera is not None else None
-    fig = plt.figure(figsize=(40, 40))
-    ax = fig.add_subplot(221, projection='3d')
-    for points, color, name in zip(point_list, color_list,name_list):
+
+def plot_quadrants(
+    point_list,
+    color_list,
+    name_list,
+    fname,
+    point_size=0.5,
+    title="",
+    camera=None,
+    ax_lims=None,
+    color_map_name="gist_rainbow",
+):
+    fig_size_baseline=10
+    cam_wires_trans = get_camera_wires_trans(camera) if camera is not None else None
+    fig = plt.figure(figsize=(fig_size_baseline, fig_size_baseline))
+    ax = fig.add_subplot(221, projection="3d")
+    for points, color, name in zip(point_list, color_list, name_list):
         assert len(points.shape) == 2, "points should have shape (N, 3)"
         assert points.shape[1] == 3, "points should have shape (N, 3)"
-        plot=ax.scatter(points[:, 0], points[:, 1], points[:, 2], c=color, marker=',', label=name,s=point_size, cmap=color_map_name)
-        #if color is not string
+        plot = ax.scatter(
+            points[:, 0],
+            points[:, 1],
+            points[:, 2],
+            c=color,
+            marker=",",
+            label=name,
+            s=point_size,
+            cmap=color_map_name,
+        )
+        # if color is not string
         if not isinstance(color, str):
-            cax = inset_axes(ax, width="5%", height="50%", loc='lower left', borderpad=1)
+            cax = inset_axes(
+                ax, width="5%", height="50%", loc="lower left", borderpad=1
+            )
             fig.colorbar(plot, cax=cax)
     ax.legend()
-    ax.set_xlabel('X')
-    ax.set_ylabel('Y')
-    ax.set_zlabel('Z')
-    
+    ax.set_xlabel("X")
+    ax.set_ylabel("Y")
+    ax.set_zlabel("Z")
+
     if camera is not None:
         for wire in cam_wires_trans:
             # the Z and Y axes are flipped intentionally here!
             x_, z_, y_ = wire.detach().cpu().numpy().T.astype(float)
-            (h,) = ax.plot(x_, y_, z_, color='k', linewidth=0.3)
+            (h,) = ax.plot(x_, y_, z_, color="k", linewidth=0.3)
     ax.set_title(title)
     if ax_lims is not None:
         ax.set_xlim(ax_lims[0])
         ax.set_ylim(ax_lims[1])
         ax.set_zlim(ax_lims[2])
-    ax.set_aspect('equal')
-    x_equal_lim=ax.get_xlim()
-    y_equal_lim=ax.get_ylim()
-    z_equal_lim=ax.get_zlim()
+    ax.set_aspect("equal")
+    x_equal_lim = ax.get_xlim()
+    y_equal_lim = ax.get_ylim()
+    z_equal_lim = ax.get_zlim()
 
-    #next plot x-z, 2D
+    # next plot x-z, 2D
     ax = fig.add_subplot(222)
-    for points, color, name in zip(point_list, color_list,name_list):
-        plot=ax.scatter(points[:, 0], points[:, 2], c=color, marker=',', label=name,s=point_size, cmap=color_map_name)
-        
+    for points, color, name in zip(point_list, color_list, name_list):
+        plot = ax.scatter(
+            points[:, 0],
+            points[:, 2],
+            c=color,
+            marker=",",
+            label=name,
+            s=point_size,
+            cmap=color_map_name,
+        )
+
         if not isinstance(color, str):
-            cax = inset_axes(ax, width="5%", height="50%", loc='lower left', borderpad=1)
+            cax = inset_axes(
+                ax, width="5%", height="50%", loc="lower left", borderpad=1
+            )
             fig.colorbar(plot, cax=cax)
     if camera is not None:
         for wire in cam_wires_trans:
             x_, z_, y_ = wire.detach().cpu().numpy().T.astype(float)
-            (h,) = ax.plot(x_, z_, color='k', linewidth=0.3)
+            (h,) = ax.plot(x_, z_, color="k", linewidth=0.3)
     ax.legend()
-    ax.set_xlabel('X')
-    ax.set_ylabel('Z')
-    
+    ax.set_xlabel("X")
+    ax.set_ylabel("Z")
+
     if ax_lims is not None:
         ax.set_xlim(ax_lims[0])
         ax.set_ylim(ax_lims[2])
-    ax.set_aspect('equal')
+    ax.set_aspect("equal")
 
-    #next plot y-z, 2D
+    # next plot y-z, 2D
     ax = fig.add_subplot(223)
-    for points, color, name in zip(point_list, color_list,name_list):
-        plot=ax.scatter(points[:, 1], points[:, 2], c=color, marker=',', label=name,s=point_size, cmap=color_map_name)
-        
+    for points, color, name in zip(point_list, color_list, name_list):
+        plot = ax.scatter(
+            points[:, 1],
+            points[:, 2],
+            c=color,
+            marker=",",
+            label=name,
+            s=point_size,
+            cmap=color_map_name,
+        )
+
         if not isinstance(color, str):
-            cax = inset_axes(ax, width="5%", height="50%", loc='lower left', borderpad=1)
+            cax = inset_axes(
+                ax, width="5%", height="50%", loc="lower left", borderpad=1
+            )
             fig.colorbar(plot, cax=cax)
     if camera is not None:
         for wire in cam_wires_trans:
             x_, z_, y_ = wire.detach().cpu().numpy().T.astype(float)
-            (h,) = ax.plot(y_, z_, color='k', linewidth=0.3)
+            (h,) = ax.plot(y_, z_, color="k", linewidth=0.3)
     ax.legend()
-    ax.set_xlabel('Y')
-    ax.set_ylabel('Z')
+    ax.set_xlabel("Y")
+    ax.set_ylabel("Z")
     if ax_lims is not None:
         ax.set_xlim(ax_lims[1])
         ax.set_ylim(ax_lims[2])
-    ax.set_aspect('equal')
+    ax.set_aspect("equal")
 
-    #next plot x-y, 2D
+    # next plot x-y, 2D
     ax = fig.add_subplot(224)
-    for points, color, name in zip(point_list, color_list,name_list):
-        plot=ax.scatter(points[:, 0], points[:, 1], c=color, marker=',', label=name,s=point_size, cmap=color_map_name)
-        
+    for points, color, name in zip(point_list, color_list, name_list):
+        plot = ax.scatter(
+            points[:, 0],
+            points[:, 1],
+            c=color,
+            marker=",",
+            label=name,
+            s=point_size,
+            cmap=color_map_name,
+        )
+
         if not isinstance(color, str):
-            cax = inset_axes(ax, width="5%", height="50%", loc='lower left', borderpad=1)
+            cax = inset_axes(
+                ax, width="5%", height="50%", loc="lower left", borderpad=1
+            )
             fig.colorbar(plot, cax=cax)
     if camera is not None:
         for wire in cam_wires_trans:
             x_, z_, y_ = wire.detach().cpu().numpy().T.astype(float)
-            (h,) = ax.plot(x_, y_, color='k', linewidth=0.3)
+            (h,) = ax.plot(x_, y_, color="k", linewidth=0.3)
     ax.legend()
-    ax.set_xlabel('X')
-    ax.set_ylabel('Y')
+    ax.set_xlabel("X")
+    ax.set_ylabel("Y")
     if ax_lims is not None:
         ax.set_xlim(ax_lims[0])
         ax.set_ylim(ax_lims[1])
-    ax.set_aspect('equal')
-    
-    #end all plots
+    ax.set_aspect("equal")
+
+    # end all plots
 
     plt.tight_layout()
     plt.savefig(fname)
     plt.close()
     return x_equal_lim, y_equal_lim, z_equal_lim
 
-def plot_sample_condition(gt, xts, x0s, steps, args, epoch, fname,point_size=.1,camera=None, image_rgb=None, mask=None):
+
+def plot_sample_condition(
+    gt,
+    xts,
+    x0s,
+    steps,
+    cfg: ProjectConfig,
+    epoch,
+    fname,
+    point_size=0.1,
+    camera=None,
+    image_rgb=None,
+    mask=None,
+):
     assert gt.shape[0] == 1, "gt should have shape (1, N, 3)"
 
     # plot_multi_gt(gts,  args, input_pc_file_list, fname=None)
     if fname is None:
-        dir_name = f"logs/outputs/" +   args.run_name.replace("/", "_")
-        #mkdir
+        dir_name = f"plots/" + cfg.run.name
+        # mkdir
         if not os.path.exists(dir_name):
-            os.makedirs(dir_name)        
-        fname = f"{dir_name}/sample_ep{epoch:09d}_M{args.M}.png"
-    # print("fname",fname)
+            print("creating dir", dir_name)
+            os.makedirs(dir_name)
+        fname = f"{dir_name}/sample_ep_{epoch:05d}.png"
+    print("plot_sample_condition fname",fname)
 
-    gt = gt.cpu().numpy()[0]    
+    gt = gt.cpu().numpy()[0]
     xt = xts[-1].cpu().numpy()[0]
 
-    x_equal_lim, y_equal_lim, z_equal_lim=plot_quadrants([gt,xt], ["g","r"],["gt",'xt'],fname.replace(".png","_gt-xt.png"),point_size=1,title=f"epoch {epoch}",camera=camera)
-    
-    plot_quadrants([gt], ["g"],["gt"],fname.replace(".png","_gt.png"),point_size=1,title=f"epoch {epoch}",camera=camera,ax_lims=[x_equal_lim,y_equal_lim,z_equal_lim])
-    plot_quadrants([xt], ["r"],["xt"],fname.replace(".png","_xt.png"),point_size=1,title=f"epoch {epoch}",camera=camera,ax_lims=[x_equal_lim,y_equal_lim,z_equal_lim])
+    x_equal_lim, y_equal_lim, z_equal_lim = plot_quadrants(
+        [gt, xt],
+        ["g", "r"],
+        ["gt", "xt"],
+        fname.replace(".png", "_gt-xt.png"),
+        point_size=1,
+        title=f"epoch {epoch}",
+        camera=camera,
+    )
 
-    color_map_name = "gist_rainbow" 
-    diff = gt[None,:,:] - xt[:,None,:] # (100, 100, 3)
+    plot_quadrants(
+        [gt],
+        ["g"],
+        ["gt"],
+        fname.replace(".png", "_gt.png"),
+        point_size=1,
+        title=f"epoch {epoch}",
+        camera=camera,
+        ax_lims=[x_equal_lim, y_equal_lim, z_equal_lim],
+    )
+    plot_quadrants(
+        [xt],
+        ["r"],
+        ["xt"],
+        fname.replace(".png", "_xt.png"),
+        point_size=1,
+        title=f"epoch {epoch}",
+        camera=camera,
+        ax_lims=[x_equal_lim, y_equal_lim, z_equal_lim],
+    )
+
+    color_map_name = "gist_rainbow"
+    diff = gt[None, :, :] - xt[:, None, :]  # (100, 100, 3)
     dist = np.linalg.norm(diff, axis=-1)
     min_dist = np.min(dist, axis=0)
-    plot_quadrants([gt], [min_dist],["error"],fname.replace(".png","_gt_color_dist.png"),point_size=1,title=f"epoch {epoch}",camera=camera,ax_lims=[x_equal_lim,y_equal_lim,z_equal_lim],color_map_name=color_map_name)        
-
+    plot_quadrants(
+        [gt],
+        [min_dist],
+        ["error"],
+        fname.replace(".png", "_gt_color_dist.png"),
+        point_size=1,
+        title=f"epoch {epoch}",
+        camera=camera,
+        ax_lims=[x_equal_lim, y_equal_lim, z_equal_lim],
+        color_map_name=color_map_name,
+    )
 
 
 def train(
@@ -368,112 +420,111 @@ def train(
     dataloader,
     optimizer,
     scheduler,
-    args,
+    cfg: ProjectConfig,
     device="cpu",
     start_epoch=0,
-    criterion=nn.MSELoss(), writer=None
+    criterion=nn.MSELoss(),
+    writer=None,pcpm:PointCloudProjectionModel=None
 ):
-    pcpm=PointCloudProjectionModel( image_size=224,
-        image_feature_model='vit_small_patch16_224_msn'  ,
-        use_local_colors=True,
-        use_local_features=True,
-        use_global_features=False,
-        use_mask=True,
-        use_distance_transform=True,
-        predict_shape=True,
-        # predict_color=False,
-        color_channels=3,
-        colors_mean=.5,
-        colors_std=.5,
-        scale_factor=1,).to(device)
+    assert pcpm is not None, "pcpm must be provided"
     model.train()
-    tqdm_range = trange(start_epoch, args.epochs, desc="Epoch")
-    checkpoint_fname = f"/data/palakons/checkpoint/cp_dm_{datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}.pth"
+    tqdm_range = trange(start_epoch, cfg.run.max_steps, desc="Epoch")
+    checkpoint_fname = f"checkpoint_pc2/cp_dm_{datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}.pth"
+    #mkdir if not exist
+    if not os.path.exists(os.path.dirname(checkpoint_fname)):
+        os.makedirs(os.path.dirname(checkpoint_fname))
     print("checkpoint to be saved at", checkpoint_fname)
     for epoch in tqdm_range:
-        losses = train_one_epoch(
-            dataloader, model, optimizer, scheduler,  args, criterion, device
+        batch_losses = train_one_epoch(
+            dataloader, model, optimizer, scheduler, cfg, criterion, device,pcpm
         )
-        tqdm_range.set_description(f"loss: {sum(losses)/len(losses):.4f}")
-        if not args.no_tensorboard:
-            writer.add_scalar("Loss/epoch", sum(losses) / len(losses), epoch)
+        losses = sum(batch_losses) / len(batch_losses)
+        tqdm_range.set_description(f"loss: {losses:.4f}")
+        writer.add_scalar("Loss/epoch", losses, epoch)
 
-        if not args.no_checkpoint and (epoch+1) % args.checkpoint_freq == 0:
-            temp_epochs = args.epochs
-            args.epochs = epoch
+        if (epoch + 1) % cfg.run.checkpoint_freq == 0:
+            temp_epochs = cfg.run.max_steps
+            cfg.run.max_steps = epoch
             checkpoint = {
                 "model": model.state_dict(),
                 "optimizer": optimizer.state_dict(),
-                "args": args,
+                "args": cfg,
             }
-            # save at /data/palakons/checkpoint/cp_{datetime.now().strftime("%Y%m%d-%H%M%S")}.pth
             torch.save(checkpoint, checkpoint_fname)
-            args.epochs = temp_epochs
-        if not args.no_tensorboard and (epoch+1) % args.visualize_freq == 0:
+            cfg.run.max_steps = temp_epochs
+        if (epoch + 1) % cfg.run.vis_freq == 0:
 
             batch = next(iter(dataloader))
             batch = batch.to(device)
-            pc=batch.sequence_point_cloud
-            camera=batch.camera
-            image_rgb=batch.image_rgb
-            mask=batch.fg_probability
-
-            # print("image_rgb",image_rgb.shape)
-            # print("mask",mask.shape)
-            # image_rgb torch.Size([4, 3, 224, 224])
-            # mask torch.Size([4, 1, 224, 224])
+            pc = batch.sequence_point_cloud
+            camera = batch.camera
+            image_rgb = batch.image_rgb
+            mask = batch.fg_probability
 
             sampled_point, xts, x0s, steps = sample(
                 model,
-                scheduler, args,camera=camera[0], image_rgb=image_rgb[:1], mask=mask[:1],
+                scheduler,
+                cfg,
+                camera=camera[0],
+                image_rgb=image_rgb[:1],
+                mask=mask[:1],
                 num_inference_steps=50,
-                evolution_freq=args.evolution_freq,
-                device=device,
+                device=device, pcpm=pcpm
             )
 
+            pc_condition = pcpm.point_cloud_to_tensor(
+                pc[:1], normalize=True, scale=True
+            )
+            plot_sample_condition(
+                pc_condition,
+                xts,
+                x0s,
+                steps,
+                cfg,
+                epoch,
+                None,
+                0.1,
+                camera=camera[0],
+                image_rgb=image_rgb[:1],
+                mask=mask[:1],
+            )
+            cd_loss, _ = chamfer_distance(sampled_point, pc_condition)
 
-            # print("gt_pcs",gt_pcs.shape) #gt_pcs torch.Size([141, 16384, 3])
-            # exit()
-            pc_condition = pcpm.point_cloud_to_tensor(pc[:1], normalize=True, scale=True)
-            # print("pc_condition",pc_condition.shape)
-            # print("sampled_point",sampled_point.shape)
-            # pc_condition torch.Size([1, 16384, 3])
-            # sampled_point torch.Size([1, 16384, 3])
-            plot_sample_condition(pc_condition, xts, x0s, steps,
-                                 args, epoch,None,.1,camera=camera[0], image_rgb=image_rgb[:1], mask=mask[:1])
-            cd_loss,_ = chamfer_distance(sampled_point,pc_condition)
+            writer.add_scalar("CD_condition/epoch", cd_loss.item(), epoch)
 
-            writer.add_scalar(
-                "CD_condition/epoch", cd_loss.item() , epoch)
-
-    if not args.no_checkpoint or True:
-        checkpoint = {
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "args": args,
-        }
-        # save at /data/palakons/checkpoint/cp_{datetime.now().strftime("%Y%m%d-%H%M%S")}.pth
-        torch.save(checkpoint, checkpoint_fname)
-        print("checkpoint saved at", checkpoint_fname)
-
-    # print(f"Epoch {epoch+1} completed")
+    checkpoint = {
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "args": cfg,
+    }
+    torch.save(checkpoint, checkpoint_fname)
+    print("checkpoint saved at", checkpoint_fname)
 
 
 # Sampling function
-@ torch.no_grad()
+@torch.no_grad()
 def sample(
     model,
-    scheduler, args,camera=None, image_rgb=None, mask=None,color_channels=None,predict_color=False,
+    scheduler,
+    cfg: ProjectConfig,
+    camera=None,
+    image_rgb=None,
+    mask=None,
+    color_channels=None,
+    predict_color=False,
     num_inference_steps=None,
-    evolution_freq=None,
-    device="cpu",
+    device="cpu",pcpm:PointCloudProjectionModel=None    
 ):
-    assert camera is not None and image_rgb is not None and mask is not None, "camera, image_rgb, mask must be provided"
+    evolution_freq = cfg.run.evolution_freq
+    assert (
+        camera is not None and image_rgb is not None and mask is not None
+    ), "camera, image_rgb, mask must be provided"
+    assert pcpm is not None, "pcpm must be provided"
     model.eval()
     num_inference_steps = num_inference_steps or scheduler.config.num_train_timesteps
     scheduler.set_timesteps(num_inference_steps)
 
-    N = args.N
+    N = cfg.dataset.max_points
     B = 1 if image_rgb is None else image_rgb.shape[0]
     D = 3 + (color_channels if predict_color else 0)
 
@@ -484,57 +535,57 @@ def sample(
     # torch.randn x_t torch.Size([1, 16384, 3])
     # image size torch.Size([1, 3, 224, 224])
 
-
-    accepts_offset = "offset" in set(inspect.signature(scheduler.set_timesteps).parameters.keys())
+    accepts_offset = "offset" in set(
+        inspect.signature(scheduler.set_timesteps).parameters.keys()
+    )
     extra_set_kwargs = {"offset": 1} if accepts_offset else {}
     scheduler.set_timesteps(num_inference_steps, **extra_set_kwargs)
 
-    pcpm=PointCloudProjectionModel( image_size=224,
-        image_feature_model='vit_small_patch16_224_msn'  ,
-        use_local_colors=True,
-        use_local_features=True,
-        use_global_features=False,
-        use_mask=True,
-        use_distance_transform=True,
-        predict_shape=True,
-        # predict_color=False,
-        color_channels=3,
-        colors_mean=.5,
-        colors_std=.5,
-        scale_factor=1,).to(device)
     # extra_step_kwargs = {"eta": eta} if accepts_eta else {}
-    extra_step_kwargs ={}
+    extra_step_kwargs = {}
     xs = []
     x0t = []
     steps = []
-    for i, t in enumerate(tqdm(scheduler.timesteps.to(device), desc="Sampling", leave=False)):
+    for i, t in enumerate(
+        tqdm(scheduler.timesteps.to(device), desc="Sampling", leave=False)
+    ):
         # print("sampling i",i,"t",t)
         # print("x_t.shape", x_t.shape)
-        # print("image_rgb.shape", image_rgb.shape) 
-        # print("mask.shape", mask.shape)  
+        # print("image_rgb.shape", image_rgb.shape)
+        # print("mask.shape", mask.shape)
         # print("type camera",type(camera)) #type camera <class 'pytorch3d.renderer.cameras.PerspectiveCameras'>
-        
+
         # x_t.shape torch.Size([1, 16384, 3])
         # image_rgb.shape torch.Size([1, 3, 224, 224])
         # mask.shape torch.Size([1, 1, 224, 224])
 
         # Conditioning
-        x_t_input = pcpm.get_input_with_conditioning(x_t, camera=camera,
-            image_rgb=image_rgb, mask=mask, t=torch.tensor([t]))
-            
+        x_t_input = pcpm.get_input_with_conditioning(
+            x_t, camera=camera, image_rgb=image_rgb, mask=mask, t=torch.tensor([t])
+        )
+
         # timesteps = torch.full(
         #     (x.size(0),), t, device=device, dtype=torch.long)
-    
+
         noise_pred = model(x_t_input, t.reshape(1).expand(B))
         # print("output", output.shape)  # output torch.Size([1, 2, 3])
         # expanding outpu dim 2 (last dim) from 3 to 4 with zero (one mroe channel)
 
         x_t = scheduler.step(noise_pred, t, x_t, **extra_step_kwargs)
 
-
         # Convert output back into a point cloud, undoing normalization and scaling
-        output_prev = pcpm.tensor_to_point_cloud(x_t.prev_sample, denormalize=True, unscale=True).points_padded().to(device)
-        output_original_sample = pcpm.tensor_to_point_cloud(x_t.pred_original_sample, denormalize=True, unscale=True).points_padded().to(device)
+        output_prev = (
+            pcpm.tensor_to_point_cloud(x_t.prev_sample, denormalize=True, unscale=True)
+            .points_padded()
+            .to(device)
+        )
+        output_original_sample = (
+            pcpm.tensor_to_point_cloud(
+                x_t.pred_original_sample, denormalize=True, unscale=True
+            )
+            .points_padded()
+            .to(device)
+        )
         # print("type output_prev",type(output_prev)) #<class 'pytorch3d.structures.pointclouds.Pointclouds'>
         # print("type output_original_sample",type(output_original_sample)) #output_original_sample <class 'pytorch3d.structures.pointclouds.Pointclouds'>
         # print("output_prev", output_prev.shape, "output_original_sample", output_original_sample.shape) #output_prev torch.Size([4, 16384, 3]) output_original_sample torch.Size([4, 16384, 3])
@@ -555,132 +606,153 @@ def sample(
     return output_prev, xs, x0t, steps
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Train a diffusion model for point clouds"
-    )
-    parser.add_argument(
-        "--epochs", type=int, default= 2500, help="Number of training epochs"
-    )
-    parser.add_argument("--batch_size", type=int,
-                        default=1, help="Batch size")
-    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
-    parser.add_argument(
-        "--N", type=int, default=16384, help="Number of points in each point cloud"
-    )
-    parser.add_argument( 
-        "--M", type=int, default=1, help="Number of point cloud scenes to load"
-    )
-    parser.add_argument(
-        "--num_train_timesteps",
-        type=int,
-        default=1000,
-        help="Number of training time steps",
-    )
-    parser.add_argument(
-        "--beta_schedule", type=str, default="linear", help="Beta schedule"
-    )
-    parser.add_argument("--no_tensorboard",  # action="store_true",
-                        default=False,
-                        help="Disable tensorboard logging")
-    parser.add_argument(
-        "--visualize_freq", type=int, default=10, help="Visualize frequency"
-    )
-    parser.add_argument(
-        "--n_hidden_layers", type=int, default=1, help="Number of hidden layers"
-    )
-    parser.add_argument("--hidden_dim", type=int,
-                        default=64, help="Hidden dimension")
-    parser.add_argument("--loss_type", type=str,
-                        default="mse", help="Loss function")
-    parser.add_argument("--model", type=str,
-                        default="pc2", help="Model type")
-    parser.add_argument(
-        "--checkpoint_freq", type=int, default=10, help="Checkpoint frequency"
-    )
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--no_checkpoint", default=True,
-                        # action="store_true",
-                        help="No checkpoint")
-    parser.add_argument(
-        "--evolution_freq", type=int, default=10, help="Evolution frequency"
-    )
-    # parser.add_argument(
-    #     "--extra_channels", type=int, default=0, help="Extra channels in PVCNN >=0"
-    # )
-    parser.add_argument(
-        "--point_path", type=str, default=None, help="Path to point cloud"  # either txt or ply
-    )
-    parser.add_argument("--tb_log_dir", type=str, default="./logs",
-                        help="Path to store tensorboard logs")
-    parser.add_argument("--run_name", type=str, default="first-27-jan-2500", help="Run name")
-    # normilzation method, std or min-max
-    parser.add_argument("--norm_method", type=str,
-                        default="std", help="Normalization method")
-    
-    # use_local_colors: bool = True
-    # use_local_features: bool = True
-    # use_mask: bool = True
-    
-    
+# def parse_args():
+#     parser = argparse.ArgumentParser(
+#         description="Train a diffusion model for point clouds"
+#     )
 
-    args = parser.parse_args()
+#     # parser.add_argument(
+#     #     "--epochs", type=int, default= 2500, help="Number of training epochs"
+#     # ) # cfg.run.max_steps
+#     # parser.add_argument("--batch_size", type=int,
+#     #                     default=1, help="Batch size") # cfg.dataloader.batch_size
+#     # parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate") # cfg.optimizer.lr
+#     # parser.add_argument(
+#     #     "--N", type=int, default=16384, help="Number of points in each point cloud"
+#     # )
+#     # parser.add_argument(
+#     #     "--M", type=int, default=1, help="Number of point cloud scenes to load"
+#     # ) #cfg.dataloader.num_scenes
+#     # parser.add_argument(
+#     #     "--num_train_timesteps",
+#     #     type=int,
+#     #     default=1000,
+#     #     help="Number of training time steps",
+#     # ) # cfg.run.num_inference_steps
+#     # parser.add_argument(
+#     #     "--beta_schedule", type=str, default="linear", help="Beta schedule"
+#     # ) # cfg.model.beta_schedule
+#     # parser.add_argument("--no_tensorboard",  # action="store_true",
+#     #                     default=False,
+#     #                     help="Disable tensorboard logging")
+#     # parser.add_argument(
+#     #     "--visualize_freq", type=int, default=10, help="Visualize frequency"
+#     # ) # cfg.run.vis_freq
+#     parser.add_argument(
+#         "--n_hidden_layers", type=int, default=1, help="Number of hidden layers"
+#     )
+#     parser.add_argument("--hidden_dim", type=int, default=64, help="Hidden dimension")
+#     parser.add_argument("--loss_type", type=str, default="mse", help="Loss function")
+#     parser.add_argument("--model", type=str, default="pc2", help="Model type")
+#     # parser.add_argument(
+#     #     "--checkpoint_freq", type=int, default=10, help="Checkpoint frequency"
+#     # ) # cfg.run.checkpoint_freq
+#     # parser.add_argument("--seed", type=int, default=42, help="Random seed") # fgc.run.seed
+#     parser.add_argument(
+#         "--no_checkpoint",
+#         default=True,
+#         # action="store_true",
+#         help="No checkpoint",
+#     )
+#     # parser.add_argument(
+#     #     "--evolution_freq", type=int, default=10, help="Evolution frequency"
+#     # )
+#     # parser.add_argument(
+#     #     "--extra_channels", type=int, default=0, help="Extra channels in PVCNN >=0"
+#     # )
+#     parser.add_argument(
+#         "--point_path",
+#         type=str,
+#         default=None,
+#         help="Path to point cloud",  # either txt or ply
+#     )
+#     parser.add_argument(
+#         "--tb_log_dir",
+#         type=str,
+#         default="./logs",
+#         help="Path to store tensorboard logs",
+#     )
+#     parser.add_argument(
+#         "--run_name", type=str, default="first-27-jan-2500", help="Run name"
+#     )
+#     # normilzation method, std or min-max
+#     parser.add_argument(
+#         "--norm_method", type=str, default="std", help="Normalization method"
+#     )
 
-    # if args.no_tensorboard is a string
-    if type(args.no_tensorboard) == str:
-        if args.no_tensorboard.lower() not in ["true", "false"]:
-            print("no_tensorboard must be either True or False")
+#     # use_local_colors: bool = True
+#     # use_local_features: bool = True
+#     # use_mask: bool = True
 
-        args.no_tensorboard = (args.no_tensorboard.lower() == "true")
-    # smae for no_checkpoint
-    if type(args.no_checkpoint) == str:
-        if args.no_checkpoint.lower() not in ["true", "false"]:
-            print("no_checkpoint must be either True or False")
+#     args = parser.parse_args()
 
-        args.no_checkpoint = (args.no_checkpoint.lower() == "true")
-    return args
+#     # if args.no_tensorboard is a string
+#     if type(args.no_tensorboard) == str:
+#         if args.no_tensorboard.lower() not in ["true", "false"]:
+#             print("no_tensorboard must be either True or False")
+
+#         args.no_tensorboard = args.no_tensorboard.lower() == "true"
+#     # smae for no_checkpoint
+#     if type(args.no_checkpoint) == str:
+#         if args.no_checkpoint.lower() not in ["true", "false"]:
+#             print("no_checkpoint must be either True or False")
+
+#         args.no_checkpoint = args.no_checkpoint.lower() == "true"
+#     return args
 
 
-def match_args(args1, args2):
-    # if number of args1 != number of args2:
-    # make copy of args1, args2
-    arga = vars(args1).copy()
-    argb = vars(args2).copy()
-    # remove checkpoint_freq,"epochs", "no_tensorboard" from both, if exist
-    for key in ["checkpoint_freq", "epochs", "no_tensorboard", "no_checkpoint", "tb_log_dir", "run_name", "visualize_freq"]:
-        if key in arga:
-            del arga[key]
-        if key in argb:
-            del argb[key]
+# def match_args(args1, args2):
+#     # if number of args1 != number of args2:
+#     # make copy of args1, args2
+#     arga = vars(args1).copy()
+#     argb = vars(args2).copy()
+#     # remove checkpoint_freq,"epochs", "no_tensorboard" from both, if exist
+#     for key in [
+#         "checkpoint_freq",
+#         "epochs",
+#         "no_tensorboard",
+#         "no_checkpoint",
+#         "tb_log_dir",
+#         "run_name",
+#         "visualize_freq",
+#     ]:
+#         if key in arga:
+#             del arga[key]
+#         if key in argb:
+#             del argb[key]
 
-    # check if they are the same
-    if len((arga)) != len((argb)):
-        # print("number of args not the same")
-        return False
-    # check one by one if they are the same, except for epochs
-    for key, value in arga.items():
-        if value != (argb)[key]:
-            # print(f"{key} not the same", value, "vs", (argb)[key])
-            print(".", end="")
-            return False
-    print()
-    return True
+#     # check if they are the same
+#     if len((arga)) != len((argb)):
+#         # print("number of args not the same")
+#         return False
+#     # check one by one if they are the same, except for epochs
+#     for key, value in arga.items():
+#         if value != (argb)[key]:
+#             # print(f"{key} not the same", value, "vs", (argb)[key])
+#             print(".", end="")
+#             return False
+#     print()
+#     return True
 
-    # if checkpoint["args"].num_train_timesteps == args.num_train_timesteps and checkpoint["args"].beta_schedule == args.beta_schedule and checkpoint["args"].N == args.N and checkpoint["args"].M == args.M and checkpoint["args"].lr == args.lr and checkpoint["args"].batch_size == args.batch_size
+#     # if checkpoint["args"].num_train_timesteps == args.num_train_timesteps and checkpoint["args"].beta_schedule == args.beta_schedule and checkpoint["args"].N == args.N and checkpoint["args"].M == args.M and checkpoint["args"].lr == args.lr and checkpoint["args"].batch_size == args.batch_size
 
-    # for key, value in vars(args1).items():
-    #     if value != vars(args2)[key]:
-    #         return False
-    # return True
+#     # for key, value in vars(args1).items():
+#     #     if value != vars(args2)[key]:
+#     #         return False
+#     # return True
+
 
 # PVCNN-Based
 class PVCNNDiffusionModel3D(nn.Module):
     def __init__(
         # pvcnnplusplus, pvcnn, simple
-        self, data_dim, point_cloud_model_embed_dim=64, point_cloud_model="pvcnn",
-            dropout=0.1,
-            width_multiplier=1,
-            voxel_resolution_multiplier=1,
+        self,
+        data_dim,
+        point_cloud_model_embed_dim=64,
+        point_cloud_model="pvcnn",
+        dropout=0.1,
+        width_multiplier=1,
+        voxel_resolution_multiplier=1,
     ):
         super().__init__()
 
@@ -702,13 +774,12 @@ class PVCNNDiffusionModel3D(nn.Module):
             voxel_resolution_multiplier=self.voxel_resolution_multiplier,
         )
 
-
-
     def forward(self, x, t):
         # (B, N, 3) (B,) #x torch.Size([1, 100, 3]) t torch.Size([1])
         noise_pred = self.point_cloud_model(x, t)
 
         return noise_pred
+
 
 # # PVCNN-Based
 # class ConditionalPVCNNDiffusionModel3D(nn.Module):
@@ -751,8 +822,6 @@ class PVCNNDiffusionModel3D(nn.Module):
 #         return noise_pred
 
 
-
-
 # class ConditionalModel(PointCloudProjectionModel):
 #     def __init__(
 #         self,
@@ -768,11 +837,11 @@ class PVCNNDiffusionModel3D(nn.Module):
 #             out_channels=self.out_channels,
 #         )
 #     def forward(self, batch, **kwargs):
-#         pc=batch.sequence_point_cloud, 
+#         pc=batch.sequence_point_cloud,
 #         camera=batch.camera,
 #         image_rgb=batch.image_rgb,
 #         mask=batch.fg_probability,
-        
+
 #         # Normalize colors and convert to tensor
 #         x_0 = self.point_cloud_to_tensor(pc, normalize=True, scale=True)
 #         B, N, D = x_0.shape
@@ -781,29 +850,30 @@ class PVCNNDiffusionModel3D(nn.Module):
 #         noise = torch.randn_like(x_0)
 
 #         # Sample random timesteps for each point_cloud
-#         timestep = torch.randint(0, self.scheduler.config.num_train_timesteps, (B,), 
+#         timestep = torch.randint(0, self.scheduler.config.num_train_timesteps, (B,),
 #             device=self.device, dtype=torch.long)
-#         # timestep = torch.randint(0, self.scheduler.num_train_timesteps, (B,), 
+#         # timestep = torch.randint(0, self.scheduler.num_train_timesteps, (B,),
 #         #     device=self.device, dtype=torch.long)
 
 #         # Add noise to points
 #         x_t = self.scheduler.add_noise(x_0, noise, timestep)
 
 #         # Conditioning
-#         x_t_input = self.get_input_with_conditioning(x_t, camera=camera, 
+#         x_t_input = self.get_input_with_conditioning(x_t, camera=camera,
 #             image_rgb=image_rgb, mask=mask, t=timestep)
 
 #         # Forward
 #         noise_pred = self.point_cloud_model(x_t_input, timestep)
-        
+
 #         # Check
 #         if not noise_pred.shape == noise.shape:
 #             # raise ValueError(f'{noise_pred.shape=} and {noise.shape=}')
 #             raise ValueError(f'{noise_pred.shape} and {noise.shape} not equal')
-        
+
 #         return noise_pred
- 
-def get_pc2dataset(cfg,M):
+
+
+def get_pc2dataset(cfg):
     dataset_cfg: CO3DConfig = cfg.dataset
     # category:'car'
     # max_points: int = 16_384
@@ -811,16 +881,16 @@ def get_pc2dataset(cfg,M):
     # mask_images: bool = '${model.use_mask}'
     # use_mask: bool = True
     # restrict_model_ids: Optional[List] = None
-    # subset_name: str = '80-20' 
+    # subset_name: str = '80-20'
     # root: str = os.getenv('ASTYX_DATASET_ROOT')
 
     dataloader_cfg: DataloaderConfig = cfg.dataloader
-    
+
     # Exclude bad and low-quality sequences
     exclude_sequence = []
     exclude_sequence.extend(EXCLUDE_SEQUENCE.get(dataset_cfg.category, []))
     exclude_sequence.extend(LOW_QUALITY_SEQUENCE.get(dataset_cfg.category, []))
-    
+
     # Whether to load pointclouds
     kwargs = dict(
         remove_empty_masks=True,
@@ -831,11 +901,17 @@ def get_pc2dataset(cfg,M):
         image_width=dataset_cfg.image_size,
         mask_images=dataset_cfg.mask_images,
         exclude_sequence=exclude_sequence,
-        pick_sequence=() if dataset_cfg.restrict_model_ids is None else dataset_cfg.restrict_model_ids,
+        pick_sequence=(
+            ()
+            if dataset_cfg.restrict_model_ids is None
+            else dataset_cfg.restrict_model_ids
+        ),
     )
 
     # Get dataset mapper
-    dataset_map_provider_type = registry.get(JsonIndexDatasetMapProviderV2, "JsonIndexDatasetMapProviderV2")
+    dataset_map_provider_type = registry.get(
+        JsonIndexDatasetMapProviderV2, "JsonIndexDatasetMapProviderV2"
+    )
     expand_args_fields(dataset_map_provider_type)
     dataset_map_provider = dataset_map_provider_type(
         category=dataset_cfg.category,
@@ -850,27 +926,42 @@ def get_pc2dataset(cfg,M):
     # Get datasets
     datasets = dataset_map_provider.get_dataset_map()
 
-    #print length of train, val, test
+    # print length of train, val, test
     print("len(train)", len(datasets["train"]))
     print("len(val)", len(datasets["val"]))
     print("len(test)", len(datasets["test"]))
-    print("M", M)
+    print("M", cfg.dataloader.num_scenes)
+    # datasets["train"].frame_annots = datasets["train"].frame_annots[:M]
+    # randoimly sample M point, using random.sample
+    datasets["train"].frame_annots = random.sample(
+        datasets["train"].frame_annots, cfg.dataloader.num_scenes
+    )
+
+    print("frame_annots", len(datasets["train"].frame_annots))
+    print("seq_annots", len(datasets["train"].seq_annots))
+
+    print("len(train)", len(datasets["train"]))
+
     # len(train) 144
     # len(val) 46
     # len(test) 144
     # M 1
 
-    #pick only M first item in train,val,test
+    # pick only M first item in train,val,test
 
     # PATCH BUG WITH POINT CLOUD LOCATIONS!
     for dataset in (datasets["train"], datasets["val"]):
         for key, ann in dataset.seq_annots.items():
-            correct_point_cloud_path = Path(dataset.dataset_root) / Path(*Path(ann.point_cloud.path).parts[-3:])
+            correct_point_cloud_path = Path(dataset.dataset_root) / Path(
+                *Path(ann.point_cloud.path).parts[-3:]
+            )
             assert correct_point_cloud_path.is_file(), correct_point_cloud_path
             ann.point_cloud.path = str(correct_point_cloud_path)
 
     # Get dataloader mapper
-    data_loader_map_provider_type = registry.get(SequenceDataLoaderMapProvider, "SequenceDataLoaderMapProvider")
+    data_loader_map_provider_type = registry.get(
+        SequenceDataLoaderMapProvider, "SequenceDataLoaderMapProvider"
+    )
     expand_args_fields(data_loader_map_provider_type)
     data_loader_map_provider = data_loader_map_provider_type(
         batch_size=dataloader_cfg.batch_size,
@@ -878,77 +969,83 @@ def get_pc2dataset(cfg,M):
     )
 
     # QUICK HACK: Patch the train dataset because it is not used but it throws an error
-    if (len(datasets['train']) == 0 and len(datasets[dataset_cfg.eval_split]) > 0 and 
-            dataset_cfg.restrict_model_ids is not None and cfg.run.job == 'sample'):
-        datasets = DatasetMap(train=datasets[dataset_cfg.eval_split], val=datasets[dataset_cfg.eval_split], 
-                                test=datasets[dataset_cfg.eval_split])
-        print('Note: You used restrict_model_ids and there were no ids in the train set.')
+    if (
+        len(datasets["train"]) == 0
+        and len(datasets[dataset_cfg.eval_split]) > 0
+        and dataset_cfg.restrict_model_ids is not None
+        and cfg.run.job == "sample"
+    ):
+        datasets = DatasetMap(
+            train=datasets[dataset_cfg.eval_split],
+            val=datasets[dataset_cfg.eval_split],
+            test=datasets[dataset_cfg.eval_split],
+        )
+        print(
+            "Note: You used restrict_model_ids and there were no ids in the train set."
+        )
 
     # Get dataloaders
     dataloaders = data_loader_map_provider.get_data_loader_map(datasets)
-    dataloader_train = dataloaders['train']
+    dataloader_train = dataloaders["train"]
     dataloader_val = dataloader_vis = dataloaders[dataset_cfg.eval_split]
 
     # Replace validation dataloader sampler with SequentialSampler
-    dataloader_val.batch_sampler.sampler = SequentialSampler(dataloader_val.batch_sampler.sampler.data_source)
+    dataloader_val.batch_sampler.sampler = SequentialSampler(
+        dataloader_val.batch_sampler.sampler.data_source
+    )
 
     # Modify for accelerate
     dataloader_train.batch_sampler.drop_last = True
     dataloader_val.batch_sampler.drop_last = False
 
     return dataloader_train, dataloader_val, dataloader_vis
-def get_model(args, device="cpu"):
-
-    if args.model == "mlp3d":
-        raise ValueError("model mlp3d not supported, please use pc2")
-        data_dim = args.N * 3
-
-        return SimpleDiffusionModel3D(
-            data_dim=data_dim,
-            time_embedding_dim=16,
-            hidden_dim=args.hidden_dim,
-            num_hidden_layers=args.n_hidden_layers,
-        ).to(device)
-    elif args.model == "pvcnn" or args.model == "pc2":
-        # raise ValueError("model pvcnn not supported, please use pc2")
-        pcpm =PointCloudProjectionModel ( image_size=224, image_feature_model='vit_small_patch16_224_msn'   )
-
-        data_dim = pcpm.in_channels  
-        print("data_dim", data_dim)
-        return PVCNNDiffusionModel3D(data_dim=data_dim,          point_cloud_model_embed_dim=args.hidden_dim, point_cloud_model="pvcnn",      dropout=0.1,            width_multiplier=1,            voxel_resolution_multiplier=1,).to(device)
-    else:
-        raise ValueError("model not supported, choose either mlp3d, pvcnn, or pc2")
 
 
-def get_checkpoint_fname(args, CHECKPOINT_DIR):
-    # check checkpoint
-    files = glob.glob(f"{CHECKPOINT_DIR}/cp_dm_*.pth")
-    max_epoch = 0
-    current_cp_fname = None
-    for fname in files:
-        try:
-            checkpoint = torch.load(fname)
-            if match_args(checkpoint["args"], args):
-                if (
-                    checkpoint["args"].epochs <= args.epochs
-                    and checkpoint["args"].epochs > max_epoch
-                ):
-                    max_epoch = checkpoint["args"].epochs
-                    current_cp_fname = fname
-                    # print("current_cp", current_cp_fname)
-        except:
-            print("error", fname)
-            continue
-    return current_cp_fname
+def get_model(cfg: ProjectConfig, device="cpu",pcpm=None):
+
+    assert pcpm is not None, "pcpm must be provided"
+    data_dim = pcpm.in_channels
+    print("data_dim", data_dim)
+
+    return PVCNNDiffusionModel3D(
+        data_dim=data_dim,
+        point_cloud_model_embed_dim=cfg.model.point_cloud_model_embed_dim,
+        point_cloud_model=cfg.model.point_cloud_model,
+        dropout=0.1,
+        width_multiplier=1,
+        voxel_resolution_multiplier=1,
+    ).to(device)
 
 
-def get_loss(args):
-    if args.loss_type == "mse":
+# def get_checkpoint_fname(args, CHECKPOINT_DIR):
+#     # check checkpoint
+#     files = glob.glob(f"{CHECKPOINT_DIR}/cp_dm_*.pth")
+#     max_epoch = 0
+#     current_cp_fname = None
+#     for fname in files:
+#         try:
+#             checkpoint = torch.load(fname)
+#             if match_args(checkpoint["args"], args):
+#                 if (
+#                     checkpoint["args"].epochs <= args.epochs
+#                     and checkpoint["args"].epochs > max_epoch
+#                 ):
+#                     max_epoch = checkpoint["args"].epochs
+#                     current_cp_fname = fname
+#                     # print("current_cp", current_cp_fname)
+#         except:
+#             print("error", fname)
+#             continue
+#     return current_cp_fname
+
+
+def get_loss(cfg: ProjectConfig):
+    if cfg.loss.loss_type == "mse":
         return nn.MSELoss(reduction="mean")
-    elif args.loss_type == "chamfer":
-        return PointCloudLoss(npoints=args.N, emd_weight=0)
-    elif args.loss_type == "emd":
-        return PointCloudLoss(npoints=args.N, emd_weight=1)
+    elif cfg.loss.loss_type == "chamfer":
+        return PointCloudLoss(npoints=cfg.dataset.max_points, emd_weight=0)
+    elif cfg.loss.loss_type == "emd":
+        return PointCloudLoss(npoints=cfg.dataset.max_points, emd_weight=1)
     else:
         raise ValueError("loss not supported")
 
@@ -973,88 +1070,64 @@ def get_loss(args):
 #                     global_step=epoch)
 
 
-import hydra
-@hydra.main(config_path='config', config_name='config', version_base='1.1')
+@hydra.main(config_path="config", config_name="config", version_base="1.1")
 def main(cfg: ProjectConfig):
+    print(cfg)
 
-    args = parse_args()
-    if args.model != "pvcnn":
-        args.extra_channels = 0
-        print("extra_channels set to 0 for non-pvcnn model")
-    else:
-        assert args.extra_channels >= 0, "extra_channels must be >=0 for pvcnn"
-    print(args)
-    set_seed(args.seed)
-
-
-    if not args.no_tensorboard:
-        log_dir = args.tb_log_dir + \
-            f"/{args.run_name if  args.run_name else datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}"
-        writer = SummaryWriter(
-            log_dir=log_dir)
-        print("tensorboard log at", log_dir)
+    set_seed(cfg.run.seed)
+    tb_log_dir = "tb_log"
+    log_dir = tb_log_dir + f"/{cfg.run.name}"
+    writer = SummaryWriter(log_dir=log_dir)
+    print("tensorboard log at", log_dir)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print("device", device)
-    
-    pcpm=PointCloudProjectionModel( image_size=224,
-        image_feature_model='vit_small_patch16_224_msn'  ,
-        use_local_colors=True,
-        use_local_features=True,
-        use_global_features=False,
-        use_mask=True,
-        use_distance_transform=True,
-        predict_shape=True,
-        # predict_color=False,
-        color_channels=3,
-        colors_mean=.5,
-        colors_std=.5,
-        scale_factor=1,).to(device)
-    # dataset = PointCloudDataset(args)
-    # dataset = PC2Dataset(args)
-    # dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
 
-    if False: #test plot_multi_gt
-        gt_pcs = dataloader.dataset.data.to(device)
-        input_pc_file_list = dataloader.dataset.use_files_list
-        plot_multi_gt(gt_pcs,  args, input_pc_file_list, fname=None)
-        exit()
+    pcpm = PointCloudProjectionModel(
+        image_size=cfg.model.image_size,
+        image_feature_model=cfg.model.image_feature_model,
+        use_local_colors=cfg.model.use_local_colors,
+        use_local_features=cfg.model.use_local_features,
+        use_global_features=cfg.model.use_global_features,
+        use_mask=cfg.model.use_mask,
+        use_distance_transform=cfg.model.use_distance_transform,
+        predict_shape=cfg.model.predict_shape,
+        predict_color=cfg.model.predict_color,
+        color_channels=cfg.model.color_channels,
+        colors_mean=cfg.model.colors_mean,
+        colors_std=cfg.model.colors_std,
+        scale_factor=cfg.model.scale_factor,
+    ).to(device)
 
-    dataloader_train, dataloader_val, dataloader_vis = get_pc2dataset(cfg,args.M)
+    dataloader_train, _, _ = get_pc2dataset(cfg)
 
-    model = get_model(args, device=device)
+    model = get_model(cfg, device=device,pcpm=pcpm)
 
-    if not args.no_tensorboard:
-        writer.add_scalar("model_params", sum(p.numel()
-                          for p in model.parameters()))
-
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.optimizer.lr)
     # linear, scaled_linear, or squaredcos_cap_v2.
+    assert cfg.run.diffusion_scheduler == "ddpm", "only ddpm supported"
     scheduler = DDPMScheduler(
-        num_train_timesteps=args.num_train_timesteps, beta_schedule=args.beta_schedule,
+        num_train_timesteps=cfg.run.num_inference_steps,
+        beta_schedule=cfg.model.beta_schedule,
         prediction_type="epsilon",  # or "sample" or "v_prediction"
-        clip_sample=False
+        clip_sample=False,
+        beta_start=cfg.model.beta_start,
+        beta_end=cfg.model.beta_end,
     )
-
-    CHECKPOINT_DIR = "/data/palakons/checkpoint"
     start_epoch = 0
+    current_cp_fname = cfg.checkpoint.resume
+    if current_cp_fname is not None:
+        current_cp = torch.load(current_cp_fname)
+        print("loading checkpoint", current_cp_fname)
+        model.load_state_dict(current_cp["model"])
+        optimizer.load_state_dict(current_cp["optimizer"])
+        start_epoch = current_cp["args"].run.max_steps
+        print("start_epoch", start_epoch)
 
-    if not args.no_checkpoint:
-        current_cp_fname = get_checkpoint_fname(args, CHECKPOINT_DIR)
-        if current_cp_fname is not None:
-            current_cp = torch.load(current_cp_fname)
-            print("loading checkpoint", current_cp_fname)
-            model.load_state_dict(current_cp["model"])
-            optimizer.load_state_dict(current_cp["optimizer"])
-            start_epoch = current_cp["args"].epochs
-            print("start_epoch", start_epoch)
-            # if not args.no_tensorboard:
-            #     raise ValueError("not implemented")
+    else:
+        print("no checkpoint found")
 
-        else:
-            print("no checkpoint found")
-
-    criterion = get_loss(args)
+    criterion = get_loss(cfg)
     # Train the model
     train(
         model,
@@ -1062,94 +1135,82 @@ def main(cfg: ProjectConfig):
         dataloader_train,
         optimizer,
         scheduler,
-        args,
+        cfg,
         device=device,
         start_epoch=start_epoch,
-        criterion=criterion, writer=writer
+        criterion=criterion,
+        writer=writer,pcpm=pcpm
     )
 
     losses = train_one_epoch(
-        dataloader_train, model, optimizer, scheduler, args, criterion=criterion, device=device
+        dataloader_train,
+        model,
+        optimizer,
+        scheduler,
+        cfg,
+        criterion=criterion,
+        device=device,pcpm=pcpm
     )
     metric_dict = {"Loss": sum(losses) / len(losses)}
-    if not args.no_tensorboard:
-        writer.add_scalar("Loss/epoch", sum(losses) /
-                          len(losses), args.epochs - 1)
-
-    # samples, _ = sample(model, scheduler, sample_shape=( 1000, data_dim), device=device)
+    writer.add_scalar("Loss/epoch", sum(losses) / len(losses), cfg.run.max_steps)
 
     # Sample from the model
-    num_sample_points = 1
 
     batch = next(iter(dataloader_train))
     batch = batch.to(device)
-    pc=batch.sequence_point_cloud
-    camera=batch.camera
-    image_rgb=batch.image_rgb
-    mask=batch.fg_probability
-    
+    pc = batch.sequence_point_cloud
+    camera = batch.camera
+    image_rgb = batch.image_rgb
+    mask = batch.fg_probability
+
     samples = {}
     for i in [1, 5, 10, 50, 100]:
         samples[f"step{i}"] = sample(
             model,
-            scheduler, args,camera=camera[0], image_rgb=image_rgb[:1], mask=mask[:1],
+            scheduler,
+            cfg,
+            camera=camera[0],
+            image_rgb=image_rgb[:1],
+            mask=mask[:1],
             num_inference_steps=i,
-            evolution_freq=args.evolution_freq,
-            device=device,
+            device=device, pcpm=pcpm
         )
 
-    if not args.no_tensorboard:
+    if True:  # Evo plots
         # make the plot that will be logged to tb
+        gt_cond_pc = pcpm.point_cloud_to_tensor(pc, normalize=True, scale=True)
+
         plt.figure(figsize=(10, 10))
 
         for key, value in samples.items():
-            # print(samples[key][0].shape)
-            # print("dataset.std",dataset.std.shape)
-            samples_updated = samples[key][0] 
-            # samples_updated = samples[key][0] *                 dataset.factor.to(device) + dataset.mean.to(device)
-            # print("samples_updated", key, samples_updated.shape) #samples_updated step1 torch.Size([1, 1, 3])
-            # #shape  dataset[:]
-            # print("dataset[:]", dataset[:].shape) #dataset[:] torch.Size([2, 1, 3])
-            
-            gt_pcs = [pcpm.point_cloud_to_tensor(batch.sequence_point_cloud, normalize=True, scale=True) for batch in dataloader_train.dataset]
-            gt_pcs = [gt_pc for gt_pc in gt_pcs if gt_pc.shape[1]==16384]
-            gt_pcs = torch.cat(gt_pcs, dim=0).to(device)
-            cd_losses = []
-            for i,gt_pc  in enumerate(gt_pcs):
-                # print("gt_pc",i,gt_pc.shape)
-                # print("samples_updated",samples_updated.shape)
-                # gt_pc 0 torch.Size([1, 16384, 3])
-                # samples_updated torch.Size([1, 16384, 3])
-                loss, _ = chamfer_distance(
-                    gt_pc.unsqueeze(0).to(device) ,
-                    samples_updated.to(device),
-                )
-                cd_losses.append(loss.item())
+            samples_updated = samples[key][0]
 
-            # log minumum loss
+
+            cd_loss, _ = chamfer_distance(
+                gt_cond_pc.to(device),
+                samples_updated.to(device),
+            )
 
             print(
-                key, "\t", f"CD: { min(cd_losses):.2f} at {cd_losses.index(min(cd_losses))}")
-            if not args.no_tensorboard:
-                writer.add_scalar(f"CD_{key}", min(cd_losses), args.epochs)
+                key,
+                "\t",
+                f"CD: {cd_loss:.2f}",
+            )
+            writer.add_scalar(f"CD_{key}", cd_loss, cfg.run.max_steps)
 
-                # add cd to metric_dict
-                metric_dict = {**{f"CD_{key}": min(cd_losses)}, **metric_dict}
+            # add cd to metric_dict
+            metric_dict = {**{f"CD_{key}": cd_loss}, **metric_dict}
 
             error = []
             assert len(samples[key][1]) > 1, "need more than 1 sample to plot"
             for x in samples[key][1]:
                 # x = x * dataset.factor.to(device) + dataset.mean.to(device)
 
-                cd_losses = []
-                for i,gt_pc  in enumerate(gt_pcs):
-                    loss, _ = chamfer_distance(
-                        gt_pc.unsqueeze(0).to(device) ,
-                        x.to(device),
-                    )
-                    # print(f"{loss.item():.2f}", end=", ")
-                    cd_losses.append(loss.item())
-                error.append(min(cd_losses))
+                cd_loss, _ = chamfer_distance(
+                    gt_cond_pc.to(device),
+                    x.to(device),
+                )
+                error.append(cd_loss.item())
             # ax = plt.plot(error, label=key)
             plt.plot(
                 [i / (len(error) - 1) for i in range(len(error))],
@@ -1160,63 +1221,27 @@ def main(cfg: ProjectConfig):
             # print()
         plt.legend()
         plt.title(
-            f"Diffusion model: {args.epochs} epochs, {args.num_train_timesteps} timesteps, {args.beta_schedule} schedule",
+            f"Diffusion model: {cfg.run.max_steps } epochs, {cfg.run.num_inference_steps } timesteps, {cfg.model.beta_schedule } schedule",
         )
         plt.xlabel("Evolution steps ratio")
         plt.ylabel("Chamfer distance")
         # ylog
         plt.yscale("log")
 
-        writer.add_figure(f"Evolution", plt.gcf(), args.epochs)
+        writer.add_figure(f"Evolution", plt.gcf(),cfg.run.max_steps)
         plt.close()
 
     print("done evo plots")
-    # plot evolution
 
-    # key_to_plot = "step50"
-
-    # # get GT  from dataloader
-    # gt_pc = next(iter(dataloader)).to(device)  # one sample
-    # # gt_pc = gt_pc * dataset.factor.to(device) + dataset.mean.to(device)
-    # # print("gt_pc", gt_pc.shape) #gt_pc torch.Size([1, N*3])
-    # gt_pc = gt_pc.reshape(-1, 3)
-    # gt_pc = gt_pc.cpu().numpy()
-
-    # key = key_to_plot
-    # value = samples[key]
-
-    # temp = torch.stack(value[1], dim=0)
-    # # print("temp", key, temp.shape)
-    # samples_updated = temp.to(
-    #     device) * dataset.factor.to(device) + dataset.mean.to(device)
-    # # print("samples_updated", key, samples_updated.shape)
-    # # print("samples_updated.reshape(-1,3).mean(dim=0)", samples_updated.reshape(-1,3).mean(dim=0))
-    # # mean_coord_val = samples_updated.reshape(-1, 3).mean(dim=0).cpu()
-    # # factor_coord_val = samples_updated.reshape(-1, 3).factor(dim=0).cpu()
-    # # move to cpu
-    # # min_coord_val = min_coord_val.cpu()
-    # # max_coord_val = max_coord_val.cpu()
-    # # print(key, "\tmin max, ", mean_coord_val, std_coord_val)
-    # samples_updated = samples_updated.cpu().numpy()
-
-    # if not args.no_tensorboard:
-    #     for i, x in tqdm(enumerate(samples_updated)):
-    #         # print("x", x.shape)
-    #         # x_shape = x.reshape(x.shape[0], -1, 3)
-    #         log_sample_to_tb(
-    #             x[0, :, :],
-    #             gt_pc,
-    #             key,
-    #             i * args.evolution_freq -
-    #             (1 if i == len(samples_updated) - 1 else 0),
-    #             args.epochs, writer
-    #         )
-
-    if not args.no_tensorboard:
-        hparam_dict = vars(args)
-        writer.add_hparams(hparam_dict, metric_dict)
-        writer.close()
+    hparam_dict = {"seed": cfg.run.seed,"epochs": cfg.run.max_steps,"num_inference_steps": cfg.run.num_inference_steps,"image_size": cfg.dataset.image_size,"beta_schedule": cfg.model.beta_schedule,"point_cloud_model_embed_dim": cfg.model.point_cloud_model_embed_dim, "dataset_cat": cfg.dataset.category,"dataset_source": cfg.dataset.type,"max_points": cfg.dataset.max_points,"lr": cfg.optimizer.lr,"batch_size": cfg.dataloader.batch_size,"num_scenes": cfg.dataloader.num_scenes,"loss_type": cfg.loss.loss_type,"optimizer": cfg.optimizer.name}
+                   
+    writer.add_hparams(hparam_dict, metric_dict)
+    writer.close()
 
 
 if __name__ == "__main__":
     main()
+    
+    
+    
+    
