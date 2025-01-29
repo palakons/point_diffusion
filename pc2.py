@@ -86,13 +86,21 @@ class PointCloudLoss(nn.Module):
 
 # Training function
 def train_one_epoch(
-    dataloader, model, optimizer, scheduler, cfg: ProjectConfig, criterion, device,pcpm:PointCloudProjectionModel
+    dataloader,
+    model,
+    optimizer,
+    scheduler,
+    cfg: ProjectConfig,
+    criterion,
+    device,
+    pcpm: PointCloudProjectionModel,
 ):
     assert pcpm is not None, "pcpm must be provided"
     model.train()
 
     batch_losses = []
     for batch in dataloader:
+
         batch = batch.to(device)
         pc = batch.sequence_point_cloud
         camera = batch.camera
@@ -109,21 +117,45 @@ def train_one_epoch(
             device=device,
             dtype=torch.long,
         )
+        # print("timesteps", timesteps.device)
+        # print("noise", noise.device)
+        # print("x_0 device", x_0.device)
+        # print("camera device", camera.device)
+        # print("image_rgb device", image_rgb.device)
+        # print("mask device", mask.device)
 
         x_t = scheduler.add_noise(x_0, noise, timesteps)  # noisy_x
         x_t_input = pcpm.get_input_with_conditioning(
             x_t, camera=camera, image_rgb=image_rgb, mask=mask, t=timesteps
         )
+        # print("x_t_input", x_t_input.device)
+        # print("x_t", x_t.device)
 
         optimizer.zero_grad()
         noise_pred = model(x_t_input, timesteps)
+
         if not noise_pred.shape == noise.shape:
             raise ValueError(f"{noise_pred.shape} and {noise.shape} not equal")
 
         loss = criterion(noise_pred, noise)
         loss.backward()
         optimizer.step()
-        batch_losses.append(loss.item())
+        batch_losses.append(loss.item())  # float
+        # print("noise_pred", noise_pred.device)
+        # print("noise", noise.device)
+        # print("loss", loss.device)
+
+        # timesteps cuda:0
+        # noise cuda:0
+        # x_0 device cuda:0
+        # camera device cuda:0
+        # image_rgb device cuda:0
+        # mask device cuda:0
+        # x_t_input cuda:0
+        # x_t cuda:0
+        # noise_pred cuda:0
+        # noise cuda:0
+        # loss cuda:0
 
     return batch_losses
 
@@ -180,6 +212,11 @@ def get_camera_wires_trans(cameras):
     Plots a set of `cameras` objects into the maplotlib axis `ax` with
     color `color`.
     """
+    # print("cameras.device", cameras.device)
+    # print(torch.device("cuda"))
+    # cameras.device cuda:0
+    # cuda
+    assert str(cameras.device).startswith("cuda"), "cameras should be on cuda"
     cam_wires_canonical = get_camera_wireframe().cuda()[None]
     cam_trans = cameras.get_world_to_view_transform().inverse()
     cam_wires_trans = cam_trans.transform_points(cam_wires_canonical)
@@ -193,17 +230,19 @@ def plot_quadrants(
     fname,
     point_size=0.5,
     title="",
-    camera=None,
+    cam_wires_trans=None,
     ax_lims=None,
     color_map_name="gist_rainbow",
 ):
-    fig_size_baseline=10
-    cam_wires_trans = get_camera_wires_trans(camera) if camera is not None else None
+    # assert camera is on cpu, not cuda
+    assert cam_wires_trans.device == torch.device("cpu"), "camera should be on cpu"
+    fig_size_baseline = 10
+
     fig = plt.figure(figsize=(fig_size_baseline, fig_size_baseline))
     ax = fig.add_subplot(221, projection="3d")
     for points, color, name in zip(point_list, color_list, name_list):
-        assert len(points.shape) == 2, "points should have shape (N, 3)"
-        assert points.shape[1] == 3, "points should have shape (N, 3)"
+        assert len(points.shape) == 2, f"{name} points should have shape (N, 3), not {points.shape}"
+        assert points.shape[1] == 3, f"{name} points should have shape (N, 3), not {points.shape}"
         plot = ax.scatter(
             points[:, 0],
             points[:, 1],
@@ -225,10 +264,10 @@ def plot_quadrants(
     ax.set_ylabel("Y")
     ax.set_zlabel("Z")
 
-    if camera is not None:
+    if cam_wires_trans is not None:
         for wire in cam_wires_trans:
             # the Z and Y axes are flipped intentionally here!
-            x_, z_, y_ = wire.detach().cpu().numpy().T.astype(float)
+            x_, z_, y_ = wire.numpy().T.astype(float)
             (h,) = ax.plot(x_, y_, z_, color="k", linewidth=0.3)
     ax.set_title(title)
     if ax_lims is not None:
@@ -258,9 +297,9 @@ def plot_quadrants(
                 ax, width="5%", height="50%", loc="lower left", borderpad=1
             )
             fig.colorbar(plot, cax=cax)
-    if camera is not None:
+    if cam_wires_trans is not None:
         for wire in cam_wires_trans:
-            x_, z_, y_ = wire.detach().cpu().numpy().T.astype(float)
+            x_, z_, y_ = wire.numpy().T.astype(float)
             (h,) = ax.plot(x_, z_, color="k", linewidth=0.3)
     ax.legend()
     ax.set_xlabel("X")
@@ -289,9 +328,9 @@ def plot_quadrants(
                 ax, width="5%", height="50%", loc="lower left", borderpad=1
             )
             fig.colorbar(plot, cax=cax)
-    if camera is not None:
+    if cam_wires_trans is not None:
         for wire in cam_wires_trans:
-            x_, z_, y_ = wire.detach().cpu().numpy().T.astype(float)
+            x_, z_, y_ = wire.numpy().T.astype(float)
             (h,) = ax.plot(y_, z_, color="k", linewidth=0.3)
     ax.legend()
     ax.set_xlabel("Y")
@@ -319,9 +358,9 @@ def plot_quadrants(
                 ax, width="5%", height="50%", loc="lower left", borderpad=1
             )
             fig.colorbar(plot, cax=cax)
-    if camera is not None:
+    if cam_wires_trans is not None:
         for wire in cam_wires_trans:
-            x_, z_, y_ = wire.detach().cpu().numpy().T.astype(float)
+            x_, z_, y_ = wire.numpy().T.astype(float)
             (h,) = ax.plot(x_, y_, color="k", linewidth=0.3)
     ax.legend()
     ax.set_xlabel("X")
@@ -348,11 +387,17 @@ def plot_sample_condition(
     epoch,
     fname,
     point_size=0.1,
-    camera=None,
+    cam_wires_trans=None,
     image_rgb=None,
     mask=None,
 ):
     assert gt.shape[0] == 1, "gt should have shape (1, N, 3)"
+    if cam_wires_trans is not None:
+        assert cam_wires_trans.device == torch.device(
+            "cpu"
+        ), "cam_wires_trans should be on cpu"
+    assert gt.device == torch.device("cpu"), "gt should be on cpu"
+    assert xts.device == torch.device("cpu"), "xts should be on cpu"
 
     # plot_multi_gt(gts,  args, input_pc_file_list, fname=None)
     if fname is None:
@@ -362,10 +407,10 @@ def plot_sample_condition(
             print("creating dir", dir_name)
             os.makedirs(dir_name)
         fname = f"{dir_name}/sample_ep_{epoch:05d}.png"
-    print("plot_sample_condition fname",fname)
+    print("plot_sample_condition fname", fname)
 
-    gt = gt.cpu().numpy()[0]
-    xt = xts[-1].cpu().numpy()[0]
+    gt = gt.numpy()[0]
+    xt = xts[-1].numpy()
 
     x_equal_lim, y_equal_lim, z_equal_lim = plot_quadrants(
         [gt, xt],
@@ -374,7 +419,7 @@ def plot_sample_condition(
         fname.replace(".png", "_gt-xt.png"),
         point_size=1,
         title=f"epoch {epoch}",
-        camera=camera,
+        cam_wires_trans=cam_wires_trans,
     )
 
     plot_quadrants(
@@ -384,7 +429,7 @@ def plot_sample_condition(
         fname.replace(".png", "_gt.png"),
         point_size=1,
         title=f"epoch {epoch}",
-        camera=camera,
+        cam_wires_trans=cam_wires_trans,
         ax_lims=[x_equal_lim, y_equal_lim, z_equal_lim],
     )
     plot_quadrants(
@@ -394,7 +439,7 @@ def plot_sample_condition(
         fname.replace(".png", "_xt.png"),
         point_size=1,
         title=f"epoch {epoch}",
-        camera=camera,
+        cam_wires_trans=cam_wires_trans,
         ax_lims=[x_equal_lim, y_equal_lim, z_equal_lim],
     )
 
@@ -409,7 +454,7 @@ def plot_sample_condition(
         fname.replace(".png", "_gt_color_dist.png"),
         point_size=1,
         title=f"epoch {epoch}",
-        camera=camera,
+        cam_wires_trans=cam_wires_trans,
         ax_lims=[x_equal_lim, y_equal_lim, z_equal_lim],
         color_map_name=color_map_name,
     )
@@ -424,19 +469,22 @@ def train(
     device="cpu",
     start_epoch=0,
     criterion=nn.MSELoss(),
-    writer=None,pcpm:PointCloudProjectionModel=None
+    writer=None,
+    pcpm: PointCloudProjectionModel = None,
 ):
     assert pcpm is not None, "pcpm must be provided"
     model.train()
     tqdm_range = trange(start_epoch, cfg.run.max_steps, desc="Epoch")
-    checkpoint_fname = f"checkpoint_pc2/cp_dm_{datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}.pth"
-    #mkdir if not exist
+    checkpoint_fname = (
+        f"checkpoint_pc2/cp_dm_{datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}.pth"
+    )
+    # mkdir if not exist
     if not os.path.exists(os.path.dirname(checkpoint_fname)):
         os.makedirs(os.path.dirname(checkpoint_fname))
     print("checkpoint to be saved at", checkpoint_fname)
     for epoch in tqdm_range:
         batch_losses = train_one_epoch(
-            dataloader, model, optimizer, scheduler, cfg, criterion, device,pcpm
+            dataloader, model, optimizer, scheduler, cfg, criterion, device, pcpm
         )
         losses = sum(batch_losses) / len(batch_losses)
         tqdm_range.set_description(f"loss: {losses:.4f}")
@@ -469,24 +517,33 @@ def train(
                 image_rgb=image_rgb[:1],
                 mask=mask[:1],
                 num_inference_steps=50,
-                device=device, pcpm=pcpm
-            )
+                device=device,
+                pcpm=pcpm,
+            ) 
 
             pc_condition = pcpm.point_cloud_to_tensor(
                 pc[:1], normalize=True, scale=True
             )
+
+            # print("shape pc_condition",pc_condition.shape) #pc_condition torch.Size([1, 128, 3])
+
+            # print("dev camera", camera.device)
+            # print("dev camera[0]", camera[0].device)
+            # dev camera cuda:0
+            # dev camera[0] cuda:0
+
             plot_sample_condition(
-                pc_condition,
-                xts,
-                x0s,
+                pc_condition.cpu(),
+                xts.cpu(),
+                x0s.cpu(),
                 steps,
                 cfg,
                 epoch,
                 None,
                 0.1,
-                camera=camera[0],
-                image_rgb=image_rgb[:1],
-                mask=mask[:1],
+                cam_wires_trans=get_camera_wires_trans(camera[0]).detach().cpu(),
+                image_rgb=image_rgb[:1].detach().cpu(),
+                mask=mask[:1].detach().cpu(),
             )
             cd_loss, _ = chamfer_distance(sampled_point, pc_condition)
 
@@ -513,13 +570,15 @@ def sample(
     color_channels=None,
     predict_color=False,
     num_inference_steps=None,
-    device="cpu",pcpm:PointCloudProjectionModel=None    
+    device="cpu",
+    pcpm: PointCloudProjectionModel = None,
 ):
     evolution_freq = cfg.run.evolution_freq
     assert (
         camera is not None and image_rgb is not None and mask is not None
     ), "camera, image_rgb, mask must be provided"
     assert pcpm is not None, "pcpm must be provided"
+
     model.eval()
     num_inference_steps = num_inference_steps or scheduler.config.num_train_timesteps
     scheduler.set_timesteps(num_inference_steps)
@@ -529,12 +588,7 @@ def sample(
     D = 3 + (color_channels if predict_color else 0)
 
     x_t = torch.randn(B, N, D, device=device)
-
-    # print(" torch.randn x_t", x_t.shape) # torch.Size([1, 16384, 3])
-    # print("image size", image_rgb.shape)
-    # torch.randn x_t torch.Size([1, 16384, 3])
-    # image size torch.Size([1, 3, 224, 224])
-
+    # print("dev x_t", x_t.device)
     accepts_offset = "offset" in set(
         inspect.signature(scheduler.set_timesteps).parameters.keys()
     )
@@ -549,27 +603,23 @@ def sample(
     for i, t in enumerate(
         tqdm(scheduler.timesteps.to(device), desc="Sampling", leave=False)
     ):
-        # print("sampling i",i,"t",t)
-        # print("x_t.shape", x_t.shape)
-        # print("image_rgb.shape", image_rgb.shape)
-        # print("mask.shape", mask.shape)
-        # print("type camera",type(camera)) #type camera <class 'pytorch3d.renderer.cameras.PerspectiveCameras'>
-
-        # x_t.shape torch.Size([1, 16384, 3])
-        # image_rgb.shape torch.Size([1, 3, 224, 224])
-        # mask.shape torch.Size([1, 1, 224, 224])
 
         # Conditioning
         x_t_input = pcpm.get_input_with_conditioning(
             x_t, camera=camera, image_rgb=image_rgb, mask=mask, t=torch.tensor([t])
         )
+        # print("dev t", t.device)
+        # print("dev x_t_input", x_t_input.device)
+        # print("dev camera", camera.device)
+        # print("dev image_rgb", image_rgb.device)
+        # print("dev mask", mask.device)
+        # dev x_t_input cuda:0
+        # dev camera cuda:0
+        # dev image_rgb cuda:0
+        # dev mask cuda:0
 
-        # timesteps = torch.full(
-        #     (x.size(0),), t, device=device, dtype=torch.long)
 
         noise_pred = model(x_t_input, t.reshape(1).expand(B))
-        # print("output", output.shape)  # output torch.Size([1, 2, 3])
-        # expanding outpu dim 2 (last dim) from 3 to 4 with zero (one mroe channel)
 
         x_t = scheduler.step(noise_pred, t, x_t, **extra_step_kwargs)
 
@@ -586,11 +636,17 @@ def sample(
             .points_padded()
             .to(device)
         )
-        # print("type output_prev",type(output_prev)) #<class 'pytorch3d.structures.pointclouds.Pointclouds'>
-        # print("type output_original_sample",type(output_original_sample)) #output_original_sample <class 'pytorch3d.structures.pointclouds.Pointclouds'>
-        # print("output_prev", output_prev.shape, "output_original_sample", output_original_sample.shape) #output_prev torch.Size([4, 16384, 3]) output_original_sample torch.Size([4, 16384, 3])
+        # print("dev noise_pred", noise_pred.device)
+        # print("dev output_prev", output_prev.device)
+        # print("dev output_original_sample", output_original_sample.device)
+        
+        # dev noise_pred cuda:0
+        # dev output_prev cuda:0
+        # dev output_original_sample cuda:0
 
         x_t = x_t.prev_sample
+        # print("dev x_t", x_t.device)
+        # dev x_t cuda:0
 
         if (
             evolution_freq is not None and i % evolution_freq == 0
@@ -603,6 +659,17 @@ def sample(
         xs.append(output_prev)
         steps.append(0)
         x0t.append(output_original_sample)
+    # print("shape xs", len(xs), "shape steps", len(steps), "shape x0t", len(x0t))
+    # print("shape xs", xs[0].shape, "shape steps", steps[0].shape, "shape x0t", x0t[0].shape)
+    # shape xs 6 shape steps 6 shape x0t 6 
+    # shape xs torch.Size([1, 128, 3]) shape steps torch.Size([]) shape x0t torch.Size([1, 128, 3])
+    xs = torch.concat(xs, dim=0)
+    steps = torch.tensor(steps)
+    x0t = torch.concat(x0t, dim=0)
+    # print("shape xs", xs.shape, "shape steps", steps.shape, "shape x0t", x0t.shape)
+    # print('device xs', xs.device, 'device steps', steps.device, 'device x0t', x0t.device)
+    # shape xs torch.Size([6, 128, 3]) shape steps torch.Size([6]) shape x0t torch.Size([6, 128, 3])
+    # device xs cuda:0 device steps cpu device x0t cuda:0
     return output_prev, xs, x0t, steps
 
 
@@ -1001,7 +1068,7 @@ def get_pc2dataset(cfg):
     return dataloader_train, dataloader_val, dataloader_vis
 
 
-def get_model(cfg: ProjectConfig, device="cpu",pcpm=None):
+def get_model(cfg: ProjectConfig, device="cpu", pcpm=None):
 
     assert pcpm is not None, "pcpm must be provided"
     data_dim = pcpm.in_channels
@@ -1101,7 +1168,7 @@ def main(cfg: ProjectConfig):
 
     dataloader_train, _, _ = get_pc2dataset(cfg)
 
-    model = get_model(cfg, device=device,pcpm=pcpm)
+    model = get_model(cfg, device=device, pcpm=pcpm)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.optimizer.lr)
     # linear, scaled_linear, or squaredcos_cap_v2.
@@ -1139,7 +1206,8 @@ def main(cfg: ProjectConfig):
         device=device,
         start_epoch=start_epoch,
         criterion=criterion,
-        writer=writer,pcpm=pcpm
+        writer=writer,
+        pcpm=pcpm,
     )
 
     losses = train_one_epoch(
@@ -1149,7 +1217,8 @@ def main(cfg: ProjectConfig):
         scheduler,
         cfg,
         criterion=criterion,
-        device=device,pcpm=pcpm
+        device=device,
+        pcpm=pcpm,
     )
     metric_dict = {"Loss": sum(losses) / len(losses)}
     writer.add_scalar("Loss/epoch", sum(losses) / len(losses), cfg.run.max_steps)
@@ -1173,7 +1242,8 @@ def main(cfg: ProjectConfig):
             image_rgb=image_rgb[:1],
             mask=mask[:1],
             num_inference_steps=i,
-            device=device, pcpm=pcpm
+            device=device,
+            pcpm=pcpm,
         )
 
     if True:  # Evo plots
@@ -1184,7 +1254,6 @@ def main(cfg: ProjectConfig):
 
         for key, value in samples.items():
             samples_updated = samples[key][0]
-
 
             cd_loss, _ = chamfer_distance(
                 gt_cond_pc.to(device),
@@ -1204,11 +1273,9 @@ def main(cfg: ProjectConfig):
             error = []
             assert len(samples[key][1]) > 1, "need more than 1 sample to plot"
             for x in samples[key][1]:
-                # x = x * dataset.factor.to(device) + dataset.mean.to(device)
-
                 cd_loss, _ = chamfer_distance(
                     gt_cond_pc.to(device),
-                    x.to(device),
+                    x.unsqueeze(0).to(device),
                 )
                 error.append(cd_loss.item())
             # ax = plt.plot(error, label=key)
@@ -1228,20 +1295,31 @@ def main(cfg: ProjectConfig):
         # ylog
         plt.yscale("log")
 
-        writer.add_figure(f"Evolution", plt.gcf(),cfg.run.max_steps)
+        writer.add_figure(f"Evolution", plt.gcf(), cfg.run.max_steps)
         plt.close()
 
     print("done evo plots")
 
-    hparam_dict = {"seed": cfg.run.seed,"epochs": cfg.run.max_steps,"num_inference_steps": cfg.run.num_inference_steps,"image_size": cfg.dataset.image_size,"beta_schedule": cfg.model.beta_schedule,"point_cloud_model_embed_dim": cfg.model.point_cloud_model_embed_dim, "dataset_cat": cfg.dataset.category,"dataset_source": cfg.dataset.type,"max_points": cfg.dataset.max_points,"lr": cfg.optimizer.lr,"batch_size": cfg.dataloader.batch_size,"num_scenes": cfg.dataloader.num_scenes,"loss_type": cfg.loss.loss_type,"optimizer": cfg.optimizer.name}
-                   
+    hparam_dict = {
+        "seed": cfg.run.seed,
+        "epochs": cfg.run.max_steps,
+        "num_inference_steps": cfg.run.num_inference_steps,
+        "image_size": cfg.dataset.image_size,
+        "beta_schedule": cfg.model.beta_schedule,
+        "point_cloud_model_embed_dim": cfg.model.point_cloud_model_embed_dim,
+        "dataset_cat": cfg.dataset.category,
+        "dataset_source": cfg.dataset.type,
+        "max_points": cfg.dataset.max_points,
+        "lr": cfg.optimizer.lr,
+        "batch_size": cfg.dataloader.batch_size,
+        "num_scenes": cfg.dataloader.num_scenes,
+        "loss_type": cfg.loss.loss_type,
+        "optimizer": cfg.optimizer.name,
+    }
+
     writer.add_hparams(hparam_dict, metric_dict)
     writer.close()
 
 
 if __name__ == "__main__":
     main()
-    
-    
-    
-    
