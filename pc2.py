@@ -486,80 +486,122 @@ def train(
     if not os.path.exists(os.path.dirname(checkpoint_fname)):
         os.makedirs(os.path.dirname(checkpoint_fname))
     print("checkpoint to be saved at", checkpoint_fname)
-    for epoch in tqdm_range:
-        batch_losses = train_one_epoch(
-            dataloader, model, optimizer, scheduler, cfg, criterion, device, pcpm
+    if start_epoch == cfg.run.max_steps: # no training, checkpoint available
+        print("checkpoint already available at", checkpoint_fname, "goes directly to inference")
+        epoch = start_epoch
+        batch = next(iter(dataloader))
+        batch = batch.to(device)
+        pc = batch.sequence_point_cloud
+        camera = batch.camera
+        image_rgb = batch.image_rgb
+        mask = batch.fg_probability
+
+        sampled_point, xts, x0s, steps = sample(
+            model,
+            scheduler,
+            cfg,
+            camera=camera[0],
+            image_rgb=image_rgb[:1],
+            mask=mask[:1],
+            num_inference_steps=50,
+            device=device,
+            pcpm=pcpm,
         )
-        losses = sum(batch_losses) / len(batch_losses)
-        tqdm_range.set_description(f"loss: {losses:.4f}")
-        writer.add_scalar("Loss/epoch", losses, epoch)
 
-        if (epoch + 1) % cfg.run.checkpoint_freq == 0:
-            temp_epochs = cfg.run.max_steps
-            cfg.run.max_steps = epoch
-            checkpoint = {
-                "model": model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "args": cfg,
-            }
-            torch.save(checkpoint, checkpoint_fname)
-            cfg.run.max_steps = temp_epochs
-        if (epoch + 1) % cfg.run.vis_freq == 0:
+        pc_condition = pcpm.point_cloud_to_tensor(
+            pc[:1], normalize=True, scale=True
+        )
+        plot_sample_condition(
+            pc_condition.cpu(),
+            xts.cpu(),
+            x0s.cpu(),
+            steps,
+            cfg,
+            epoch,
+            None,
+            0.1,
+            cam_wires_trans=get_camera_wires_trans(camera[0]).detach().cpu(),
+            image_rgb=image_rgb[:1].detach().cpu(),
+            mask=mask[:1].detach().cpu(),
+        )
+        cd_loss, _ = chamfer_distance(sampled_point, pc_condition)
 
-            batch = next(iter(dataloader))
-            batch = batch.to(device)
-            pc = batch.sequence_point_cloud
-            camera = batch.camera
-            image_rgb = batch.image_rgb
-            mask = batch.fg_probability
-
-            sampled_point, xts, x0s, steps = sample(
-                model,
-                scheduler,
-                cfg,
-                camera=camera[0],
-                image_rgb=image_rgb[:1],
-                mask=mask[:1],
-                num_inference_steps=50,
-                device=device,
-                pcpm=pcpm,
+        writer.add_scalar("CD_condition/epoch", cd_loss.item(), epoch)
+    else:
+        for epoch in tqdm_range:
+            batch_losses = train_one_epoch(
+                dataloader, model, optimizer, scheduler, cfg, criterion, device, pcpm
             )
+            losses = sum(batch_losses) / len(batch_losses)
+            tqdm_range.set_description(f"loss: {losses:.4f}")
+            writer.add_scalar("Loss/epoch", losses, epoch)
 
-            pc_condition = pcpm.point_cloud_to_tensor(
-                pc[:1], normalize=True, scale=True
-            )
+            if (epoch + 1) % cfg.run.checkpoint_freq == 0:
+                temp_epochs = cfg.run.max_steps
+                cfg.run.max_steps = epoch
+                checkpoint = {
+                    "model": model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "args": cfg,
+                }
+                torch.save(checkpoint, checkpoint_fname)
+                cfg.run.max_steps = temp_epochs
+            if (epoch + 1) % cfg.run.vis_freq == 0:
 
-            # print("shape pc_condition",pc_condition.shape) #pc_condition torch.Size([1, 128, 3])
+                batch = next(iter(dataloader))
+                batch = batch.to(device)
+                pc = batch.sequence_point_cloud
+                camera = batch.camera
+                image_rgb = batch.image_rgb
+                mask = batch.fg_probability
 
-            # print("dev camera", camera.device)
-            # print("dev camera[0]", camera[0].device)
-            # dev camera cuda:0
-            # dev camera[0] cuda:0
+                sampled_point, xts, x0s, steps = sample(
+                    model,
+                    scheduler,
+                    cfg,
+                    camera=camera[0],
+                    image_rgb=image_rgb[:1],
+                    mask=mask[:1],
+                    num_inference_steps=50,
+                    device=device,
+                    pcpm=pcpm,
+                )
 
-            plot_sample_condition(
-                pc_condition.cpu(),
-                xts.cpu(),
-                x0s.cpu(),
-                steps,
-                cfg,
-                epoch,
-                None,
-                0.1,
-                cam_wires_trans=get_camera_wires_trans(camera[0]).detach().cpu(),
-                image_rgb=image_rgb[:1].detach().cpu(),
-                mask=mask[:1].detach().cpu(),
-            )
-            cd_loss, _ = chamfer_distance(sampled_point, pc_condition)
+                pc_condition = pcpm.point_cloud_to_tensor(
+                    pc[:1], normalize=True, scale=True
+                )
 
-            writer.add_scalar("CD_condition/epoch", cd_loss.item(), epoch)
+                # print("shape pc_condition",pc_condition.shape) #pc_condition torch.Size([1, 128, 3])
 
-    checkpoint = {
-        "model": model.state_dict(),
-        "optimizer": optimizer.state_dict(),
-        "args": cfg,
-    }
-    torch.save(checkpoint, checkpoint_fname)
-    print("checkpoint saved at", checkpoint_fname)
+                # print("dev camera", camera.device)
+                # print("dev camera[0]", camera[0].device)
+                # dev camera cuda:0
+                # dev camera[0] cuda:0
+
+                plot_sample_condition(
+                    pc_condition.cpu(),
+                    xts.cpu(),
+                    x0s.cpu(),
+                    steps,
+                    cfg,
+                    epoch,
+                    None,
+                    0.1,
+                    cam_wires_trans=get_camera_wires_trans(camera[0]).detach().cpu(),
+                    image_rgb=image_rgb[:1].detach().cpu(),
+                    mask=mask[:1].detach().cpu(),
+                )
+                cd_loss, _ = chamfer_distance(sampled_point, pc_condition)
+
+                writer.add_scalar("CD_condition/epoch", cd_loss.item(), epoch)
+
+        checkpoint = {
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "args": cfg,
+        }
+        torch.save(checkpoint, checkpoint_fname)
+        print("checkpoint saved at", checkpoint_fname)
 
 
 # Sampling function
@@ -1253,13 +1295,16 @@ def main(cfg: ProjectConfig):
 
     if True:  # Evo plots
         # make the plot that will be logged to tb
-        gt_cond_pc = pcpm.point_cloud_to_tensor(pc, normalize=True, scale=True)
+        gt_cond_pc = pcpm.point_cloud_to_tensor(pc[:1], normalize=True, scale=True)
+        # print("samples_updated", samples_updated.shape)
+        # print("gt_cond_pc", gt_cond_pc.shape)
+        # samples_updated torch.Size([1, 128, 3])
+        # gt_cond_pc torch.Size([2, 128, 3])
 
         plt.figure(figsize=(10, 10))
 
         for key, value in samples.items():
             samples_updated = samples[key][0]
-
             cd_loss, _ = chamfer_distance(
                 gt_cond_pc.to(device),
                 samples_updated.to(device),
