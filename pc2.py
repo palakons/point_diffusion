@@ -223,6 +223,75 @@ def get_camera_wires_trans(cameras):
     return cam_wires_trans
 
 
+def plot_image_mask(    gt,
+    cfg: ProjectConfig,
+    fname,
+    point_size=0.1,
+    cam_wires_trans=None,
+    image_rgb=None,
+    mask=None,
+):
+    assert gt.shape[0] == 1, "gt should have shape (1, N, 3)"
+    if cam_wires_trans is not None:
+        assert cam_wires_trans.device == torch.device(
+            "cpu"
+        ), "cam_wires_trans should be on cpu"
+    assert gt.device == torch.device("cpu"), "gt should be on cpu"
+
+    plt_title = f"{cfg.run.name}"
+
+    # plot_multi_gt(gts,  args, input_pc_file_list, fname=None)
+    if fname is None:
+        dir_name = f"plots/" + cfg.run.name
+        # mkdir
+        if not os.path.exists(dir_name):
+            print("creating dir", dir_name)
+            os.makedirs(dir_name)
+        fname = f"{dir_name}/images-masks.png"
+    # print("plot_sample_condition fname", fname)
+
+    gt = gt.numpy()
+    
+    # print("gt", gt.shape)
+
+    #make sure same number of items, gt, camera, image_rgb, mask
+    assert len(gt) == len(cam_wires_trans) == len(image_rgb) == len(mask), f"gt, camera, image_rgb, mask should have same number of items: {len(gt)}, {len(cam_wires_trans)}, {len(image_rgb)}, {len(mask)}"
+    fig = plt.figure(figsize=(30, 10))
+
+    for i in range(len(gt)):
+
+        ax = fig.add_subplot(len(gt), 3, 3*i+1)
+        ax.imshow(image_rgb[i].cpu().numpy().transpose(1, 2, 0))
+        ax.axis("off")
+        ax.set_title("image_rgb")
+        ax = fig.add_subplot(len(gt), 3, 3*i+2)
+        ax.imshow(mask[i].cpu().numpy().transpose(1, 2, 0))
+        ax.axis("off")
+        ax.set_title("mask")
+        #ax[x] is 3d plots
+        ax = fig.add_subplot(len(gt), 3, 3*i+3 , projection="3d")
+        plot = ax.scatter(
+            gt[i][:, 0],
+            gt[i][:, 1],
+            gt[i][:, 2],
+            marker=",",
+            s=point_size
+        )
+        ax.set_xlabel("X")
+        ax.set_ylabel("Y")
+        ax.set_zlabel("Z")
+
+        if cam_wires_trans is not None:
+            for wire in cam_wires_trans:
+                # the Z and Y axes are flipped intentionally here!
+                x_, z_, y_ = wire.numpy().T.astype(float)
+                (h,) = ax.plot(x_, y_, z_, color="k", linewidth=0.3)
+        ax.set_aspect("equal")
+        
+    plt.tight_layout()
+    plt.savefig(fname)
+    plt.close()
+    print("saved image-mask", fname)
 def plot_quadrants(
     point_list,
     color_list,
@@ -403,6 +472,8 @@ def plot_sample_condition(
     assert gt.device == torch.device("cpu"), "gt should be on cpu"
     assert xts.device == torch.device("cpu"), "xts should be on cpu"
 
+    plt_title = f"epoch {epoch}: {cfg.run.name}"
+
     # plot_multi_gt(gts,  args, input_pc_file_list, fname=None)
     if fname is None:
         dir_name = f"plots/" + cfg.run.name
@@ -422,7 +493,7 @@ def plot_sample_condition(
         ["gt", "xt"],
         fname.replace(".png", "_gt-xt.png"),
         point_size=1,
-        title=f"epoch {epoch}",
+        title=plt_title,
         cam_wires_trans=cam_wires_trans,
     )
 
@@ -432,7 +503,7 @@ def plot_sample_condition(
         ["gt"],
         fname.replace(".png", "_gt.png"),
         point_size=1,
-        title=f"epoch {epoch}",
+        title=plt_title,
         cam_wires_trans=cam_wires_trans,
         ax_lims=[x_equal_lim, y_equal_lim, z_equal_lim],
     )
@@ -442,7 +513,7 @@ def plot_sample_condition(
         ["xt"],
         fname.replace(".png", "_xt.png"),
         point_size=1,
-        title=f"epoch {epoch}",
+        title=plt_title,
         cam_wires_trans=cam_wires_trans,
         ax_lims=[x_equal_lim, y_equal_lim, z_equal_lim],
     )
@@ -457,7 +528,7 @@ def plot_sample_condition(
         ["error"],
         fname.replace(".png", "_gt_color_dist.png"),
         point_size=1,
-        title=f"epoch {epoch}",
+        title=plt_title,
         cam_wires_trans=cam_wires_trans,
         ax_lims=[x_equal_lim, y_equal_lim, z_equal_lim],
         color_map_name=color_map_name,
@@ -524,6 +595,14 @@ def train(
             image_rgb=image_rgb[:1].detach().cpu(),
             mask=mask[:1].detach().cpu(),
         )
+
+        plot_image_mask(
+            pc_condition.cpu(),
+            cfg,
+            None,
+            0.1,cam_wires_trans=get_camera_wires_trans(camera[0]).detach().cpu(),
+            image_rgb=image_rgb[:1].detach().cpu(),
+            mask=mask[:1].detach().cpu())
         cd_loss, _ = chamfer_distance(sampled_point, pc_condition)
 
         writer.add_scalar("CD_condition/epoch", cd_loss.item(), epoch)
@@ -578,6 +657,15 @@ def train(
                 # dev camera cuda:0
                 # dev camera[0] cuda:0
 
+                if False: # save parameters to pkl
+                    import pickle
+                    temp_fname = cfg.run.name.replace("/", "_")+f"_tes_plots.pkl"
+                    data = {"pc_condition": pc_condition, "xts": xts, "x0s": x0s, "steps": steps, "cfg": cfg, "epoch": epoch,"camera": camera, "image_rgb": image_rgb, "mask": mask}
+                    with open(f"outputs/{temp_fname}", "wb") as f:
+                        pickle.dump(data, f)
+                    print("saved at", f"outputs/{temp_fname}")
+                    exit()
+
                 plot_sample_condition(
                     pc_condition.cpu(),
                     xts.cpu(),
@@ -591,6 +679,12 @@ def train(
                     image_rgb=image_rgb[:1].detach().cpu(),
                     mask=mask[:1].detach().cpu(),
                 )
+                plot_image_mask(            pc_condition.cpu(),
+            cfg,
+            None,
+            0.1,cam_wires_trans=get_camera_wires_trans(camera[0]).detach().cpu(),
+            image_rgb=image_rgb[:1].detach().cpu(),
+            mask=mask[:1].detach().cpu())
                 cd_loss, _ = chamfer_distance(sampled_point, pc_condition)
 
                 writer.add_scalar("CD_condition/epoch", cd_loss.item(), epoch)
