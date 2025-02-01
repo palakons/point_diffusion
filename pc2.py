@@ -43,6 +43,10 @@ from torch.utils.data import SequentialSampler
 from pytorch3d.implicitron.dataset.dataset_map_provider import DatasetMap
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 
+import pynvml
+import psutil
+import platform
+
 
 def set_seed(seed):
     torch.manual_seed(seed)
@@ -697,6 +701,10 @@ def train(
             image_rgb=image_rgb[:1].detach().cpu(),
             mask=mask[:1].detach().cpu())
 
+
+            log_utils(log_type="dynamic",  model=model,writer=writer, epoch=epoch)
+
+
         checkpoint = {
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
@@ -1265,6 +1273,125 @@ def get_loss(cfg: ProjectConfig):
 #                     global_step=epoch)
 
 
+def    log_utils(log_type="static",  model=None,writer=None, epoch=None):
+    assert log_type in ["static", "dynamic"], f"log_type {log_type} must be either 'static' or 'dynamic'"
+    assert writer is not None, "writer must be provided"
+
+    data = {}
+
+    if log_type == "static":
+        if model is None:
+            raise ValueError("model must be provided for static logging")
+
+        # model param_count
+        param_count = sum(p.numel() for p in model.parameters())/1e6
+        data["model/param_count_M"] = param_count
+
+        #log ,max ram,
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        meminfo = pynvml.nvmlDeviceGetMemoryInfo(handle)
+        data["gpu/GB_ram"] = meminfo.total/2**30
+        pynvml.nvmlShutdown()
+        #log GPU model, e.g., 3080, etc., qurying the GPU model
+        gpu_name = pynvml.nvmlDeviceGetName(handle)
+        data["gpu/model"] = str(gpu_name)
+        #CPU: model
+        # CPU: model
+        cpu_name = platform.processor()
+        data["cpu/processor"] = str(cpu_name) #x86_64
+        #cpu commcerical name
+        cpu_commercial_name = platform.processor()
+
+        #CPU: core count
+        cpu_core_count = psutil.cpu_count(logical=False)
+        data["cpu/core_count"] = cpu_core_count
+        #CPU: thread count
+        cpu_thread_count = psutil.cpu_count(logical=True)
+        data["cpu/thread_count"] = cpu_thread_count
+        #CPU: max ram
+        cpu_max_ram = psutil.virtual_memory().total/2**30
+        data["cpu/GB_ram"] = cpu_max_ram   
+        # print(data)
+        for key, value in data.items():
+            #if str, add_text, else add_scalar
+            if isinstance(value, str):
+                writer.add_text(key, value)
+            else:
+                writer.add_scalar(key, value)
+    elif log_type == "dynamic":
+        if epoch is None:
+            raise ValueError("epoch must be provided for dynamic logging")
+        # GPU utilization/temp/mem utilization,fan speed, power consumption 
+
+        
+        # CPU utilization/temp/mem utilization,fan speed, power consumption 
+
+        # disk/network/swap utilization,
+
+
+        # GPU utilization/temp/mem utilization, fan speed, power consumption
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+
+        gpu_util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+        data["gpu/utilization"] = gpu_util.gpu
+
+        gpu_temp = pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)
+        data["gpu/temperature"] = gpu_temp
+
+        gpu_mem_util = pynvml.nvmlDeviceGetMemoryInfo(handle)
+        data["gpu/mem_utilization_percent"] = gpu_mem_util.used / gpu_mem_util.total * 100
+        gpu_mem_util = pynvml.nvmlDeviceGetMemoryInfo(handle)
+        data["gpu/mem_utilization_GB"] = gpu_mem_util.used / 2**30
+        gpu_mem_util = pynvml.nvmlDeviceGetMemoryInfo(handle)
+        data["gpu/mem_utilization_total_GB"] =  gpu_mem_util.total /2**30
+
+        gpu_fan_speed = pynvml.nvmlDeviceGetFanSpeed(handle)
+        data["gpu/fan_speed"] = gpu_fan_speed
+
+        gpu_power = pynvml.nvmlDeviceGetPowerUsage(handle)
+        data["gpu/power_consumption"] = gpu_power / 1000  # Convert to watts
+
+        pynvml.nvmlShutdown()
+
+        # CPU utilization/temp/mem utilization, fan speed, power consumption
+        cpu_util = psutil.cpu_percent(interval=1)
+        data["cpu/utilization"] = cpu_util
+        # print(psutil.sensors_temperatures())
+
+        # {'nvme': [shwtemp(label='Composite', current=35.85, high=84.85, critical=84.85), shwtemp(label='Sensor 1', current=35.85, high=65261.85, critical=65261.85), shwtemp(label='Sensor 2', current=40.85, high=65261.85, critical=65261.85)], 'enp3s0': [shwtemp(label='MAC Temperature', current=51.124, high=None, critical=None)], 'k10temp': [shwtemp(label='Tctl', current=77.875, high=None, critical=None), shwtemp(label='Tdie', current=50.875, high=None, critical=None), shwtemp(label='Tccd1', current=68.75, high=None, critical=None), shwtemp(label='Tctl', current=76.75, high=None, critical=None), shwtemp(label='Tdie', current=49.75, high=None, critical=None)], 'iwlwifi_1': [shwtemp(label='', current=31.0, high=None, critical=None)]}
+        for key, value in psutil.sensors_temperatures().items():
+            # print(key,":")
+            for sensor in value:
+                # print(sensor.label, sensor.current, sensor.high, sensor.critical)
+                data[f"temperature/{key}/{sensor.label}"] = sensor.current
+
+        cpu_mem = psutil.virtual_memory()
+        data["mem/utilization_percent"] = cpu_mem.percent
+
+        # Disk utilization
+        disk_usage = psutil.disk_usage('/')
+        data["disk/utilization"] = disk_usage.percent
+
+        # Network utilization
+        net_io = psutil.net_io_counters()
+        data["network/bytes_sent_GB"] = net_io.bytes_sent/2**30
+        data["network/bytes_recv_GB"] = net_io.bytes_recv/2**30
+
+        # Swap utilization
+        swap = psutil.swap_memory()
+        data["swap/utilization"] = swap.percent
+
+        # print(data)
+        for key, value in data.items():
+            #if str, add_text, else add_scalar
+            if isinstance(value, str):
+                writer.add_text(key, value, epoch)
+            else:
+                writer.add_scalar(key, value, epoch)
+
+
 @hydra.main(config_path="config", config_name="config", version_base="1.1")
 def main(cfg: ProjectConfig):
     print(cfg)
@@ -1342,6 +1469,8 @@ def main(cfg: ProjectConfig):
 
     else:
         print("no checkpoint found")
+
+    log_utils(log_type="static",  model=model,writer=writer, epoch=None)
 
     criterion = get_loss(cfg)
     # Train the model
