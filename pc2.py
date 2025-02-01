@@ -292,6 +292,7 @@ def plot_image_mask(    gt,
     plt.savefig(fname)
     plt.close()
     print("saved image-mask", fname)
+    
 def plot_quadrants(
     point_list,
     color_list,
@@ -307,7 +308,7 @@ def plot_quadrants(
     assert cam_wires_trans.device == torch.device("cpu"), "camera should be on cpu"
     fig_size_baseline = 10
 
-    fig = plt.figure(figsize=(fig_size_baseline, fig_size_baseline))
+    fig = plt.figure(figsize=(fig_size_baseline*4/3, fig_size_baseline))
     ax = fig.add_subplot(221, projection="3d")
     for points, color, name in zip(point_list, color_list, name_list):
         assert (
@@ -316,16 +317,22 @@ def plot_quadrants(
         assert (
             points.shape[1] == 3
         ), f"{name} points should have shape (N, 3), not {points.shape}"
-        plot = ax.scatter(
-            points[:, 0],
-            points[:, 1],
-            points[:, 2],
-            c=color,
-            marker=",",
-            label=name,
-            s=point_size,
-            cmap=color_map_name,
-        )
+        params = { "zs": points[:, 2],"c": color, "marker": ",", "label": name, "s": point_size}
+        # if color is a string
+        if not isinstance(color, str): #color is a list
+            params["cmap"] = color_map_name
+        plot = ax.scatter(points[:, 0],points[:, 1],**params)
+
+        # plot = ax.scatter(
+        #     points[:, 0],
+        #     points[:, 1],
+        #     points[:, 2],
+        #     c=color,
+        #     marker=",",
+        #     label=name,
+        #     s=point_size,
+        #     cmap=color_map_name,
+        # )
         # if color is not string
         if not isinstance(color, str):
             cax = inset_axes(
@@ -355,15 +362,13 @@ def plot_quadrants(
     # next plot x-z, 2D
     ax = fig.add_subplot(222)
     for points, color, name in zip(point_list, color_list, name_list):
-        plot = ax.scatter(
-            points[:, 0],
-            points[:, 2],
-            c=color,
-            marker=",",
-            label=name,
-            s=point_size,
-            cmap=color_map_name,
-        )
+
+        params = {"x": points[:, 0], "y": points[:, 2],"c": color, "marker": ",", "label": name, "s": point_size}
+        # if color is a string
+        if not isinstance(color, str): #color is a list
+            params["cmap"] = color_map_name
+        plot = ax.scatter(**params)
+
 
         if not isinstance(color, str):
             cax = inset_axes(
@@ -386,15 +391,12 @@ def plot_quadrants(
     # next plot y-z, 2D
     ax = fig.add_subplot(223)
     for points, color, name in zip(point_list, color_list, name_list):
-        plot = ax.scatter(
-            points[:, 1],
-            points[:, 2],
-            c=color,
-            marker=",",
-            label=name,
-            s=point_size,
-            cmap=color_map_name,
-        )
+        
+        params = {"x": points[:, 1], "y": points[:, 2],"c": color, "marker": ",", "label": name, "s": point_size}
+        # if color is a string
+        if not isinstance(color, str): #color is a list
+            params["cmap"] = color_map_name
+        plot = ax.scatter(**params)
 
         if not isinstance(color, str):
             cax = inset_axes(
@@ -416,15 +418,13 @@ def plot_quadrants(
     # next plot x-y, 2D
     ax = fig.add_subplot(224)
     for points, color, name in zip(point_list, color_list, name_list):
-        plot = ax.scatter(
-            points[:, 0],
-            points[:, 1],
-            c=color,
-            marker=",",
-            label=name,
-            s=point_size,
-            cmap=color_map_name,
-        )
+
+        params = {"x": points[:, 0], "y": points[:, 1],"c": color, "marker": ",", "label": name, "s": point_size}
+        # if color is a string
+        if not isinstance(color, str): #color is a list
+            params["cmap"] = color_map_name
+        plot = ax.scatter(**params)
+
 
         if not isinstance(color, str):
             cax = inset_axes(
@@ -445,11 +445,10 @@ def plot_quadrants(
 
     # end all plots
 
-    plt.tight_layout()
+    # plt.tight_layout()
     plt.savefig(fname)
     plt.close()
     return x_equal_lim, y_equal_lim, z_equal_lim
-
 
 def plot_sample_condition(
     gt,
@@ -463,6 +462,7 @@ def plot_sample_condition(
     cam_wires_trans=None,
     image_rgb=None,
     mask=None,
+    cd=None
 ):
     assert gt.shape[0] == 1, "gt should have shape (1, N, 3)"
     if cam_wires_trans is not None:
@@ -472,7 +472,12 @@ def plot_sample_condition(
     assert gt.device == torch.device("cpu"), "gt should be on cpu"
     assert xts.device == torch.device("cpu"), "xts should be on cpu"
 
-    plt_title = f"epoch {epoch}: {cfg.run.name}"
+    plt_title = f"{epoch}: {cfg.run.name}: "
+    
+    #add these parameters to the title, use a verybrief names
+    plt_title += f"\nsd{cfg.run.seed} infer_step{cfg.run.num_inference_steps} im_sz{cfg.dataset.image_size} schedule{cfg.model.beta_schedule} dim{cfg.model.point_cloud_model_embed_dim}\nn{cfg.dataset.max_points} lr{cfg.optimizer.lr} loss{cfg.loss.loss_type} opt{cfg.optimizer.name}"
+    if cd is not None:
+        plt_title += f" -- CD{cd:.2f}"
 
     # plot_multi_gt(gts,  args, input_pc_file_list, fname=None)
     if fname is None:
@@ -550,8 +555,9 @@ def train(
     assert pcpm is not None, "pcpm must be provided"
     model.train()
     tqdm_range = trange(start_epoch, cfg.run.max_steps, desc="Epoch")
+    #add run name and host name to checkpoint
     checkpoint_fname = (
-        f"checkpoint_pc2/cp_dm_{datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}.pth"
+        f"checkpoint_pc2/cp_dm_{datetime.now().strftime(f'%Y-%m-%d-%H-%M-%S')}-{cfg.run.name.replace('/', '_') }_{os.uname().nodename}.pth"
     )
     # mkdir if not exist
     if not os.path.exists(os.path.dirname(checkpoint_fname)):
@@ -582,6 +588,9 @@ def train(
         pc_condition = pcpm.point_cloud_to_tensor(
             pc[:1], normalize=True, scale=True
         )
+        cd_loss, _ = chamfer_distance(sampled_point, pc_condition)
+
+        writer.add_scalar("CD_condition/epoch", cd_loss.item(), epoch)
         plot_sample_condition(
             pc_condition.cpu(),
             xts.cpu(),
@@ -593,7 +602,8 @@ def train(
             0.1,
             cam_wires_trans=get_camera_wires_trans(camera[0]).detach().cpu(),
             image_rgb=image_rgb[:1].detach().cpu(),
-            mask=mask[:1].detach().cpu(),
+            mask=mask[:1].detach().cpu(),cd=cd_loss.item()
+
         )
 
         plot_image_mask(
@@ -603,10 +613,8 @@ def train(
             0.1,cam_wires_trans=get_camera_wires_trans(camera[0]).detach().cpu(),
             image_rgb=image_rgb[:1].detach().cpu(),
             mask=mask[:1].detach().cpu())
-        cd_loss, _ = chamfer_distance(sampled_point, pc_condition)
-
-        writer.add_scalar("CD_condition/epoch", cd_loss.item(), epoch)
     else:
+        print("start from epoch", start_epoch, "to", cfg.run.max_steps)
         for epoch in tqdm_range:
             batch_losses = train_one_epoch(
                 dataloader, model, optimizer, scheduler, cfg, criterion, device, pcpm
@@ -666,6 +674,9 @@ def train(
                     print("saved at", f"outputs/{temp_fname}")
                     exit()
 
+                cd_loss, _ = chamfer_distance(sampled_point, pc_condition)
+
+                writer.add_scalar("CD_condition/epoch", cd_loss.item(), epoch)
                 plot_sample_condition(
                     pc_condition.cpu(),
                     xts.cpu(),
@@ -677,7 +688,7 @@ def train(
                     0.1,
                     cam_wires_trans=get_camera_wires_trans(camera[0]).detach().cpu(),
                     image_rgb=image_rgb[:1].detach().cpu(),
-                    mask=mask[:1].detach().cpu(),
+                    mask=mask[:1].detach().cpu(),cd=cd_loss.item()
                 )
                 plot_image_mask(            pc_condition.cpu(),
             cfg,
@@ -685,9 +696,6 @@ def train(
             0.1,cam_wires_trans=get_camera_wires_trans(camera[0]).detach().cpu(),
             image_rgb=image_rgb[:1].detach().cpu(),
             mask=mask[:1].detach().cpu())
-                cd_loss, _ = chamfer_distance(sampled_point, pc_condition)
-
-                writer.add_scalar("CD_condition/epoch", cd_loss.item(), epoch)
 
         checkpoint = {
             "model": model.state_dict(),
@@ -1374,7 +1382,7 @@ def main(cfg: ProjectConfig):
     mask = batch.fg_probability
 
     samples = {}
-    for i in [1, 5, 10, 50, 100]:
+    for i in [1, 5, 10, 50, 100,scheduler.config.num_train_timesteps]:
         samples[f"step{i}"] = sample(
             model,
             scheduler,
@@ -1445,20 +1453,20 @@ def main(cfg: ProjectConfig):
     print("done evo plots")
 
     hparam_dict = {
-        "seed": cfg.run.seed,
+        "seed": cfg.run.seed,#
         "epochs": cfg.run.max_steps,
-        "num_inference_steps": cfg.run.num_inference_steps,
-        "image_size": cfg.dataset.image_size,
-        "beta_schedule": cfg.model.beta_schedule,
-        "point_cloud_model_embed_dim": cfg.model.point_cloud_model_embed_dim,
+        "num_inference_steps": cfg.run.num_inference_steps,#
+        "image_size": cfg.dataset.image_size,#
+        "beta_schedule": cfg.model.beta_schedule,#
+        "point_cloud_model_embed_dim": cfg.model.point_cloud_model_embed_dim,#
         "dataset_cat": cfg.dataset.category,
         "dataset_source": cfg.dataset.type,
-        "max_points": cfg.dataset.max_points,
-        "lr": cfg.optimizer.lr,
+        "max_points": cfg.dataset.max_points,#
+        "lr": cfg.optimizer.lr,#
         "batch_size": cfg.dataloader.batch_size,
         "num_scenes": cfg.dataloader.num_scenes,
-        "loss_type": cfg.loss.loss_type,
-        "optimizer": cfg.optimizer.name,
+        "loss_type": cfg.loss.loss_type,#
+        "optimizer": cfg.optimizer.name,#
         "optimizer_decay": cfg.optimizer.weight_decay,
         "optimizer_beta_0": cfg.optimizer.kwargs.betas[0],
         "optimizer_beta_1": cfg.optimizer.kwargs.betas[1],
