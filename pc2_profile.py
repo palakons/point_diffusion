@@ -99,7 +99,7 @@ def train_one_epoch(
     cfg: ProjectConfig,
     criterion,
     device,
-    pcpm: PointCloudProjectionModel
+    pcpm: PointCloudProjectionModel,prof
 ):
     assert pcpm is not None, "pcpm must be provided"
     model.train()
@@ -638,10 +638,11 @@ def train(
                 record_shapes=True,
                 profile_memory=True,
                 with_stack=True,
-                on_trace_ready=torch.profiler.tensorboard_trace_handler(PROF_LOGDIR)
+                on_trace_ready=torch.profiler.tensorboard_trace_handler(writer.log_dir),
+                #
             ) as prof:
                 batch_losses = train_one_epoch(
-                    dataloader, model, optimizer, scheduler, cfg, criterion, device, pcpm
+                    dataloader, model, optimizer, scheduler, cfg, criterion, device, pcpm,prof
                 )
                 losses = sum(batch_losses) / len(batch_losses)
                 tqdm_range.set_description(f"loss: {losses:.4f}")
@@ -1508,16 +1509,24 @@ def main(cfg: ProjectConfig):
         pcpm=pcpm,
     )
 
-    losses = train_one_epoch(
-        dataloader_train,
-        model,
-        optimizer,
-        scheduler,
-        cfg,
-        criterion=criterion,
-        device=device,
-        pcpm=pcpm,
-    )
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=True,
+        on_trace_ready=torch.profiler.tensorboard_trace_handler(writer.log_dir),
+        #
+    ) as prof:
+        losses = train_one_epoch(
+            dataloader_train,
+            model,
+            optimizer,
+            scheduler,
+            cfg,
+            criterion=criterion,
+            device=device,
+            pcpm=pcpm,prof=prof
+        )
     metric_dict = {"Loss": sum(losses) / len(losses)}
     writer.add_scalar("Loss/epoch", sum(losses) / len(losses), cfg.run.max_steps)
 
