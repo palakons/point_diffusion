@@ -17,7 +17,7 @@ from pytorch3d.implicitron.dataset.json_index_dataset_map_provider_v2 import (
     registry,
 )
 from pytorch3d.implicitron.tools.config import expand_args_fields
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from config.structured import CO3DConfig, DataloaderConfig, ProjectConfig
 
 from dataset.exclude_sequence import EXCLUDE_SEQUENCE, LOW_QUALITY_SEQUENCE
@@ -46,6 +46,9 @@ from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 import pynvml
 import psutil
 import platform
+
+
+import pickle,json
 
 
 def set_seed(seed):
@@ -670,7 +673,6 @@ def train(
                 # dev camera[0] cuda:0
 
                 if False: # save parameters to pkl
-                    import pickle
                     temp_fname = cfg.run.name.replace("/", "_")+f"_tes_plots.pkl"
                     data = {"pc_condition": pc_condition, "xts": xts, "x0s": x0s, "steps": steps, "cfg": cfg, "epoch": epoch,"camera": camera, "image_rgb": image_rgb, "mask": mask}
                     with open(f"outputs/{temp_fname}", "wb") as f:
@@ -1287,368 +1289,97 @@ def get_checkpoint_fname(cfg: ProjectConfig, CHECKPOINT_DIR):
     return current_cp_fname
 
 
-def get_loss(cfg: ProjectConfig):
-    if cfg.loss.loss_type == "mse":
-        return nn.MSELoss(reduction="mean")
-    elif cfg.loss.loss_type == "chamfer":
-        return PointCloudLoss(npoints=cfg.dataset.max_points, emd_weight=0)
-    elif cfg.loss.loss_type == "emd":
-        return PointCloudLoss(npoints=cfg.dataset.max_points, emd_weight=1)
-    else:
-        raise ValueError("loss not supported")
+def to_dict(cfg):
+    return OmegaConf.to_container(cfg, resolve=True)
 
+def scrape_checkpoints(db_fname, CHECKPOINT_DIR):
+    #use json to store checkpoints
+    files = glob.glob(f"{CHECKPOINT_DIR}/cp_dm_*.pth")
+    db_fname = f"{CHECKPOINT_DIR}/{db_fname}"
+    for fname in tqdm(files):
+        with open(db_fname, "a") as f:
+            try:
+                checkpoint = torch.load(fname)
+                data = {"fname":fname,"args":  to_dict(checkpoint['args'])}
+                #dict to json text
+                json.dump(data, f)
+                f.write("\n")
+                print("saved", fname)
+            except:
+                print("error", fname)
+                continue
 
-# def log_sample_to_tb(x, gt_pc, key, evo, epoch, writer):
-#     sampled_tensor = torch.tensor(x, dtype=torch.float)
-#     gt_pc_tensor = torch.tensor(gt_pc, dtype=torch.float)
+def match_args_json(cfg1, cfg2):
 
-#     all_tensor = torch.cat([sampled_tensor, gt_pc_tensor], dim=0)
+    return (
+        cfg1['run']['seed'] == cfg2['run']['seed']
+        and cfg1['run']['num_inference_steps'] == cfg2['run']['num_inference_steps']
+        and cfg1['dataset']['image_size'] == cfg2['dataset']['image_size']
+        and cfg1['model']['beta_schedule'] == cfg2['model']['beta_schedule']
+        and cfg1['model']['point_cloud_model_embed_dim']
+        == cfg2['model']['point_cloud_model_embed_dim']
+        and cfg1['dataset']['category'] == cfg2['dataset']['category']
+        and cfg1['dataset']['type'] == cfg2['dataset']['type']
+        and cfg1['dataset']['max_points'] == cfg2['dataset']['max_points']
+        and cfg1['optimizer']['lr'] == cfg2['optimizer']['lr']
+        and cfg1['dataloader']['batch_size'] == cfg2['dataloader']['batch_size']
+        and cfg1['dataloader']['num_scenes'] == cfg2['dataloader']['num_scenes']
+        and cfg1['loss']['loss_type'] == cfg2['loss']['loss_type']
+        and cfg1['optimizer']['name'] == cfg2['optimizer']['name']
+        and cfg1['optimizer']['weight_decay'] == cfg2['optimizer']['weight_decay']
+        and cfg1['optimizer']['kwargs']['betas'][0] == cfg2['optimizer']['kwargs']['betas'][0]
+        and cfg1['optimizer']['kwargs']['betas'][1] == cfg2['optimizer']['kwargs']['betas'][1]
+        # and cfg1.run.num_inference_steps == cfg2.run.num_inference_steps
+        # and cfg1.dataset.image_size == cfg2.dataset.image_size
+        # and cfg1.model.beta_schedule == cfg2.model.beta_schedule
+        # and cfg1.model.point_cloud_model_embed_dim
+        # == cfg2.model.point_cloud_model_embed_dim
+        # and cfg1.dataset.category == cfg2.dataset.category
+        # and cfg1.dataset.type == cfg2.dataset.type
+        # and cfg1.dataset.max_points == cfg2.dataset.max_points
+        # and cfg1.optimizer.lr == cfg2.optimizer.lr
+        # and cfg1.dataloader.batch_size == cfg2.dataloader.batch_size
+        # and cfg1.dataloader.num_scenes == cfg2.dataloader.num_scenes
+        # and cfg1.loss.loss_type == cfg2.loss.loss_type
+        # and cfg1.optimizer.name == cfg2.optimizer.name
+        # and cfg1.optimizer.weight_decay == cfg2.optimizer.weight_decay
+        # and cfg1.optimizer.kwargs.betas[0] == cfg2.optimizer.kwargs.betas[0]
+        # and cfg1.optimizer.kwargs.betas[1] == cfg2.optimizer.kwargs.betas[1]
+    )
 
-#     color_sampled = torch.tensor(
-#         [[255, 0, 0] for _ in range(sampled_tensor.shape[0])])  # color: red
-#     color_gt = torch.tensor(
-#         [[0, 255, 0] for _ in range(gt_pc_tensor.shape[0])])  # color: green
+def get_checkpoint_fname_json(cfg: ProjectConfig, db_fname,CHECKPOINT_DIR):
+    # check checkpoint
+    db_fname = f"{CHECKPOINT_DIR}/{db_fname}"
+    current_cp_fname = None
+    max_epoch = 0
 
-#     all_color = torch.cat([color_sampled, color_gt], dim=0)
-#     # print("shape", all_tensor.shape, all_color.shape)
-#     # add dimension to tensor to dim 0
-#     all_tensor = all_tensor.unsqueeze(0)
-#     all_color = all_color.unsqueeze(0)
-#     writer.add_mesh(f"PointCloud_{key}_{evo}", vertices=all_tensor, colors=all_color,
-#                     global_step=epoch)
+    #load file line by line
 
+    with open(db_fname, "r") as f:
+        for line in tqdm(f):
+            dat = json.loads(line)
+            if match_args_json(dat["args"],  to_dict(cfg)):
+                if (
+                    dat["args"]['run']['max_steps'] <= cfg.run.max_steps
+                    and dat["args"]['run']['max_steps'] > max_epoch
+                ):
+                    max_epoch = dat["args"]['run']['max_steps']
+                    current_cp_fname = dat["fname"]
+                    print("this is ok",current_cp_fname)
+                    # print("current_cp", current_cp_fname)
+                else:
+                    print("epoch in config",dat["args"]['run']['max_steps'] ," is less than max epoch in checkpoint", cfg.run.max_steps,"or max epoch in checkpoint is less than max epoch in checkpoint",  max_epoch)
 
-def    log_utils(log_type="static",  model=None,writer=None, epoch=None):
-    assert log_type in ["static", "dynamic"], f"log_type {log_type} must be either 'static' or 'dynamic'"
-    assert writer is not None, "writer must be provided"
-
-    data = {}
-
-    if log_type == "static":
-        if model is None:
-            raise ValueError("model must be provided for static logging")
-
-        # model param_count
-        param_count = sum(p.numel() for p in model.parameters())/1e6
-        data["model/param_count_M"] = param_count
-
-        #log ,max ram,
-        pynvml.nvmlInit()
-        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-        meminfo = pynvml.nvmlDeviceGetMemoryInfo(handle)
-        data["gpu/GB_ram"] = meminfo.total/2**30
-        pynvml.nvmlShutdown()
-        #log GPU model, e.g., 3080, etc., qurying the GPU model
-        gpu_name = pynvml.nvmlDeviceGetName(handle)
-        data["gpu/model"] = str(gpu_name)
-        #CPU: model
-        # CPU: model
-        cpu_name = platform.processor()
-        data["cpu/processor"] = str(cpu_name) #x86_64
-        #cpu commcerical name
-        cpu_commercial_name = platform.processor()
-
-        #CPU: core count
-        cpu_core_count = psutil.cpu_count(logical=False)
-        data["cpu/core_count"] = cpu_core_count
-        #CPU: thread count
-        cpu_thread_count = psutil.cpu_count(logical=True)
-        data["cpu/thread_count"] = cpu_thread_count
-        #CPU: max ram
-        cpu_max_ram = psutil.virtual_memory().total/2**30
-        data["cpu/GB_ram"] = cpu_max_ram   
-        # print(data)
-        for key, value in data.items():
-            #if str, add_text, else add_scalar
-            if isinstance(value, str):
-                writer.add_text(key, value)
-            else:
-                writer.add_scalar(key, value)
-    elif log_type == "dynamic":
-        if epoch is None:
-            raise ValueError("epoch must be provided for dynamic logging")
-        # GPU utilization/temp/mem utilization,fan speed, power consumption 
-
-        
-        # CPU utilization/temp/mem utilization,fan speed, power consumption 
-
-        # disk/network/swap utilization,
-
-
-        # GPU utilization/temp/mem utilization, fan speed, power consumption
-        pynvml.nvmlInit()
-        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-
-        gpu_util = pynvml.nvmlDeviceGetUtilizationRates(handle)
-        data["gpu/utilization"] = gpu_util.gpu
-
-        gpu_temp = pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)
-        data["gpu/temperature"] = gpu_temp
-
-        gpu_mem_util = pynvml.nvmlDeviceGetMemoryInfo(handle)
-        data["gpu/mem_utilization_percent"] = gpu_mem_util.used / gpu_mem_util.total * 100
-        gpu_mem_util = pynvml.nvmlDeviceGetMemoryInfo(handle)
-        data["gpu/mem_utilization_GB"] = gpu_mem_util.used / 2**30
-        gpu_mem_util = pynvml.nvmlDeviceGetMemoryInfo(handle)
-        data["gpu/mem_utilization_total_GB"] =  gpu_mem_util.total /2**30
-
-        gpu_fan_speed = pynvml.nvmlDeviceGetFanSpeed(handle)
-        data["gpu/fan_speed"] = gpu_fan_speed
-
-        gpu_power = pynvml.nvmlDeviceGetPowerUsage(handle)
-        data["gpu/power_consumption"] = gpu_power / 1000  # Convert to watts
-
-        pynvml.nvmlShutdown()
-
-        # CPU utilization/temp/mem utilization, fan speed, power consumption
-        cpu_util = psutil.cpu_percent(interval=1)
-        data["cpu/utilization"] = cpu_util
-        # print(psutil.sensors_temperatures())
-
-        # {'nvme': [shwtemp(label='Composite', current=35.85, high=84.85, critical=84.85), shwtemp(label='Sensor 1', current=35.85, high=65261.85, critical=65261.85), shwtemp(label='Sensor 2', current=40.85, high=65261.85, critical=65261.85)], 'enp3s0': [shwtemp(label='MAC Temperature', current=51.124, high=None, critical=None)], 'k10temp': [shwtemp(label='Tctl', current=77.875, high=None, critical=None), shwtemp(label='Tdie', current=50.875, high=None, critical=None), shwtemp(label='Tccd1', current=68.75, high=None, critical=None), shwtemp(label='Tctl', current=76.75, high=None, critical=None), shwtemp(label='Tdie', current=49.75, high=None, critical=None)], 'iwlwifi_1': [shwtemp(label='', current=31.0, high=None, critical=None)]}
-        for key, value in psutil.sensors_temperatures().items():
-            # print(key,":")
-            for sensor in value:
-                # print(sensor.label, sensor.current, sensor.high, sensor.critical)
-                data[f"temperature/{key}/{sensor.label}"] = sensor.current
-
-        cpu_mem = psutil.virtual_memory()
-        data["mem/utilization_percent"] = cpu_mem.percent
-
-        # Disk utilization
-        disk_usage = psutil.disk_usage('/')
-        data["disk/utilization"] = disk_usage.percent
-
-        # Network utilization
-        net_io = psutil.net_io_counters()
-        data["network/bytes_sent_GB"] = net_io.bytes_sent/2**30
-        data["network/bytes_recv_GB"] = net_io.bytes_recv/2**30
-
-        # Swap utilization
-        swap = psutil.swap_memory()
-        data["swap/utilization"] = swap.percent
-
-        # print(data)
-        for key, value in data.items():
-            #if str, add_text, else add_scalar
-            if isinstance(value, str):
-                writer.add_text(key, value, epoch)
-            else:
-                writer.add_scalar(key, value, epoch)
-
+    return current_cp_fname
 
 @hydra.main(config_path="config", config_name="config", version_base="1.1")
 def main(cfg: ProjectConfig):
     print(cfg)
 
-    set_seed(cfg.run.seed)
-    tb_log_dir = "tb_log"
-    log_dir = tb_log_dir + f"/{cfg.run.name}"
-    writer = SummaryWriter(log_dir=log_dir)
-    print("tensorboard log at", log_dir)
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print("device", device)
-
-    pcpm = PointCloudProjectionModel(
-        image_size=cfg.model.image_size,
-        image_feature_model=cfg.model.image_feature_model,
-        use_local_colors=cfg.model.use_local_colors,
-        use_local_features=cfg.model.use_local_features,
-        use_global_features=cfg.model.use_global_features,
-        use_mask=cfg.model.use_mask,
-        use_distance_transform=cfg.model.use_distance_transform,
-        predict_shape=cfg.model.predict_shape,
-        predict_color=cfg.model.predict_color,
-        color_channels=cfg.model.color_channels,
-        colors_mean=cfg.model.colors_mean,
-        colors_std=cfg.model.colors_std,
-        scale_factor=cfg.model.scale_factor,
-    ).to(device)
-
-    dataloader_train, _, _ = get_pc2dataset(cfg)
-
-    model = get_model(cfg, device=device, pcpm=pcpm)
-
-    if cfg.optimizer.name == "Adam":
-        optimizer = torch.optim.Adam(
-            model.parameters(),
-            lr=cfg.optimizer.lr,
-            weight_decay=cfg.optimizer.weight_decay,
-            betas=cfg.optimizer.kwargs.betas,
-        )
-    elif cfg.optimizer.name == "AdamW":
-        optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=cfg.optimizer.lr,
-            weight_decay=cfg.optimizer.weight_decay,
-            betas=cfg.optimizer.kwargs.betas,
-        )
-    else:
-        raise ValueError(
-            f"optimizer {cfg.optimizer.name} not supported, pick Adam or AdamW"
-        )
-    # linear, scaled_linear, or squaredcos_cap_v2.
-    assert cfg.run.diffusion_scheduler == "ddpm", "only ddpm supported"
-    scheduler = DDPMScheduler(
-        num_train_timesteps=cfg.run.num_inference_steps,
-        beta_schedule=cfg.model.beta_schedule,
-        prediction_type="epsilon",  # or "sample" or "v_prediction"
-        clip_sample=False,
-        beta_start=cfg.model.beta_start,
-        beta_end=cfg.model.beta_end,
-    )
-    start_epoch = 0
-
-    current_cp_fname = None
-    if cfg.checkpoint.resume_training:
-        current_cp_fname = get_checkpoint_fname(cfg, "checkpoint_pc2")
+    scrape_checkpoints("checkpoint_db.json", "checkpoint_pc2")
     
-    if current_cp_fname is not None:
-        current_cp = torch.load(current_cp_fname)
-        print("loading checkpoint", current_cp_fname)
-        model.load_state_dict(current_cp["model"])
-        optimizer.load_state_dict(current_cp["optimizer"])
-        start_epoch = current_cp["args"].run.max_steps
-        print("start_epoch", start_epoch)
-
-    else:
-        print("no checkpoint found")
-
-    log_utils(log_type="static",  model=model,writer=writer, epoch=None)
-
-    criterion = get_loss(cfg)
-    # Train the model
-    train(
-        model,
-        # dataloader,
-        dataloader_train,
-        optimizer,
-        scheduler,
-        cfg,
-        device=device,
-        start_epoch=start_epoch,
-        criterion=criterion,
-        writer=writer,
-        pcpm=pcpm,
-    )
-
-    losses = train_one_epoch(
-        dataloader_train,
-        model,
-        optimizer,
-        scheduler,
-        cfg,
-        criterion=criterion,
-        device=device,
-        pcpm=pcpm,
-    )
-    metric_dict = {"Loss": sum(losses) / len(losses)}
-    writer.add_scalar("Loss/epoch", sum(losses) / len(losses), cfg.run.max_steps)
-
-    # Sample from the model
-
-    batch = next(iter(dataloader_train))
-    batch = batch.to(device)
-    pc = batch.sequence_point_cloud
-    camera = batch.camera
-    image_rgb = batch.image_rgb
-    mask = batch.fg_probability
-
-    samples = {}
-    for i in [1, 5, 10, 50, 100,scheduler.config.num_train_timesteps]:
-        samples[f"step{i}"] = sample(
-            model,
-            scheduler,
-            cfg,
-            camera=camera[0],
-            image_rgb=image_rgb[:1],
-            mask=mask[:1],
-            num_inference_steps=i,
-            device=device,
-            pcpm=pcpm,
-        )
-
-    if True:  # Evo plots
-        # make the plot that will be logged to tb
-        gt_cond_pc = pcpm.point_cloud_to_tensor(pc[:1], normalize=True, scale=True)
-        # print("samples_updated", samples_updated.shape)
-        # print("gt_cond_pc", gt_cond_pc.shape)
-        # samples_updated torch.Size([1, 128, 3])
-        # gt_cond_pc torch.Size([2, 128, 3])
-
-        plt.figure(figsize=(10, 10))
-
-        for key, value in samples.items():
-            samples_updated = samples[key][0]
-            cd_loss, _ = chamfer_distance(
-                gt_cond_pc.to(device),
-                samples_updated.to(device),
-            )
-
-            print(
-                key,
-                "\t",
-                f"CD: {cd_loss:.2f}",
-            )
-            writer.add_scalar(f"CD_{key}", cd_loss, cfg.run.max_steps)
-
-            # add cd to metric_dict
-            metric_dict = {**{f"CD_{key}": cd_loss}, **metric_dict}
-
-            error = []
-            assert len(samples[key][1]) > 1, "need more than 1 sample to plot"
-            for x in samples[key][1]:
-                cd_loss, _ = chamfer_distance(
-                    gt_cond_pc.to(device),
-                    x.unsqueeze(0).to(device),
-                )
-                error.append(cd_loss.item())
-            # ax = plt.plot(error, label=key)
-            plt.plot(
-                [i / (len(error) - 1) for i in range(len(error))],
-                error,
-                label=key,
-                marker=None,
-            )
-            # print()
-        plt.legend()
-        plt.title(
-            f"Diffusion model: {cfg.run.max_steps } epochs, {cfg.run.num_inference_steps } timesteps, {cfg.model.beta_schedule } schedule",
-        )
-        plt.xlabel("Evolution steps ratio")
-        plt.ylabel("Chamfer distance")
-        # ylog
-        plt.yscale("log")
-
-        writer.add_figure(f"Evolution", plt.gcf(), cfg.run.max_steps)
-        plt.close()
-
-    print("done evo plots")
-
-    hparam_dict = {
-        "seed": cfg.run.seed,#
-        "epochs": cfg.run.max_steps,
-        "num_inference_steps": cfg.run.num_inference_steps,#
-        "image_size": cfg.dataset.image_size,#
-        "beta_schedule": cfg.model.beta_schedule,#
-        "point_cloud_model_embed_dim": cfg.model.point_cloud_model_embed_dim,#
-        "dataset_cat": cfg.dataset.category,
-        "dataset_source": cfg.dataset.type,
-        "max_points": cfg.dataset.max_points,#
-        "lr": cfg.optimizer.lr,#
-        "batch_size": cfg.dataloader.batch_size,
-        "num_scenes": cfg.dataloader.num_scenes,
-        "loss_type": cfg.loss.loss_type,#
-        "optimizer": cfg.optimizer.name,#
-        "optimizer_decay": cfg.optimizer.weight_decay,
-        "optimizer_beta_0": cfg.optimizer.kwargs.betas[0],
-        "optimizer_beta_1": cfg.optimizer.kwargs.betas[1],
-    }
-
-
-    writer.add_hparams(hparam_dict, metric_dict)
-    writer.close()
+    # fname = get_checkpoint_fname_json(cfg, "checkpoints.json", "checkpoint_pc2")
+    # print("checkpoint", fname)
 
 
 if __name__ == "__main__":
