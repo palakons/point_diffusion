@@ -611,7 +611,7 @@ def train(
         )
         cd_loss, _ = chamfer_distance(sampled_point, pc_condition)
 
-        writer.add_scalar("CD_condition/epoch", cd_loss.item(), epoch)
+        writer.add_scalar("CD50_condition/epoch", cd_loss.item(), epoch)
         plot_sample_condition(
             pc_condition.cpu(),
             xts.cpu(),
