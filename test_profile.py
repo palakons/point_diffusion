@@ -1,3 +1,17 @@
+import torch
+import torchvision.models as models
+from torch.profiler import profile, record_function, ProfilerActivity
+
+# model = models.resnet18()
+# inputs = torch.randn(5, 3, 224, 224)
+
+# #log at logs/test-profile directory
+# with profile(activities=[ProfilerActivity.CPU], 
+#         on_trace_ready=torch.profiler.tensorboard_trace_handler('./logs/test-profile')) as prof:
+#     model(inputs)
+
+# print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=10))
+
 from math import ceil, sqrt
 import pandas as pd
 import argparse
@@ -17,7 +31,7 @@ from pytorch3d.implicitron.dataset.json_index_dataset_map_provider_v2 import (
     registry,
 )
 from pytorch3d.implicitron.tools.config import expand_args_fields
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig
 from config.structured import CO3DConfig, DataloaderConfig, ProjectConfig
 
 from dataset.exclude_sequence import EXCLUDE_SEQUENCE, LOW_QUALITY_SEQUENCE
@@ -46,7 +60,9 @@ from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 import pynvml
 import psutil
 import platform
-import json
+from torch.profiler import profile, record_function, ProfilerActivity,schedule
+from torch.cuda.amp import GradScaler, autocast
+
 
 
 def set_seed(seed):
@@ -98,69 +114,203 @@ def train_one_epoch(
     cfg: ProjectConfig,
     criterion,
     device,
-    pcpm: PointCloudProjectionModel,
+    pcpm: PointCloudProjectionModel,log_dir
 ):
     assert pcpm is not None, "pcpm must be provided"
     model.train()
 
     batch_losses = []
-    for batch in dataloader:
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    
+    scaler =GradScaler()
+    schedule_conf = schedule(
+        wait=0,     # skip the first 2 steps
+        warmup=0,   # then warm up for 2 steps
+        active=5,   # then record for 5 steps
+        repeat=1    # then stop profiling
+    )
 
-        batch = batch.to(device)
-        pc = batch.sequence_point_cloud
-        camera = batch.camera
-        image_rgb = batch.image_rgb
-        mask = batch.fg_probability
-        x_0 = pcpm.point_cloud_to_tensor(pc, normalize=True, scale=True)
+    with profile(
+        schedule=schedule_conf,
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=True,
+        on_trace_ready=torch.profiler.tensorboard_trace_handler(log_dir),
+        #
+    ) as prof:
+        for batch in dataloader:
 
-        B, N, D = x_0.shape
-        noise = torch.randn_like(x_0)
-        timesteps = torch.randint(
-            0,
-            scheduler.config.num_train_timesteps,
-            (B,),
-            device=device,
-            dtype=torch.long,
-        )
-        # print("timesteps", timesteps.device)
-        # print("noise", noise.device)
-        # print("x_0 device", x_0.device)
-        # print("camera device", camera.device)
-        # print("image_rgb device", image_rgb.device)
-        # print("mask device", mask.device)
+            with record_function("data_to_device"):
+                batch = batch.to(device)
 
-        x_t = scheduler.add_noise(x_0, noise, timesteps)  # noisy_x
-        x_t_input = pcpm.get_input_with_conditioning(
-            x_t, camera=camera, image_rgb=image_rgb, mask=mask, t=timesteps
-        )
-        # print("x_t_input", x_t_input.device)
-        # print("x_t", x_t.device)
+            with autocast( dtype=torch.bfloat16):
+                with record_function("forward_pass"):
+                    pc = batch.sequence_point_cloud
+                    camera = batch.camera
+                    image_rgb = batch.image_rgb
+                    mask = batch.fg_probability
+                    x_0 = pcpm.point_cloud_to_tensor(pc, normalize=True, scale=True)
 
-        optimizer.zero_grad()
-        noise_pred = model(x_t_input, timesteps)
+                    B, N, D = x_0.shape
+                    noise = torch.randn_like(x_0)
+                    timesteps = torch.randint(
+                        0,
+                        scheduler.config.num_train_timesteps,
+                        (B,),
+                        device=device,
+                        dtype=torch.long,
+                    )
+                    # print("timesteps", timesteps.device)
+                    # print("noise", noise.device)
+                    # print("x_0 device", x_0.device)
+                    # print("camera device", camera.device)
+                    # print("image_rgb device", image_rgb.device)
+                    # print("mask device", mask.device)
 
-        if not noise_pred.shape == noise.shape:
-            raise ValueError(f"{noise_pred.shape} and {noise.shape} not equal")
+                    x_t = scheduler.add_noise(x_0, noise, timesteps)  # noisy_x
+                    x_t_input = pcpm.get_input_with_conditioning(
+                        x_t, camera=camera, image_rgb=image_rgb, mask=mask, t=timesteps
+                    )
+                    # print("x_t_input", x_t_input.device)
+                    # print("x_t", x_t.device)
 
-        loss = criterion(noise_pred, noise)
-        loss.backward()
-        optimizer.step()
-        batch_losses.append(loss.item())  # float
-        # print("noise_pred", noise_pred.device)
-        # print("noise", noise.device)
-        # print("loss", loss.device)
+                    noise_pred = model(x_t_input, timesteps)
 
-        # timesteps cuda:0
-        # noise cuda:0
-        # x_0 device cuda:0
-        # camera device cuda:0
-        # image_rgb device cuda:0
-        # mask device cuda:0
-        # x_t_input cuda:0
-        # x_t cuda:0
-        # noise_pred cuda:0
-        # noise cuda:0
-        # loss cuda:0
+                    if not noise_pred.shape == noise.shape:
+                        raise ValueError(f"{noise_pred.shape} and {noise.shape} not equal")
+
+                    loss = criterion(noise_pred, noise)
+
+            with record_function("backward_pass"):
+                optimizer.zero_grad()
+                # loss.backward()
+                scaler.scale(loss).backward()
+                # optimizer.step()
+                scaler.step(optimizer)
+                scaler.update()
+            batch_losses.append(loss.item())  # float
+            # print("noise_pred", noise_pred.device)
+            # print("noise", noise.device)
+            # print("loss", loss.device)
+
+            # timesteps cuda:0
+            # noise cuda:0
+            # x_0 device cuda:0
+            # camera device cuda:0
+            # image_rgb device cuda:0
+            # mask device cuda:0
+            # x_t_input cuda:0
+            # x_t cuda:0
+            # noise_pred cuda:0
+            # noise cuda:0
+            # loss cuda:0
+            
+            prof.step()
+
+
+
+    return batch_losses
+
+
+# Training function
+def train_one_epoch_noamp(
+    dataloader,
+    model,
+    optimizer,
+    scheduler,
+    cfg: ProjectConfig,
+    criterion,
+    device,
+    pcpm: PointCloudProjectionModel,log_dir
+):
+    assert pcpm is not None, "pcpm must be provided"
+    model.train()
+
+    batch_losses = []
+    schedule_conf = schedule(
+        wait=0,     # skip the first 2 steps
+        warmup=0,   # then warm up for 2 steps
+        active=5,   # then record for 5 steps
+        repeat=1    # then stop profiling
+    )
+
+    with profile(
+        schedule=schedule_conf,
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=True,
+        on_trace_ready=torch.profiler.tensorboard_trace_handler(log_dir),
+        #
+    ) as prof:
+        for batch in dataloader:
+
+            with record_function("data_to_device"):
+                batch = batch.to(device)
+
+            with record_function("forward_pass"):
+                pc = batch.sequence_point_cloud
+                camera = batch.camera
+                image_rgb = batch.image_rgb
+                mask = batch.fg_probability
+                x_0 = pcpm.point_cloud_to_tensor(pc, normalize=True, scale=True)
+
+                B, N, D = x_0.shape
+                noise = torch.randn_like(x_0)
+                timesteps = torch.randint(
+                    0,
+                    scheduler.config.num_train_timesteps,
+                    (B,),
+                    device=device,
+                    dtype=torch.long,
+                )
+                # print("timesteps", timesteps.device)
+                # print("noise", noise.device)
+                # print("x_0 device", x_0.device)
+                # print("camera device", camera.device)
+                # print("image_rgb device", image_rgb.device)
+                # print("mask device", mask.device)
+
+                x_t = scheduler.add_noise(x_0, noise, timesteps)  # noisy_x
+                x_t_input = pcpm.get_input_with_conditioning(
+                    x_t, camera=camera, image_rgb=image_rgb, mask=mask, t=timesteps
+                )
+                # print("x_t_input", x_t_input.device)
+                # print("x_t", x_t.device)
+
+                noise_pred = model(x_t_input, timesteps)
+
+                if not noise_pred.shape == noise.shape:
+                    raise ValueError(f"{noise_pred.shape} and {noise.shape} not equal")
+
+                loss = criterion(noise_pred, noise)
+
+            with record_function("backward_pass"):
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+            batch_losses.append(loss.item())  # float
+            # print("noise_pred", noise_pred.device)
+            # print("noise", noise.device)
+            # print("loss", loss.device)
+
+            # timesteps cuda:0
+            # noise cuda:0
+            # x_0 device cuda:0
+            # camera device cuda:0
+            # image_rgb device cuda:0
+            # mask device cuda:0
+            # x_t_input cuda:0
+            # x_t cuda:0
+            # noise_pred cuda:0
+            # noise cuda:0
+            # loss cuda:0
+            
+            prof.step()
+
+
 
     return batch_losses
 
@@ -228,8 +378,7 @@ def get_camera_wires_trans(cameras):
     return cam_wires_trans
 
 
-def plot_image_mask(
-    gt,
+def plot_image_mask(    gt,
     cfg: ProjectConfig,
     fname,
     point_size=0.1,
@@ -257,29 +406,31 @@ def plot_image_mask(
     # print("plot_sample_condition fname", fname)
 
     gt = gt.numpy()
-
+    
     # print("gt", gt.shape)
 
-    # make sure same number of items, gt, camera, image_rgb, mask
-    assert (
-        len(gt) == len(cam_wires_trans) == len(image_rgb) == len(mask)
-    ), f"gt, camera, image_rgb, mask should have same number of items: {len(gt)}, {len(cam_wires_trans)}, {len(image_rgb)}, {len(mask)}"
+    #make sure same number of items, gt, camera, image_rgb, mask
+    assert len(gt) == len(cam_wires_trans) == len(image_rgb) == len(mask), f"gt, camera, image_rgb, mask should have same number of items: {len(gt)}, {len(cam_wires_trans)}, {len(image_rgb)}, {len(mask)}"
     fig = plt.figure(figsize=(30, 10))
 
     for i in range(len(gt)):
 
-        ax = fig.add_subplot(len(gt), 3, 3 * i + 1)
+        ax = fig.add_subplot(len(gt), 3, 3*i+1)
         ax.imshow(image_rgb[i].cpu().numpy().transpose(1, 2, 0))
         ax.axis("off")
         ax.set_title("image_rgb")
-        ax = fig.add_subplot(len(gt), 3, 3 * i + 2)
+        ax = fig.add_subplot(len(gt), 3, 3*i+2)
         ax.imshow(mask[i].cpu().numpy().transpose(1, 2, 0))
         ax.axis("off")
         ax.set_title("mask")
-        # ax[x] is 3d plots
-        ax = fig.add_subplot(len(gt), 3, 3 * i + 3, projection="3d")
+        #ax[x] is 3d plots
+        ax = fig.add_subplot(len(gt), 3, 3*i+3 , projection="3d")
         plot = ax.scatter(
-            gt[i][:, 0], gt[i][:, 1], gt[i][:, 2], marker=",", s=point_size
+            gt[i][:, 0],
+            gt[i][:, 1],
+            gt[i][:, 2],
+            marker=",",
+            s=point_size
         )
         ax.set_xlabel("X")
         ax.set_ylabel("Y")
@@ -291,13 +442,12 @@ def plot_image_mask(
                 x_, z_, y_ = wire.numpy().T.astype(float)
                 (h,) = ax.plot(x_, y_, z_, color="k", linewidth=0.3)
         ax.set_aspect("equal")
-
+        
     plt.tight_layout()
     plt.savefig(fname)
     plt.close()
-    # print("saved image-mask", fname)
-
-
+    print("saved image-mask", fname)
+    
 def plot_quadrants(
     point_list,
     color_list,
@@ -313,7 +463,7 @@ def plot_quadrants(
     assert cam_wires_trans.device == torch.device("cpu"), "camera should be on cpu"
     fig_size_baseline = 10
 
-    fig = plt.figure(figsize=(fig_size_baseline * 4 / 3, fig_size_baseline))
+    fig = plt.figure(figsize=(fig_size_baseline*4/3, fig_size_baseline))
     ax = fig.add_subplot(221, projection="3d")
     for points, color, name in zip(point_list, color_list, name_list):
         assert (
@@ -322,17 +472,11 @@ def plot_quadrants(
         assert (
             points.shape[1] == 3
         ), f"{name} points should have shape (N, 3), not {points.shape}"
-        params = {
-            "zs": points[:, 2],
-            "c": color,
-            "marker": ",",
-            "label": name,
-            "s": point_size,
-        }
+        params = { "zs": points[:, 2],"c": color, "marker": ",", "label": name, "s": point_size}
         # if color is a string
-        if not isinstance(color, str):  # color is a list
+        if not isinstance(color, str): #color is a list
             params["cmap"] = color_map_name
-        plot = ax.scatter(points[:, 0], points[:, 1], **params)
+        plot = ax.scatter(points[:, 0],points[:, 1],**params)
 
         # plot = ax.scatter(
         #     points[:, 0],
@@ -374,18 +518,12 @@ def plot_quadrants(
     ax = fig.add_subplot(222)
     for points, color, name in zip(point_list, color_list, name_list):
 
-        params = {
-            "x": points[:, 0],
-            "y": points[:, 2],
-            "c": color,
-            "marker": ",",
-            "label": name,
-            "s": point_size,
-        }
+        params = {"x": points[:, 0], "y": points[:, 2],"c": color, "marker": ",", "label": name, "s": point_size}
         # if color is a string
-        if not isinstance(color, str):  # color is a list
+        if not isinstance(color, str): #color is a list
             params["cmap"] = color_map_name
         plot = ax.scatter(**params)
+
 
         if not isinstance(color, str):
             cax = inset_axes(
@@ -408,17 +546,10 @@ def plot_quadrants(
     # next plot y-z, 2D
     ax = fig.add_subplot(223)
     for points, color, name in zip(point_list, color_list, name_list):
-
-        params = {
-            "x": points[:, 1],
-            "y": points[:, 2],
-            "c": color,
-            "marker": ",",
-            "label": name,
-            "s": point_size,
-        }
+        
+        params = {"x": points[:, 1], "y": points[:, 2],"c": color, "marker": ",", "label": name, "s": point_size}
         # if color is a string
-        if not isinstance(color, str):  # color is a list
+        if not isinstance(color, str): #color is a list
             params["cmap"] = color_map_name
         plot = ax.scatter(**params)
 
@@ -443,18 +574,12 @@ def plot_quadrants(
     ax = fig.add_subplot(224)
     for points, color, name in zip(point_list, color_list, name_list):
 
-        params = {
-            "x": points[:, 0],
-            "y": points[:, 1],
-            "c": color,
-            "marker": ",",
-            "label": name,
-            "s": point_size,
-        }
+        params = {"x": points[:, 0], "y": points[:, 1],"c": color, "marker": ",", "label": name, "s": point_size}
         # if color is a string
-        if not isinstance(color, str):  # color is a list
+        if not isinstance(color, str): #color is a list
             params["cmap"] = color_map_name
         plot = ax.scatter(**params)
+
 
         if not isinstance(color, str):
             cax = inset_axes(
@@ -480,7 +605,6 @@ def plot_quadrants(
     plt.close()
     return x_equal_lim, y_equal_lim, z_equal_lim
 
-
 def plot_sample_condition(
     gt,
     xts,
@@ -493,7 +617,7 @@ def plot_sample_condition(
     cam_wires_trans=None,
     image_rgb=None,
     mask=None,
-    cd=None,
+    cd=None
 ):
     assert gt.shape[0] == 1, "gt should have shape (1, N, 3)"
     if cam_wires_trans is not None:
@@ -504,8 +628,8 @@ def plot_sample_condition(
     assert xts.device == torch.device("cpu"), "xts should be on cpu"
 
     plt_title = f"{epoch}: {cfg.run.name}: "
-
-    # add these parameters to the title, use a verybrief names
+    
+    #add these parameters to the title, use a verybrief names
     plt_title += f"\nsd{cfg.run.seed} infer_step{cfg.run.num_inference_steps} im_sz{cfg.dataset.image_size} schedule{cfg.model.beta_schedule} dim{cfg.model.point_cloud_model_embed_dim}\nn{cfg.dataset.max_points} lr{cfg.optimizer.lr} loss{cfg.loss.loss_type} opt{cfg.optimizer.name}"
     if cd is not None:
         plt_title += f" -- CD{cd:.2f}"
@@ -571,23 +695,6 @@ def plot_sample_condition(
     )
 
 
-def to_dict(cfg):
-    return OmegaConf.to_container(cfg, resolve=True)
-
-
-def save_checkpoint(checkpoint, checkpoint_fname, db_fname):
-
-    torch.save(checkpoint, checkpoint_fname)
-
-    with open(db_fname, "a") as f:
-        data = {"fname": checkpoint_fname, "args": to_dict(checkpoint["args"])}
-        # dict to json text
-        json.dump(data, f)
-        f.write("\n")
-
-    # print("saved at", db_fname)
-
-
 def train(
     model,
     dataloader,
@@ -599,25 +706,21 @@ def train(
     criterion=nn.MSELoss(),
     writer=None,
     pcpm: PointCloudProjectionModel = None,
-    CHECKPOINT_DIR="checkpoint_pc2",
-    CHECKPOINT_DB_FILE="checkpoint_db.json",
-    loss_ema_factors=[0.9, 0.95, 0.975, 0.99],
 ):
     assert pcpm is not None, "pcpm must be provided"
+    assert writer is not None, "writer must be provided"
     model.train()
     tqdm_range = trange(start_epoch, cfg.run.max_steps, desc="Epoch")
-    # add run name and host name to checkpoint
-    checkpoint_fname = f"{CHECKPOINT_DIR}/cp_dm_{datetime.now().strftime(f'%Y-%m-%d-%H-%M-%S')}-{cfg.run.name.replace('/', '_') }_{os.uname().nodename}.pth"
+    #add run name and host name to checkpoint
+    checkpoint_fname = (
+        f"checkpoint_pc2/cp_dm_{datetime.now().strftime(f'%Y-%m-%d-%H-%M-%S')}-{cfg.run.name.replace('/', '_') }_{os.uname().nodename}.pth"
+    )
     # mkdir if not exist
     if not os.path.exists(os.path.dirname(checkpoint_fname)):
         os.makedirs(os.path.dirname(checkpoint_fname))
     print("checkpoint to be saved at", checkpoint_fname)
-    if start_epoch == cfg.run.max_steps:  # no training, checkpoint available
-        print(
-            "checkpoint already available at",
-            checkpoint_fname,
-            "goes directly to inference",
-        )
+    if start_epoch == cfg.run.max_steps: # no training, checkpoint available
+        print("checkpoint already available at", checkpoint_fname, "goes directly to inference")
         epoch = start_epoch
         batch = next(iter(dataloader))
         batch = batch.to(device)
@@ -633,15 +736,17 @@ def train(
             camera=camera[0],
             image_rgb=image_rgb[:1],
             mask=mask[:1],
-            num_inference_steps=None,
+            num_inference_steps=50,
             device=device,
             pcpm=pcpm,
         )
 
-        pc_condition = pcpm.point_cloud_to_tensor(pc[:1], normalize=True, scale=True)
+        pc_condition = pcpm.point_cloud_to_tensor(
+            pc[:1], normalize=True, scale=True
+        )
         cd_loss, _ = chamfer_distance(sampled_point, pc_condition)
 
-        writer.add_scalar("CD_condition", cd_loss.item(), epoch)
+        writer.add_scalar("CD_condition/epoch", cd_loss.item(), epoch)
         plot_sample_condition(
             pc_condition.cpu(),
             xts.cpu(),
@@ -653,42 +758,27 @@ def train(
             0.1,
             cam_wires_trans=get_camera_wires_trans(camera[0]).detach().cpu(),
             image_rgb=image_rgb[:1].detach().cpu(),
-            mask=mask[:1].detach().cpu(),
-            cd=cd_loss.item(),
+            mask=mask[:1].detach().cpu(),cd=cd_loss.item()
+
         )
 
         plot_image_mask(
             pc_condition.cpu(),
             cfg,
             None,
-            0.1,
-            cam_wires_trans=get_camera_wires_trans(camera[0]).detach().cpu(),
+            0.1,cam_wires_trans=get_camera_wires_trans(camera[0]).detach().cpu(),
             image_rgb=image_rgb[:1].detach().cpu(),
-            mask=mask[:1].detach().cpu(),
-        )
-        return None, None
-
+            mask=mask[:1].detach().cpu())
     else:
         print("start from epoch", start_epoch, "to", cfg.run.max_steps)
-        prev_loss_emas = {k: None for k in loss_ema_factors}
-        already_image_mask = False
         for epoch in tqdm_range:
+
             batch_losses = train_one_epoch(
-                dataloader, model, optimizer, scheduler, cfg, criterion, device, pcpm
+                dataloader, model, optimizer, scheduler, cfg, criterion, device, pcpm, writer.log_dir
             )
             losses = sum(batch_losses) / len(batch_losses)
             tqdm_range.set_description(f"loss: {losses:.4f}")
-            writer.add_scalars("Loss",{ f"ema/0":losses}, epoch)
-
-            for alpha in loss_ema_factors:
-                if prev_loss_emas[alpha] is None:
-                    prev_loss_emas[alpha] = losses
-                else:
-                    prev_loss_emas[alpha] = (
-                         (1 - alpha)* losses + alpha * prev_loss_emas[alpha]
-                    )
-                
-                writer.add_scalars("Loss",{ f"ema/{alpha}":prev_loss_emas[alpha]}, epoch)
+            writer.add_scalar("Loss/epoch", losses, epoch)
 
             if (epoch + 1) % cfg.run.checkpoint_freq == 0:
                 temp_epochs = cfg.run.max_steps
@@ -698,13 +788,7 @@ def train(
                     "optimizer": optimizer.state_dict(),
                     "args": cfg,
                 }
-
-                save_checkpoint(
-                    checkpoint,
-                    checkpoint_fname.replace(".pth", f"_{epoch}.pth"),
-                    f"{CHECKPOINT_DIR}/{CHECKPOINT_DB_FILE}",
-                )
-
+                torch.save(checkpoint, checkpoint_fname)
                 cfg.run.max_steps = temp_epochs
             if (epoch + 1) % cfg.run.vis_freq == 0:
 
@@ -722,7 +806,7 @@ def train(
                     camera=camera[0],
                     image_rgb=image_rgb[:1],
                     mask=mask[:1],
-                    num_inference_steps=None,
+                    num_inference_steps=50,
                     device=device,
                     pcpm=pcpm,
                 )
@@ -738,21 +822,10 @@ def train(
                 # dev camera cuda:0
                 # dev camera[0] cuda:0
 
-                if False:  # save parameters to pkl
+                if False: # save parameters to pkl
                     import pickle
-
-                    temp_fname = cfg.run.name.replace("/", "_") + f"_tes_plots.pkl"
-                    data = {
-                        "pc_condition": pc_condition,
-                        "xts": xts,
-                        "x0s": x0s,
-                        "steps": steps,
-                        "cfg": cfg,
-                        "epoch": epoch,
-                        "camera": camera,
-                        "image_rgb": image_rgb,
-                        "mask": mask,
-                    }
+                    temp_fname = cfg.run.name.replace("/", "_")+f"_tes_plots.pkl"
+                    data = {"pc_condition": pc_condition, "xts": xts, "x0s": x0s, "steps": steps, "cfg": cfg, "epoch": epoch,"camera": camera, "image_rgb": image_rgb, "mask": mask}
                     with open(f"outputs/{temp_fname}", "wb") as f:
                         pickle.dump(data, f)
                     print("saved at", f"outputs/{temp_fname}")
@@ -760,41 +833,7 @@ def train(
 
                 cd_loss, _ = chamfer_distance(sampled_point, pc_condition)
 
-                writer.add_scalars("CD_condition", { f"ema/0":cd_loss.item()}, epoch)
-
-
-                cd_ema_factors = [k**cfg.run.vis_freq  for k in loss_ema_factors]    
-                print("cd_em_eqi_factors", cd_ema_factors)
-                prev_cd_emas = {k: None for k in cd_ema_factors}
-                
-                for alpha in cd_ema_factors:
-                    if prev_cd_emas[alpha] is None:
-                        prev_cd_emas[alpha] = cd_loss.item()
-                    else:
-                        prev_cd_emas[alpha] = (
-                             (1 - alpha)* cd_loss.item()
-                            + alpha * prev_cd_emas[alpha]
-                        )
-                    # writer.add_scalar(
-                    #     f"CD_condition/ema_equi/{alpha}", prev_cd_emas[alpha], epoch
-                    # )
-                    writer.add_scalars("CD_condition", { f"ema_equi/{alpha}":prev_cd_emas[alpha]}, epoch)
-                cd_ema_factors = [ k  for k in loss_ema_factors]    
-                print("cd_ema_factors", cd_ema_factors)
-                prev_cd_emas = {k: None for k in cd_ema_factors}
-                
-                for alpha in cd_ema_factors:
-                    if prev_cd_emas[alpha] is None:
-                        prev_cd_emas[alpha] = cd_loss.item()
-                    else:
-                        prev_cd_emas[alpha] = (
-                             (1 - alpha)* cd_loss.item()
-                            + alpha * prev_cd_emas[alpha]
-                        )
-                    # writer.add_scalar(
-                    #     f"CD_condition/ema/{alpha}", prev_cd_emas[alpha], epoch
-                    # )
-                    writer.add_scalars("CD_condition", { f"ema/{alpha}":prev_cd_emas[alpha]}, epoch)
+                writer.add_scalar("CD_condition/epoch", cd_loss.item(), epoch)
                 plot_sample_condition(
                     pc_condition.cpu(),
                     xts.cpu(),
@@ -806,36 +845,26 @@ def train(
                     0.1,
                     cam_wires_trans=get_camera_wires_trans(camera[0]).detach().cpu(),
                     image_rgb=image_rgb[:1].detach().cpu(),
-                    mask=mask[:1].detach().cpu(),
-                    cd=cd_loss.item(),
+                    mask=mask[:1].detach().cpu(),cd=cd_loss.item()
                 )
-                if not already_image_mask:
-                    plot_image_mask(
-                        pc_condition.cpu(),
-                        cfg,
-                        None,
-                        0.1,
-                        cam_wires_trans=get_camera_wires_trans(camera[0])
-                        .detach()
-                        .cpu(),
-                        image_rgb=image_rgb[:1].detach().cpu(),
-                        mask=mask[:1].detach().cpu(),
-                    )
+                plot_image_mask(            pc_condition.cpu(),
+            cfg,
+            None,
+            0.1,cam_wires_trans=get_camera_wires_trans(camera[0]).detach().cpu(),
+            image_rgb=image_rgb[:1].detach().cpu(),
+            mask=mask[:1].detach().cpu())
 
-            log_utils(log_type="dynamic", model=model, writer=writer, epoch=epoch)
+
+            log_utils(log_type="dynamic",  model=model,writer=writer, epoch=epoch)
+
 
         checkpoint = {
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
             "args": cfg,
         }
-        save_checkpoint(
-            checkpoint,
-            checkpoint_fname.replace(".pth", f"_final.pth"),
-            f"{CHECKPOINT_DIR}/{CHECKPOINT_DB_FILE}",
-        )
-        print("checkpoint saved at", checkpoint_fname.replace(".pth", f"_final.pth"))
-        return prev_loss_emas, prev_cd_emas
+        torch.save(checkpoint, checkpoint_fname)
+        print("checkpoint saved at", checkpoint_fname)
 
 
 # Sampling function
@@ -1048,69 +1077,6 @@ def sample(
 
 
 def match_args(cfg1: CO3DConfig, cfg2: CO3DConfig):
-    if cfg1.run.seed != cfg2.run.seed:
-        print("seed mismatch", cfg1.run.seed, cfg2.run.seed)
-    if cfg1.run.num_inference_steps != cfg2.run.num_inference_steps:
-        print(
-            "num_inference_steps mismatch",
-            cfg1.run.num_inference_steps,
-            cfg2.run.num_inference_steps,
-        )
-    if cfg1.dataset.image_size != cfg2.dataset.image_size:
-        print("image_size mismatch", cfg1.dataset.image_size, cfg2.dataset.image_size)
-    if cfg1.model.beta_schedule != cfg2.model.beta_schedule:
-        print(
-            "beta_schedule mismatch", cfg1.model.beta_schedule, cfg2.model.beta_schedule
-        )
-    if cfg1.model.point_cloud_model_embed_dim != cfg2.model.point_cloud_model_embed_dim:
-        print(
-            "point_cloud_model_embed_dim mismatch",
-            cfg1.model.point_cloud_model_embed_dim,
-            cfg2.model.point_cloud_model_embed_dim,
-        )
-    if cfg1.dataset.category != cfg2.dataset.category:
-        print("category mismatch", cfg1.dataset.category, cfg2.dataset.category)
-    if cfg1.dataset.type != cfg2.dataset.type:
-        print("type mismatch", cfg1.dataset.type, cfg2.dataset.type)
-    if cfg1.dataset.max_points != cfg2.dataset.max_points:
-        print("max_points mismatch", cfg1.dataset.max_points, cfg2.dataset.max_points)
-    if cfg1.optimizer.lr != cfg2.optimizer.lr:
-        print("lr mismatch", cfg1.optimizer.lr, cfg2.optimizer.lr)
-    if cfg1.dataloader.batch_size != cfg2.dataloader.batch_size:
-        print(
-            "batch_size mismatch",
-            cfg1.dataloader.batch_size,
-            cfg2.dataloader.batch_size,
-        )
-    if cfg1.dataloader.num_scenes != cfg2.dataloader.num_scenes:
-        print(
-            "num_scenes mismatch",
-            cfg1.dataloader.num_scenes,
-            cfg2.dataloader.num_scenes,
-        )
-    if cfg1.loss.loss_type != cfg2.loss.loss_type:
-        print("loss_type mismatch", cfg1.loss.loss_type, cfg2.loss.loss_type)
-    if cfg1.optimizer.name != cfg2.optimizer.name:
-        print("name mismatch", cfg1.optimizer.name, cfg2.optimizer.name)
-    if cfg1.optimizer.weight_decay != cfg2.optimizer.weight_decay:
-        print(
-            "weight_decay mismatch",
-            cfg1.optimizer.weight_decay,
-            cfg2.optimizer.weight_decay,
-        )
-    if cfg1.optimizer.kwargs.betas[0] != cfg2.optimizer.kwargs.betas[0]:
-        print(
-            "beta1 mismatch",
-            cfg1.optimizer.kwargs.betas[0],
-            cfg2.optimizer.kwargs.betas[0],
-        )
-    if cfg1.optimizer.kwargs.betas[1] != cfg2.optimizer.kwargs.betas[1]:
-        print(
-            "beta2 mismatch",
-            cfg1.optimizer.kwargs.betas[1],
-            cfg2.optimizer.kwargs.betas[1],
-        )
-
     return (
         cfg1.run.seed == cfg2.run.seed
         and cfg1.run.num_inference_steps == cfg2.run.num_inference_steps
@@ -1412,10 +1378,9 @@ def get_checkpoint_fname(cfg: ProjectConfig, CHECKPOINT_DIR):
     files = glob.glob(f"{CHECKPOINT_DIR}/cp_dm_*.pth")
     max_epoch = 0
     current_cp_fname = None
-    for fname in tqdm(files):
+    for fname in files:
         try:
             checkpoint = torch.load(fname)
-            print("checkpoint", fname)
             if match_args(checkpoint["args"], cfg):
                 if (
                     checkpoint["args"].run.max_steps <= cfg.run.max_steps
@@ -1424,15 +1389,6 @@ def get_checkpoint_fname(cfg: ProjectConfig, CHECKPOINT_DIR):
                     max_epoch = checkpoint["args"].run.max_steps
                     current_cp_fname = fname
                     # print("current_cp", current_cp_fname)
-                else:
-                    print(
-                        "epoch in config",
-                        checkpoint["args"].run.max_steps,
-                        " is less than max epoch in checkpoint",
-                        cfg.run.max_steps,
-                        "or max epoch in checkpoint is less than max epoch in checkpoint",
-                        max_epoch,
-                    )
         except:
             print("error", fname)
             continue
@@ -1470,11 +1426,8 @@ def get_loss(cfg: ProjectConfig):
 #                     global_step=epoch)
 
 
-def log_utils(log_type="static", model=None, writer=None, epoch=None):
-    assert log_type in [
-        "static",
-        "dynamic",
-    ], f"log_type {log_type} must be either 'static' or 'dynamic'"
+def    log_utils(log_type="static",  model=None,writer=None, epoch=None):
+    assert log_type in ["static", "dynamic"], f"log_type {log_type} must be either 'static' or 'dynamic'"
     assert writer is not None, "writer must be provided"
 
     data = {}
@@ -1484,40 +1437,37 @@ def log_utils(log_type="static", model=None, writer=None, epoch=None):
             raise ValueError("model must be provided for static logging")
 
         # model param_count
-        param_count = sum(p.numel() for p in model.parameters()) / 1e6
+        param_count = sum(p.numel() for p in model.parameters())/1e6
         data["model/param_count_M"] = param_count
 
-        # log ,max ram,
+        #log ,max ram,
         pynvml.nvmlInit()
         handle = pynvml.nvmlDeviceGetHandleByIndex(0)
         meminfo = pynvml.nvmlDeviceGetMemoryInfo(handle)
-        data["gpu/GB_ram"] = meminfo.total / 2**30
+        data["gpu/GB_ram"] = meminfo.total/2**30
         pynvml.nvmlShutdown()
-        # log GPU model, e.g., 3080, etc., qurying the GPU model
+        #log GPU model, e.g., 3080, etc., qurying the GPU model
         gpu_name = pynvml.nvmlDeviceGetName(handle)
         data["gpu/model"] = str(gpu_name)
-        # CPU: model
+        #CPU: model
         # CPU: model
         cpu_name = platform.processor()
-        data["cpu/processor"] = str(cpu_name)  # x86_64
-        # cpu commcerical name
+        data["cpu/processor"] = str(cpu_name) #x86_64
+        #cpu commcerical name
         cpu_commercial_name = platform.processor()
 
-        # CPU: core count
+        #CPU: core count
         cpu_core_count = psutil.cpu_count(logical=False)
         data["cpu/core_count"] = cpu_core_count
-        # CPU: thread count
+        #CPU: thread count
         cpu_thread_count = psutil.cpu_count(logical=True)
         data["cpu/thread_count"] = cpu_thread_count
-        # CPU: max ram
-        cpu_max_ram = psutil.virtual_memory().total / 2**30
-        data["cpu/GB_ram"] = cpu_max_ram
+        #CPU: max ram
+        cpu_max_ram = psutil.virtual_memory().total/2**30
+        data["cpu/GB_ram"] = cpu_max_ram   
         # print(data)
-
-        gpu_mem_util = pynvml.nvmlDeviceGetMemoryInfo(handle)
-        data["gpu/mem_utilization_total_GB"] = gpu_mem_util.total / 2**30
         for key, value in data.items():
-            # if str, add_text, else add_scalar
+            #if str, add_text, else add_scalar
             if isinstance(value, str):
                 writer.add_text(key, value)
             else:
@@ -1525,11 +1475,13 @@ def log_utils(log_type="static", model=None, writer=None, epoch=None):
     elif log_type == "dynamic":
         if epoch is None:
             raise ValueError("epoch must be provided for dynamic logging")
-        # GPU utilization/temp/mem utilization,fan speed, power consumption
+        # GPU utilization/temp/mem utilization,fan speed, power consumption 
 
-        # CPU utilization/temp/mem utilization,fan speed, power consumption
+        
+        # CPU utilization/temp/mem utilization,fan speed, power consumption 
 
         # disk/network/swap utilization,
+
 
         # GPU utilization/temp/mem utilization, fan speed, power consumption
         pynvml.nvmlInit()
@@ -1542,10 +1494,11 @@ def log_utils(log_type="static", model=None, writer=None, epoch=None):
         data["gpu/temperature"] = gpu_temp
 
         gpu_mem_util = pynvml.nvmlDeviceGetMemoryInfo(handle)
-        data["gpu/mem_utilization_percent"] = (
-            gpu_mem_util.used / gpu_mem_util.total * 100
-        )
+        data["gpu/mem_utilization_percent"] = gpu_mem_util.used / gpu_mem_util.total * 100
+        gpu_mem_util = pynvml.nvmlDeviceGetMemoryInfo(handle)
         data["gpu/mem_utilization_GB"] = gpu_mem_util.used / 2**30
+        gpu_mem_util = pynvml.nvmlDeviceGetMemoryInfo(handle)
+        data["gpu/mem_utilization_total_GB"] =  gpu_mem_util.total /2**30
 
         gpu_fan_speed = pynvml.nvmlDeviceGetFanSpeed(handle)
         data["gpu/fan_speed"] = gpu_fan_speed
@@ -1571,13 +1524,13 @@ def log_utils(log_type="static", model=None, writer=None, epoch=None):
         data["mem/utilization_percent"] = cpu_mem.percent
 
         # Disk utilization
-        disk_usage = psutil.disk_usage("/")
+        disk_usage = psutil.disk_usage('/')
         data["disk/utilization"] = disk_usage.percent
 
         # Network utilization
         net_io = psutil.net_io_counters()
-        data["network/bytes_sent_GB"] = net_io.bytes_sent / 2**30
-        data["network/bytes_recv_GB"] = net_io.bytes_recv / 2**30
+        data["network/bytes_sent_GB"] = net_io.bytes_sent/2**30
+        data["network/bytes_recv_GB"] = net_io.bytes_recv/2**30
 
         # Swap utilization
         swap = psutil.swap_memory()
@@ -1585,102 +1538,21 @@ def log_utils(log_type="static", model=None, writer=None, epoch=None):
 
         # print(data)
         for key, value in data.items():
-            # if str, add_text, else add_scalar
+            #if str, add_text, else add_scalar
             if isinstance(value, str):
                 writer.add_text(key, value, epoch)
             else:
                 writer.add_scalar(key, value, epoch)
 
 
-def match_args_json(cfg1, cfg2):
-
-    return (
-        cfg1["run"]["seed"] == cfg2["run"]["seed"]
-        and cfg1["run"]["num_inference_steps"] == cfg2["run"]["num_inference_steps"]
-        and cfg1["dataset"]["image_size"] == cfg2["dataset"]["image_size"]
-        and cfg1["model"]["beta_schedule"] == cfg2["model"]["beta_schedule"]
-        and cfg1["model"]["point_cloud_model_embed_dim"]
-        == cfg2["model"]["point_cloud_model_embed_dim"]
-        and cfg1["dataset"]["category"] == cfg2["dataset"]["category"]
-        and cfg1["dataset"]["type"] == cfg2["dataset"]["type"]
-        and cfg1["dataset"]["max_points"] == cfg2["dataset"]["max_points"]
-        and cfg1["optimizer"]["lr"] == cfg2["optimizer"]["lr"]
-        and cfg1["dataloader"]["batch_size"] == cfg2["dataloader"]["batch_size"]
-        and cfg1["dataloader"]["num_scenes"] == cfg2["dataloader"]["num_scenes"]
-        and cfg1["loss"]["loss_type"] == cfg2["loss"]["loss_type"]
-        and cfg1["optimizer"]["name"] == cfg2["optimizer"]["name"]
-        and cfg1["optimizer"]["weight_decay"] == cfg2["optimizer"]["weight_decay"]
-        and cfg1["optimizer"]["kwargs"]["betas"][0]
-        == cfg2["optimizer"]["kwargs"]["betas"][0]
-        and cfg1["optimizer"]["kwargs"]["betas"][1]
-        == cfg2["optimizer"]["kwargs"]["betas"][1]
-        # and cfg1.run.num_inference_steps == cfg2.run.num_inference_steps
-        # and cfg1.dataset.image_size == cfg2.dataset.image_size
-        # and cfg1.model.beta_schedule == cfg2.model.beta_schedule
-        # and cfg1.model.point_cloud_model_embed_dim
-        # == cfg2.model.point_cloud_model_embed_dim
-        # and cfg1.dataset.category == cfg2.dataset.category
-        # and cfg1.dataset.type == cfg2.dataset.type
-        # and cfg1.dataset.max_points == cfg2.dataset.max_points
-        # and cfg1.optimizer.lr == cfg2.optimizer.lr
-        # and cfg1.dataloader.batch_size == cfg2.dataloader.batch_size
-        # and cfg1.dataloader.num_scenes == cfg2.dataloader.num_scenes
-        # and cfg1.loss.loss_type == cfg2.loss.loss_type
-        # and cfg1.optimizer.name == cfg2.optimizer.name
-        # and cfg1.optimizer.weight_decay == cfg2.optimizer.weight_decay
-        # and cfg1.optimizer.kwargs.betas[0] == cfg2.optimizer.kwargs.betas[0]
-        # and cfg1.optimizer.kwargs.betas[1] == cfg2.optimizer.kwargs.betas[1]
-    )
-
-
-def get_checkpoint_fname_json(cfg: ProjectConfig, db_fname, CHECKPOINT_DIR):
-    # check checkpoint
-    db_fname = f"{CHECKPOINT_DIR}/{db_fname}"
-    current_cp_fname = None
-    max_epoch = 0
-
-    # load file line by line
-
-    print("db_fname", db_fname)
-    print("exists", os.path.exists(db_fname))
-    with open(db_fname, "r") as f:
-        for line in tqdm(f):
-            dat = json.loads(line)
-            print("checking checkpoint", dat["fname"])
-            if match_args_json(dat["args"], to_dict(cfg)):
-                if (
-                    dat["args"]["run"]["max_steps"] <= cfg.run.max_steps
-                    and dat["args"]["run"]["max_steps"] > max_epoch
-                ):
-                    max_epoch = dat["args"]["run"]["max_steps"]
-                    current_cp_fname = dat["fname"]
-                    print("this is ok", current_cp_fname)
-                    # print("current_cp", current_cp_fname)
-                else:
-                    print(
-                        "epoch in config",
-                        dat["args"]["run"]["max_steps"],
-                        " is less than max epoch in checkpoint",
-                        cfg.run.max_steps,
-                        "or max epoch in checkpoint is less than max epoch in checkpoint",
-                        max_epoch,
-                    )
-
-    return current_cp_fname
-
-
 @hydra.main(config_path="config", config_name="config", version_base="1.1")
 def main(cfg: ProjectConfig):
     print(cfg)
-    CHECKPOINT_DIR = "checkpoint_pc2"
-    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-    CHECKPOINT_DB_FILE = "checkpoint_db.json"
 
     set_seed(cfg.run.seed)
     tb_log_dir = "tb_log"
     log_dir = tb_log_dir + f"/{cfg.run.name}"
     writer = SummaryWriter(log_dir=log_dir)
-    print("tensorboard log at", log_dir)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print("device", device)
@@ -1733,32 +1605,10 @@ def main(cfg: ProjectConfig):
         beta_start=cfg.model.beta_start,
         beta_end=cfg.model.beta_end,
     )
-    start_epoch = 0
-
-    current_cp_fname = None
-
-    if cfg.checkpoint.resume_training:
-        if os.path.exists(f"{CHECKPOINT_DIR}/{CHECKPOINT_DB_FILE}"):
-            current_cp_fname = get_checkpoint_fname_json(
-                cfg, CHECKPOINT_DB_FILE, CHECKPOINT_DIR
-            )
-
-    if current_cp_fname is not None:
-        current_cp = torch.load(current_cp_fname)
-        print("loading checkpoint", current_cp_fname)
-        model.load_state_dict(current_cp["model"])
-        optimizer.load_state_dict(current_cp["optimizer"])
-        start_epoch = current_cp["args"].run.max_steps
-        print("start_epoch", start_epoch)
-
-    else:
-        print("no checkpoint found")
-
-    log_utils(log_type="static", model=model, writer=writer, epoch=None)
-
     criterion = get_loss(cfg)
+    start_epoch =0
     # Train the model
-    prev_loss_emas, prev_cd_emas = train(
+    train(
         model,
         # dataloader,
         dataloader_train,
@@ -1771,121 +1621,6 @@ def main(cfg: ProjectConfig):
         writer=writer,
         pcpm=pcpm,
     )
-
-    # losses = train_one_epoch(
-    #     dataloader_train,
-    #     model,
-    #     optimizer,
-    #     scheduler,
-    #     cfg,
-    #     criterion=criterion,
-    #     device=device,
-    #     pcpm=pcpm,
-    # )
-    # writer.add_scalar("Loss/epoch", sum(losses) / len(losses), cfg.run.max_steps)
-    metric_dict = {f"Loss/ema/{k}": prev_loss_emas[k] for k in prev_loss_emas}
-    metric_dict.update({f"CD_condition/ema/{k}": prev_cd_emas[k] for k in prev_cd_emas})
-
-    # Sample from the model
-
-    batch = next(iter(dataloader_train))
-    batch = batch.to(device)
-    pc = batch.sequence_point_cloud
-    camera = batch.camera
-    image_rgb = batch.image_rgb
-    mask = batch.fg_probability
-
-    samples = {}
-    for i in [1, 5, 10, 50, 100, scheduler.config.num_train_timesteps]:
-        samples[f"step{i}"] = sample(
-            model,
-            scheduler,
-            cfg,
-            camera=camera[0],
-            image_rgb=image_rgb[:1],
-            mask=mask[:1],
-            num_inference_steps=i,
-            device=device,
-            pcpm=pcpm,
-        )
-
-    if True:  # Evo plots
-        # make the plot that will be logged to tb
-        gt_cond_pc = pcpm.point_cloud_to_tensor(pc[:1], normalize=True, scale=True)
-        # print("samples_updated", samples_updated.shape)
-        # print("gt_cond_pc", gt_cond_pc.shape)
-        # samples_updated torch.Size([1, 128, 3])
-        # gt_cond_pc torch.Size([2, 128, 3])
-
-        plt.figure(figsize=(10, 10))
-
-        for key, value in samples.items():
-            samples_updated = samples[key][0]
-            cd_loss, _ = chamfer_distance(
-                gt_cond_pc.to(device),
-                samples_updated.to(device),
-            )
-
-            print(
-                key,
-                "\t",
-                f"CD: {cd_loss:.2f}",
-            )
-
-            error = []
-            assert len(samples[key][1]) > 1, "need more than 1 sample to plot"
-            for x in samples[key][1]:
-                cd_loss, _ = chamfer_distance(
-                    gt_cond_pc.to(device),
-                    x.unsqueeze(0).to(device),
-                )
-                error.append(cd_loss.item())
-            # ax = plt.plot(error, label=key)
-            plt.plot(
-                [i / (len(error) - 1) for i in range(len(error))],
-                error,
-                label=key,
-                marker=None,
-            )
-            # print()
-        plt.legend()
-        plt.title(
-            f"Diffusion model: {cfg.run.max_steps } epochs, {cfg.run.num_inference_steps } timesteps, {cfg.model.beta_schedule } schedule",
-        )
-        plt.xlabel("Evolution steps ratio")
-        plt.ylabel("Chamfer distance")
-        # ylog
-        plt.yscale("log")
-
-        writer.add_figure(f"Evolution", plt.gcf(), cfg.run.max_steps)
-        plt.close()
-
-        # add cd to metric_dict
-        metric_dict = {**{f"CD": cd_loss}, **metric_dict}
-
-    print("done evo plots")
-
-    hparam_dict = {
-        "seed": cfg.run.seed,  #
-        "epochs": cfg.run.max_steps,
-        "num_inference_steps": cfg.run.num_inference_steps,  #
-        "image_size": cfg.dataset.image_size,  #
-        "beta_schedule": cfg.model.beta_schedule,  #
-        "point_cloud_model_embed_dim": cfg.model.point_cloud_model_embed_dim,  #
-        "dataset_cat": cfg.dataset.category,
-        "dataset_source": cfg.dataset.type,
-        "max_points": cfg.dataset.max_points,  #
-        "lr": cfg.optimizer.lr,  #
-        "batch_size": cfg.dataloader.batch_size,
-        "num_scenes": cfg.dataloader.num_scenes,
-        "loss_type": cfg.loss.loss_type,  #
-        "optimizer": cfg.optimizer.name,  #
-        "optimizer_decay": cfg.optimizer.weight_decay,
-        "optimizer_beta_0": cfg.optimizer.kwargs.betas[0],
-        "optimizer_beta_1": cfg.optimizer.kwargs.betas[1],
-    }
-
-    writer.add_hparams(hparam_dict, metric_dict)
     writer.close()
 
 
