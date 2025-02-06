@@ -671,6 +671,8 @@ def train(
     else:
         print("start from epoch", start_epoch, "to", cfg.run.max_steps)
         prev_loss_emas = {k: None for k in loss_ema_factors}
+        prev_cd_equi_emas = {k**cfg.run.vis_freq: None for k in loss_ema_factors}
+        prev_cd_emas = {k: None for k in loss_ema_factors}
         already_image_mask = False
         for epoch in tqdm_range:
             batch_losses = train_one_epoch(
@@ -762,28 +764,22 @@ def train(
 
                 writer.add_scalars("CD_condition", { f"ema/0":cd_loss.item()}, epoch)
 
-
-                cd_ema_factors = [k**cfg.run.vis_freq  for k in loss_ema_factors]    
-                print("cd_em_eqi_factors", cd_ema_factors)
-                prev_cd_emas = {k: None for k in cd_ema_factors}
                 
-                for alpha in cd_ema_factors:
-                    if prev_cd_emas[alpha] is None:
-                        prev_cd_emas[alpha] = cd_loss.item()
+                for alpha in prev_cd_equi_emas:
+                    if prev_cd_equi_emas[alpha] is None:
+                        prev_cd_equi_emas[alpha] = cd_loss.item()
                     else:
-                        prev_cd_emas[alpha] = (
+                        prev_cd_equi_emas[alpha] = (
                              (1 - alpha)* cd_loss.item()
-                            + alpha * prev_cd_emas[alpha]
+                            + alpha * prev_cd_equi_emas[alpha]
                         )
                     # writer.add_scalar(
                     #     f"CD_condition/ema_equi/{alpha}", prev_cd_emas[alpha], epoch
                     # )
-                    writer.add_scalars("CD_condition", { f"ema_equi/{alpha}":prev_cd_emas[alpha]}, epoch)
-                cd_ema_factors = [ k  for k in loss_ema_factors]    
-                print("cd_ema_factors", cd_ema_factors)
-                prev_cd_emas = {k: None for k in cd_ema_factors}
+                    writer.add_scalars("CD_condition", { f"ema_equi/{alpha}":prev_cd_equi_emas[alpha]}, epoch)
+
                 
-                for alpha in cd_ema_factors:
+                for alpha in prev_cd_emas:
                     if prev_cd_emas[alpha] is None:
                         prev_cd_emas[alpha] = cd_loss.item()
                     else:

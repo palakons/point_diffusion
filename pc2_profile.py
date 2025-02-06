@@ -1508,52 +1508,54 @@ def main(cfg: ProjectConfig):
         writer=writer,
         pcpm=pcpm,
     )
-
-    with profile(
-        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-        record_shapes=True,
-        profile_memory=True,
-        with_stack=True,
-        on_trace_ready=torch.profiler.tensorboard_trace_handler(writer.log_dir),
-        #
-    ) as prof:
-        losses = train_one_epoch(
-            dataloader_train,
-            model,
-            optimizer,
-            scheduler,
-            cfg,
-            criterion=criterion,
-            device=device,
-            pcpm=pcpm,prof=prof
-        )
+    if False:
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(writer.log_dir),
+            #
+        ) as prof:
+            losses = train_one_epoch(
+                dataloader_train,
+                model,
+                optimizer,
+                scheduler,
+                cfg,
+                criterion=criterion,
+                device=device,
+                pcpm=pcpm,prof=prof
+            )
+    losses = [0]
     metric_dict = {"Loss": sum(losses) / len(losses)}
     writer.add_scalar("Loss/epoch", sum(losses) / len(losses), cfg.run.max_steps)
 
-    # Sample from the model
+    if False:
+        # Sample from the model
 
-    batch = next(iter(dataloader_train))
-    batch = batch.to(device)
-    pc = batch.sequence_point_cloud
-    camera = batch.camera
-    image_rgb = batch.image_rgb
-    mask = batch.fg_probability
+        batch = next(iter(dataloader_train))
+        batch = batch.to(device)
+        pc = batch.sequence_point_cloud
+        camera = batch.camera
+        image_rgb = batch.image_rgb
+        mask = batch.fg_probability
 
-    samples = {}
-    for i in [1, 5, 10, 50, 100,scheduler.config.num_train_timesteps]:
-        samples[f"step{i}"] = sample(
-            model,
-            scheduler,
-            cfg,
-            camera=camera[0],
-            image_rgb=image_rgb[:1],
-            mask=mask[:1],
-            num_inference_steps=i,
-            device=device,
-            pcpm=pcpm,
-        )
+        samples = {}
+        for i in [1, 5, 10, 50, 100,scheduler.config.num_train_timesteps]:
+            samples[f"step{i}"] = sample(
+                model,
+                scheduler,
+                cfg,
+                camera=camera[0],
+                image_rgb=image_rgb[:1],
+                mask=mask[:1],
+                num_inference_steps=i,
+                device=device,
+                pcpm=pcpm,
+            )
 
-    if True:  # Evo plots
+    if False:  # Evo plots
         # make the plot that will be logged to tb
         gt_cond_pc = pcpm.point_cloud_to_tensor(pc[:1], normalize=True, scale=True)
         # print("samples_updated", samples_updated.shape)
