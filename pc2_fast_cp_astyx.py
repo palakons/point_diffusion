@@ -1,3 +1,4 @@
+from pytorch3d.structures import Pointclouds
 import hydra
 import glob
 from datetime import datetime
@@ -38,6 +39,183 @@ import pynvml
 import psutil
 import platform
 import json
+import pandas as pd
+
+from torch.utils.data import Dataset, DataLoader
+from pytorch3d.renderer.cameras import PerspectiveCameras
+
+
+class AstyxDataset(Dataset):
+    def __init__(self, M, N, depth_model, root_dir="/data/palakons/dataset_astyx_hires2019/", device="cpu"):
+        # root_dir: path to the directory containing the json files
+        self.root_dir = root_dir
+        self.radar_dir = root_dir + '/radar_6455'
+        self.depth_dir = root_dir + '/depth_front'
+        self.camera_dir = root_dir + '/camera_front'
+        # self.depth_models = ['vitl','vitb','vits']
+        self.calibration_dir = root_dir + '/calibration'
+        self.object_dir = root_dir + '/groundtruth_obj3d'
+        self.M = M
+        self.N = N
+        self.depth_model = depth_model  # ['vitl','vitb','vits']
+
+        self.ids = []
+        # list filesin the radar_dir
+        for file in os.listdir(self.radar_dir):
+            idx = int(file[:6])
+            if idx not in self.ids:
+                if not os.path.exists(self.depth_dir+f'/{idx:06d}_{self.depth_model}.jpg'):
+                    print("File not found: ", self.depth_dir +
+                          f'/{idx:06d}_{self.depth_model}.jpg')
+                    continue
+
+                if not os.path.exists(self.calibration_dir+f'/{idx:06d}.json'):
+                    print("File not found: ",
+                          self.calibration_dir+f'/{idx:06d}.json')
+                    continue
+                if not os.path.exists(self.camera_dir+f'/{idx:06d}.jpg'):
+                    print("File not found: ",
+                          self.camera_dir+f'/{idx:06d}.jpg')
+                    continue
+                if not os.path.exists(self.object_dir+f'/{idx:06d}.json'):
+                    print("File not found: ",
+                          self.object_dir+f'/{idx:06d}.json')
+                    continue
+                self.ids.append(idx)
+        # randomly sample for M items
+        self.active_ids = random.sample(self.ids, M)
+
+    def __len__(self):
+        return len(self.active_ids)
+
+    def __getitem__(self, idx):
+        idx = self.active_ids[idx]
+
+        depth = {}
+        image = plt.imread(self.depth_dir+f'/{idx:06d}_{self.depth_model}.jpg')
+        # if image is of 3 channels, take only the first one
+        # print("image.shape: ", image.shape)
+        if len(image.shape) == 3:
+            image = image[:, :, 0]
+        if image.max() > 1.0:
+            image = image / 255.0
+        depth = torch.tensor(image, dtype=torch.float32)
+        # load radar data, .txt
+        df = pd.read_csv(self.radar_dir + f"/{idx:06d}.txt", sep=" ",
+                         skip_blank_lines=True)
+        df = df.iloc[:, :3]
+        # convert to tensor
+        radar_data = torch.tensor(df.values)
+        npoints = radar_data.shape[0]
+
+        # print("radar_data: ", radar_data.shape)#radar_data:  torch.Size([2246, 3])
+        # sample radar data points to N points
+        radar_data = radar_data[torch.randperm(radar_data.size(0))[:self.N]]
+        while radar_data.shape[0] < self.N:
+            radar_data = torch.cat([radar_data, radar_data[torch.randperm(
+                radar_data.size(0))[:self.N-radar_data.shape[0]]]])
+        # print("radar_data: ", radar_data.shape)#radar_data:  torch.Size([N, 3])
+        # load calibration data, .json
+        with open(self.calibration_dir+f'/{idx:06d}.json') as f:
+            calibrations = json.load(f)
+        # load camera data, .jpg
+        camera_front = plt.imread(
+            self.camera_dir+f'/{idx:06d}.jpg').transpose(2, 0, 1)
+        if camera_front.max() > 1.0:
+            camera_front = camera_front / 255.0
+        camera_front = torch.tensor(camera_front, dtype=torch.float32)
+        # load object data, .json
+        with open(self.object_dir+f'/{idx:06d}.json') as f:
+            objects = json.load(f)  # --> convert to tensor
+            # print("objects: ", objects.keys())
+            # if "objects" in objects:
+            #     objects = objects["objects"]
+
+            #     for o in objects:
+            #         print("o: ", o.keys())
+            #         print("o: ", o)
+        # print("types: ", type(depth), type(radar_data), type(camera_base), type(camera_front), type(objects), type(idx), type(npoints)) #types:  <class 'torch.Tensor'> <class 'torch.Tensor'> <class 'dict'> <class 'torch.Tensor'> <class 'dict'> <class 'int'> <class 'int'>
+        return depth, radar_data, calibrations, camera_front, objects, idx, npoints
+
+
+def custom_collate_fn(batch):
+    depths, radar_data, calibrations, camera_fronts, objects, idxs, npoints = zip(
+        *batch)
+
+    npoints_after = torch.tensor(npoints)
+    idxs_after = torch.tensor(idxs)
+    objects_after = list(objects)
+    camera_fronts_after = torch.stack(camera_fronts)
+    radar_data_after = torch.stack(radar_data)
+    depths_after = torch.stack(depths)
+    # calibrations_after = list(calibrations)
+
+    # print("npoints types: ", type(npoints), type(
+    #     npoints_after), len(npoints_after), "shape: ", npoints_after.shape)
+    # print("index types: ", type(idxs), type(idxs_after),
+    #       len(idxs_after), "shape: ", idxs_after.shape)
+    # print("objects types: ", type(objects), type(
+    #     objects_after), len(objects_after))
+    # print("camera_fronts types: ", type(
+    #     camera_fronts), type(camera_fronts_after), len(camera_fronts_after), "shape: ", camera_fronts_after.shape)
+    # print("calibrations types: ", type(calibrations), type(
+    #     calibrations_after), len(calibrations_after))
+    # print("radar_data types: ", type(radar_data), type(
+    #     radar_data_after), len(radar_data_after), "shape: ", radar_data_after.shape)
+    # print("depths types: ", type(depths), type(
+    #     depths_after), len(depths_after), "shape: ", depths_after.shape)
+
+    camara_bases = []
+    focal_length = [
+
+    ]
+    principal_point = []
+    R = []
+    T = []
+    for calib in calibrations:
+        for c in calib['sensors']:
+            if c['sensor_uid'] == 'camera_front':
+                camera_base = calib_to_camera_base(c['calib_data'])
+                camara_bases.append(camera_base)
+                # print("camera_base: ", camera_base.R, camera_base.T)
+                focal_length.append(camera_base.focal_length)
+                principal_point.append(camera_base.principal_point)
+                R.append(camera_base.R)
+                T.append(camera_base.T)
+
+    assert len(camara_bases) == len(calibrations)
+    focal_lengths = torch.concat(focal_length)
+    principal_points = torch.concat(
+        principal_point)
+    Rs = torch.concat(R)
+    Ts = torch.concat(T)
+    # print("shapes: ", focal_lengths.shape,
+    #       principal_points.shape, Rs.shape, Ts.shape)
+
+    camera_base = PerspectiveCameras(
+        focal_length=focal_lengths, principal_point=principal_points, R=Rs, T=Ts)
+
+    return depths_after, radar_data_after, camera_base, camera_fronts_after, objects_after, idxs_after, npoints_after
+
+
+def calib_to_camera_base(calibration_data):
+
+    # Convert intrinsic matrix K to tensor
+    K = torch.tensor(calibration_data['K'])
+
+    # Extract focal length and principal point from K
+    focal_length = torch.tensor([[K[0, 0], K[1, 1]]])
+    principal_point = torch.tensor([[K[0, 2], K[1, 2]]])
+
+    # Convert extrinsic matrix T_to_ref_COS to tensor
+    T_to_ref_COS = torch.tensor(calibration_data['T_to_ref_COS'])
+
+    # Extract rotation (R) and translation (T) components
+    R = T_to_ref_COS[:3, :3].unsqueeze(0)  # 3x3 rotation matrix
+    T = T_to_ref_COS[:3, 3].unsqueeze(0)   # 3x1 translation vector
+
+    # Create a PerspectiveCameras object
+    return PerspectiveCameras(focal_length=focal_length, principal_point=principal_point, R=R, T=T)
 
 
 def set_seed(seed):
@@ -97,11 +275,13 @@ def train_one_epoch(
     batch_losses = []
     for batch in dataloader:
 
-        batch = batch.to(device)
-        pc = batch.sequence_point_cloud
-        camera = batch.camera
-        image_rgb = batch.image_rgb
-        mask = batch.fg_probability
+        # batch = batch.to(device)
+        pc, camera, image_rgb, mask = extract_astyx_batch(batch, device)
+        # pc = batch.sequence_point_cloud
+        # camera = batch.camera
+        # image_rgb = batch.image_rgb
+        # mask = batch.fg_probability
+
         x_0 = pcpm.point_cloud_to_tensor(pc, normalize=True, scale=True)
 
         B, N, D = x_0.shape
@@ -154,6 +334,7 @@ def train_one_epoch(
         # loss cuda:0
 
     return batch_losses
+
 
 def get_camera_wires_trans(cameras):
     """
@@ -228,7 +409,6 @@ def plot_image_mask(
         ax.set_ylabel("Y")
         ax.set_zlabel("Z")
 
-
         if cam_wires_trans is not None:
             x_, z_, y_ = cam_wires_trans[i].numpy().T.astype(float)
             # print("coord", x_, y_, z_)
@@ -253,7 +433,8 @@ def plot_quadrants(
     color_map_name="gist_rainbow",
 ):
     # assert camera is on cpu, not cuda
-    assert cam_wires_trans.device == torch.device("cpu"), "camera should be on cpu"
+    assert cam_wires_trans.device == torch.device(
+        "cpu"), "camera should be on cpu"
     fig_size_baseline = 10
 
     fig = plt.figure(figsize=(fig_size_baseline * 4 / 3, fig_size_baseline))
@@ -564,10 +745,11 @@ def train(
         epoch = start_epoch
         batch = next(iter(dataloader))
         batch = batch.to(device)
-        pc = batch.sequence_point_cloud
-        camera = batch.camera
-        image_rgb = batch.image_rgb
-        mask = batch.fg_probability
+        pc, camera, image_rgb, mask = extract_astyx_batch(batch)
+        # pc = batch.sequence_point_cloud
+        # camera = batch.camera
+        # image_rgb = batch.image_rgb
+        # mask = batch.fg_probability
 
         sampled_point, xts, x0s, steps = sample(
             model,
@@ -581,7 +763,8 @@ def train(
             pcpm=pcpm,
         )
 
-        pc_condition = pcpm.point_cloud_to_tensor(pc[:1], normalize=True, scale=True)
+        pc_condition = pcpm.point_cloud_to_tensor(
+            pc[:1], normalize=True, scale=True)
         cd_loss, _ = chamfer_distance(sampled_point, pc_condition)
 
         writer.add_scalar("CD_condition", cd_loss.item(), epoch)
@@ -614,7 +797,8 @@ def train(
     else:
         print("start from epoch", start_epoch, "to", cfg.run.max_steps)
         prev_loss_emas = {k: None for k in loss_ema_factors}
-        prev_cd_equi_emas = {k**cfg.run.vis_freq: None for k in loss_ema_factors}
+        prev_cd_equi_emas = {
+            k**cfg.run.vis_freq: None for k in loss_ema_factors}
         prev_cd_emas = {k: None for k in loss_ema_factors}
         already_image_mask = False
         for epoch in tqdm_range:
@@ -623,17 +807,18 @@ def train(
             )
             losses = sum(batch_losses) / len(batch_losses)
             tqdm_range.set_description(f"loss: {losses:.4f}")
-            writer.add_scalars("Loss",{ f"ema/0":losses}, epoch)
+            writer.add_scalars("Loss", {f"ema/0": losses}, epoch)
 
             for alpha in loss_ema_factors:
                 if prev_loss_emas[alpha] is None:
                     prev_loss_emas[alpha] = losses
                 else:
                     prev_loss_emas[alpha] = (
-                         (1 - alpha)* losses + alpha * prev_loss_emas[alpha]
+                        (1 - alpha) * losses + alpha * prev_loss_emas[alpha]
                     )
-                
-                writer.add_scalars("Loss",{ f"ema/{alpha}":prev_loss_emas[alpha]}, epoch)
+
+                writer.add_scalars(
+                    "Loss", {f"ema/{alpha}": prev_loss_emas[alpha]}, epoch)
 
             if (epoch + 1) % cfg.run.checkpoint_freq == 0:
                 temp_epochs = cfg.run.max_steps
@@ -655,10 +840,11 @@ def train(
 
                 batch = next(iter(dataloader))
                 batch = batch.to(device)
-                pc = batch.sequence_point_cloud
-                camera = batch.camera
-                image_rgb = batch.image_rgb
-                mask = batch.fg_probability
+                pc, camera, image_rgb, mask = extract_astyx_batch(batch)
+                # pc = batch.sequence_point_cloud
+                # camera = batch.camera
+                # image_rgb = batch.image_rgb
+                # mask = batch.fg_probability
 
                 sampled_point, xts, x0s, steps = sample(
                     model,
@@ -686,7 +872,8 @@ def train(
                 if False:  # save parameters to pkl
                     import pickle
 
-                    temp_fname = cfg.run.name.replace("/", "_") + f"_tes_plots.pkl"
+                    temp_fname = cfg.run.name.replace(
+                        "/", "_") + f"_tes_plots.pkl"
                     data = {
                         "pc_condition": pc_condition,
                         "xts": xts,
@@ -705,35 +892,36 @@ def train(
 
                 cd_loss, _ = chamfer_distance(sampled_point, pc_condition)
 
-                writer.add_scalars("CD_condition", { f"ema/0":cd_loss.item()}, epoch)
+                writer.add_scalars(
+                    "CD_condition", {f"ema/0": cd_loss.item()}, epoch)
 
-                
                 for alpha in prev_cd_equi_emas:
                     if prev_cd_equi_emas[alpha] is None:
                         prev_cd_equi_emas[alpha] = cd_loss.item()
                     else:
                         prev_cd_equi_emas[alpha] = (
-                             (1 - alpha)* cd_loss.item()
+                            (1 - alpha) * cd_loss.item()
                             + alpha * prev_cd_equi_emas[alpha]
                         )
                     # writer.add_scalar(
                     #     f"CD_condition/ema_equi/{alpha}", prev_cd_emas[alpha], epoch
                     # )
-                    writer.add_scalars("CD_condition", { f"ema_equi/{alpha:0.4f}":prev_cd_equi_emas[alpha]}, epoch)
+                    writer.add_scalars(
+                        "CD_condition", {f"ema_equi/{alpha:0.4f}": prev_cd_equi_emas[alpha]}, epoch)
 
-                
                 for alpha in prev_cd_emas:
                     if prev_cd_emas[alpha] is None:
                         prev_cd_emas[alpha] = cd_loss.item()
                     else:
                         prev_cd_emas[alpha] = (
-                             (1 - alpha)* cd_loss.item()
+                            (1 - alpha) * cd_loss.item()
                             + alpha * prev_cd_emas[alpha]
                         )
                     # writer.add_scalar(
                     #     f"CD_condition/ema/{alpha}", prev_cd_emas[alpha], epoch
                     # )
-                    writer.add_scalars("CD_condition", { f"ema/{alpha}":prev_cd_emas[alpha]}, epoch)
+                    writer.add_scalars(
+                        "CD_condition", {f"ema/{alpha}": prev_cd_emas[alpha]}, epoch)
                 plot_sample_condition(
                     pc_condition.cpu(),
                     xts.cpu(),
@@ -743,7 +931,8 @@ def train(
                     epoch,
                     None,
                     0.1,
-                    cam_wires_trans=get_camera_wires_trans(camera[0]).detach().cpu(),
+                    cam_wires_trans=get_camera_wires_trans(
+                        camera[0]).detach().cpu(),
                     image_rgb=image_rgb[:1].detach().cpu(),
                     mask=mask[:1].detach().cpu(),
                     cd=cd_loss.item(),
@@ -761,7 +950,8 @@ def train(
                         mask=mask[:1].detach().cpu(),
                     )
 
-            log_utils(log_type="dynamic", model=model, writer=writer, epoch=epoch)
+            log_utils(log_type="dynamic", model=model,
+                      writer=writer, epoch=epoch)
 
         checkpoint = {
             "model": model.state_dict(),
@@ -773,7 +963,8 @@ def train(
             checkpoint_fname.replace(".pth", f"_final.pth"),
             f"{CHECKPOINT_DIR}/{CHECKPOINT_DB_FILE}",
         )
-        print("checkpoint saved at", checkpoint_fname.replace(".pth", f"_final.pth"))
+        print("checkpoint saved at",
+              checkpoint_fname.replace(".pth", f"_final.pth"))
         return prev_loss_emas, prev_cd_emas
 
 
@@ -825,7 +1016,8 @@ def sample(
 
         # Conditioning
         x_t_input = pcpm.get_input_with_conditioning(
-            x_t, camera=camera, image_rgb=image_rgb, mask=mask, t=torch.tensor([t])
+            x_t, camera=camera, image_rgb=image_rgb, mask=mask, t=torch.tensor([
+                                                                               t])
         )
         # print("dev t", t.device)
         # print("dev x_t_input", x_t_input.device)
@@ -843,7 +1035,8 @@ def sample(
 
         # Convert output back into a point cloud, undoing normalization and scaling
         output_prev = (
-            pcpm.tensor_to_point_cloud(x_t.prev_sample, denormalize=True, unscale=True)
+            pcpm.tensor_to_point_cloud(
+                x_t.prev_sample, denormalize=True, unscale=True)
             .points_padded()
             .to(device)
         )
@@ -891,8 +1084,6 @@ def sample(
     return output_prev, xs, x0t, steps
 
 
-
-
 def match_args(cfg1: CO3DConfig, cfg2: CO3DConfig):
     if cfg1.run.seed != cfg2.run.seed:
         print("seed mismatch", cfg1.run.seed, cfg2.run.seed)
@@ -903,7 +1094,8 @@ def match_args(cfg1: CO3DConfig, cfg2: CO3DConfig):
             cfg2.run.num_inference_steps,
         )
     if cfg1.dataset.image_size != cfg2.dataset.image_size:
-        print("image_size mismatch", cfg1.dataset.image_size, cfg2.dataset.image_size)
+        print("image_size mismatch", cfg1.dataset.image_size,
+              cfg2.dataset.image_size)
     if cfg1.model.beta_schedule != cfg2.model.beta_schedule:
         print(
             "beta_schedule mismatch", cfg1.model.beta_schedule, cfg2.model.beta_schedule
@@ -919,7 +1111,8 @@ def match_args(cfg1: CO3DConfig, cfg2: CO3DConfig):
     if cfg1.dataset.type != cfg2.dataset.type:
         print("type mismatch", cfg1.dataset.type, cfg2.dataset.type)
     if cfg1.dataset.max_points != cfg2.dataset.max_points:
-        print("max_points mismatch", cfg1.dataset.max_points, cfg2.dataset.max_points)
+        print("max_points mismatch", cfg1.dataset.max_points,
+              cfg2.dataset.max_points)
     if cfg1.optimizer.lr != cfg2.optimizer.lr:
         print("lr mismatch", cfg1.optimizer.lr, cfg2.optimizer.lr)
     if cfg1.dataloader.batch_size != cfg2.dataloader.batch_size:
@@ -1016,6 +1209,15 @@ class PVCNNDiffusionModel3D(nn.Module):
 
         return noise_pred
 
+
+def get_astyxdataset(cfg: ProjectConfig):
+    # cfg1.dataloader.batch_size
+    print("batch_size", cfg.dataloader.batch_size)
+    train_dataset = AstyxDataset(
+        cfg.dataloader.num_scenes, cfg.dataset.max_points, "vits")
+    dataloader_train, dataloader_val, dataloader_vis = DataLoader(
+        train_dataset, batch_size=cfg.dataloader.batch_size, num_workers=cfg.dataloader.num_workers, collate_fn=custom_collate_fn), None, None
+    return dataloader_train, dataloader_val, dataloader_vis
 
 
 def get_pc2dataset(cfg):
@@ -1170,7 +1372,8 @@ def get_checkpoint_fname(cfg: ProjectConfig, CHECKPOINT_DIR):
     for fname in tqdm(files):
         try:
             checkpoint = torch.load(fname)
-            print("checkpoint", fname)
+            # print("checkpoint", fname)
+            print(".", end="")
             if match_args(checkpoint["args"], cfg):
                 if (
                     checkpoint["args"].run.max_steps <= cfg.run.max_steps
@@ -1293,7 +1496,8 @@ def log_utils(log_type="static", model=None, writer=None, epoch=None):
         gpu_util = pynvml.nvmlDeviceGetUtilizationRates(handle)
         data["gpu/utilization"] = gpu_util.gpu
 
-        gpu_temp = pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)
+        gpu_temp = pynvml.nvmlDeviceGetTemperature(
+            handle, pynvml.NVML_TEMPERATURE_GPU)
         data["gpu/temperature"] = gpu_temp
 
         gpu_mem_util = pynvml.nvmlDeviceGetMemoryInfo(handle)
@@ -1401,7 +1605,8 @@ def get_checkpoint_fname_json(cfg: ProjectConfig, db_fname, CHECKPOINT_DIR):
     with open(db_fname, "r") as f:
         for line in tqdm(f):
             dat = json.loads(line)
-            print("checking checkpoint", dat["fname"])
+            # print("checking checkpoint", dat["fname"])
+            print(".", end="")
             if match_args_json(dat["args"], to_dict(cfg)):
                 if (
                     dat["args"]["run"]["max_steps"] <= cfg.run.max_steps
@@ -1424,9 +1629,49 @@ def get_checkpoint_fname_json(cfg: ProjectConfig, db_fname, CHECKPOINT_DIR):
     return current_cp_fname
 
 
+def extract_astyx_batch(batch, device, square_image_offset=int((2048-618)/2)):
+
+    depths, radar_data, camera_bases, camera_rgb, objects, idxs, npoints = batch
+
+    square_image_offset = int(square_image_offset)
+
+    assert 0 <= square_image_offset <= 2048 - \
+        618, "square_image_offset must be between 0 and 2048-618"
+    # image shaoe torch.Size([2, 3, 618, 2048])
+    # print("image shaoe", camera_rgb.shape)
+    # print("square_image_offset", square_image_offset)
+    # pick on the the middle 618x618
+    new_camera_rgb = camera_rgb[:, :, :,
+                                square_image_offset:square_image_offset+618]
+    # print("new_camera_rgb", new_camera_rgb.shape)
+
+    principal_points = camera_bases.principal_point
+    principal_points -= torch.tensor([square_image_offset, 0],
+                                     device=camera_bases.device)
+    new_camera_bases = PerspectiveCameras(focal_length=camera_bases.focal_length,
+                                          principal_point=principal_points, R=camera_bases.R, T=camera_bases.T, device=camera_bases.device)
+
+    pc = Pointclouds(points=radar_data.float().to(device))
+    # pc, camera, image_rgb, mask
+    return pc, new_camera_bases.to(device), new_camera_rgb.to(device), None
+
+
+def extract_co3d_batch(batch, device):
+    # pc = batch.point_clouds.points_padded().to(device)
+    # camera = batch.cameras.to(device)
+    # image_rgb = batch.images_rgb.to(device)
+    # mask = batch.images_mask.to(device)
+    batch = batch.to(device)
+    pc = batch.sequence_point_cloud
+    camera = batch.camera
+    image_rgb = batch.image_rgb
+    mask = batch.fg_probability
+    return pc, camera, image_rgb, mask
+
+
 @hydra.main(config_path="config", config_name="config", version_base="1.1")
 def main(cfg: ProjectConfig):
-    print(cfg)
+    # print(cfg)
     CHECKPOINT_DIR = "checkpoint_pc2"
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     CHECKPOINT_DB_FILE = "checkpoint_db.json"
@@ -1456,7 +1701,7 @@ def main(cfg: ProjectConfig):
         scale_factor=cfg.model.scale_factor,
     ).to(device)
 
-    dataloader_train, _, _ = get_pc2dataset(cfg)
+    dataloader_train, _, _ = get_astyxdataset(cfg)
 
     model = get_model(cfg, device=device, pcpm=pcpm)
 
@@ -1528,16 +1773,14 @@ def main(cfg: ProjectConfig):
     )
 
     metric_dict = {f"Loss/ema/{k}": prev_loss_emas[k] for k in prev_loss_emas}
-    metric_dict.update({f"CD_condition/ema/{k}": prev_cd_emas[k] for k in prev_cd_emas})
+    metric_dict.update(
+        {f"CD_condition/ema/{k}": prev_cd_emas[k] for k in prev_cd_emas})
 
     # Sample from the model
 
     batch = next(iter(dataloader_train))
     batch = batch.to(device)
-    pc = batch.sequence_point_cloud
-    camera = batch.camera
-    image_rgb = batch.image_rgb
-    mask = batch.fg_probability
+    pc, camera, image_rgb, mask = extract_astyx_batch(batch)
 
     samples = {}
     for i in [1, 5, 10, 50, 100, scheduler.config.num_train_timesteps]:
@@ -1555,7 +1798,8 @@ def main(cfg: ProjectConfig):
 
     if True:  # Evo plots
         # make the plot that will be logged to tb
-        gt_cond_pc = pcpm.point_cloud_to_tensor(pc[:1], normalize=True, scale=True)
+        gt_cond_pc = pcpm.point_cloud_to_tensor(
+            pc[:1], normalize=True, scale=True)
         # print("samples_updated", samples_updated.shape)
         # print("gt_cond_pc", gt_cond_pc.shape)
         # samples_updated torch.Size([1, 128, 3])
