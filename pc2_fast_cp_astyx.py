@@ -385,8 +385,8 @@ def plot_image_mask(
 
     # make sure same number of items, gt, camera, image_rgb, mask
     assert (
-        len(gt) == len(cam_wires_trans) == len(image_rgb) == len(mask)
-    ), f"gt, camera, image_rgb, mask should have same number of items: {len(gt)}, {len(cam_wires_trans)}, {len(image_rgb)}, {len(mask)}"
+        len(gt) == len(cam_wires_trans) == len(image_rgb)
+    ), f"gt, camera, image_rgb should have same number of items: {len(gt)}, {len(cam_wires_trans)}, {len(image_rgb)}"
     fig = plt.figure(figsize=(30, 10*len(gt)))
 
     for i in range(len(gt)):
@@ -395,10 +395,11 @@ def plot_image_mask(
         ax.imshow(image_rgb[i].cpu().numpy().transpose(1, 2, 0))
         ax.axis("off")
         ax.set_title("image_rgb")
-        ax = fig.add_subplot(len(gt), 3, 3 * i + 2)
-        ax.imshow(mask[i].cpu().numpy().transpose(1, 2, 0))
-        ax.axis("off")
-        ax.set_title("mask")
+        if mask is not None:
+            ax = fig.add_subplot(len(gt), 3, 3 * i + 2)
+            ax.imshow(mask[i].cpu().numpy().transpose(1, 2, 0))
+            ax.axis("off")
+            ax.set_title("mask")
         # ax[x] is 3d plots
 
         ax = fig.add_subplot(len(gt), 3, 3 * i + 3, projection="3d")
@@ -744,8 +745,8 @@ def train(
         )
         epoch = start_epoch
         batch = next(iter(dataloader))
-        batch = batch.to(device)
-        pc, camera, image_rgb, mask = extract_astyx_batch(batch)
+        # batch = batch.to(device)
+        pc, camera, image_rgb, mask = extract_astyx_batch(batch, device)
         # pc = batch.sequence_point_cloud
         # camera = batch.camera
         # image_rgb = batch.image_rgb
@@ -757,7 +758,7 @@ def train(
             cfg,
             camera=camera[0],
             image_rgb=image_rgb[:1],
-            mask=mask[:1],
+            mask=mask[:1] if mask is not None else None,
             num_inference_steps=None,
             device=device,
             pcpm=pcpm,
@@ -779,7 +780,7 @@ def train(
             0.1,
             cam_wires_trans=get_camera_wires_trans(camera[0]).detach().cpu(),
             image_rgb=image_rgb[:1].detach().cpu(),
-            mask=mask[:1].detach().cpu(),
+            mask=mask[:1].detach().cpu() if mask is not None else None,
             cd=cd_loss.item(),
         )
 
@@ -790,7 +791,7 @@ def train(
             0.1,
             cam_wires_trans=get_camera_wires_trans(camera[0]).detach().cpu(),
             image_rgb=image_rgb[:1].detach().cpu(),
-            mask=mask[:1].detach().cpu(),
+            mask=mask[:1].detach().cpu() if mask is not None else None,
         )
         return None, None
 
@@ -839,8 +840,9 @@ def train(
             if (epoch + 1) % cfg.run.vis_freq == 0:
 
                 batch = next(iter(dataloader))
-                batch = batch.to(device)
-                pc, camera, image_rgb, mask = extract_astyx_batch(batch)
+                # batch = batch.to(device)
+                pc, camera, image_rgb, mask = extract_astyx_batch(
+                    batch, device)
                 # pc = batch.sequence_point_cloud
                 # camera = batch.camera
                 # image_rgb = batch.image_rgb
@@ -852,7 +854,7 @@ def train(
                     cfg,
                     camera=camera[0],
                     image_rgb=image_rgb[:1],
-                    mask=mask[:1],
+                    mask=mask[:1] if mask is not None else None,
                     num_inference_steps=None,
                     device=device,
                     pcpm=pcpm,
@@ -934,7 +936,7 @@ def train(
                     cam_wires_trans=get_camera_wires_trans(
                         camera[0]).detach().cpu(),
                     image_rgb=image_rgb[:1].detach().cpu(),
-                    mask=mask[:1].detach().cpu(),
+                    mask=mask[:1].detach().cpu() if mask is not None else None,
                     cd=cd_loss.item(),
                 )
                 if not already_image_mask:
@@ -947,7 +949,8 @@ def train(
                         .detach()
                         .cpu(),
                         image_rgb=image_rgb[:1].detach().cpu(),
-                        mask=mask[:1].detach().cpu(),
+                        mask=mask[:1].detach().cpu(
+                        ) if mask is not None else None,
                     )
 
             log_utils(log_type="dynamic", model=model,
@@ -985,8 +988,8 @@ def sample(
 ):
     evolution_freq = cfg.run.evolution_freq
     assert (
-        camera is not None and image_rgb is not None and mask is not None
-    ), "camera, image_rgb, mask must be provided"
+        camera is not None and image_rgb is not None
+    ), "camera, image_rgb must be provided"
     assert pcpm is not None, "pcpm must be provided"
 
     model.eval()
@@ -1790,7 +1793,7 @@ def main(cfg: ProjectConfig):
             cfg,
             camera=camera[0],
             image_rgb=image_rgb[:1],
-            mask=mask[:1],
+            mask=mask[:1] if mask is not None else None,
             num_inference_steps=i,
             device=device,
             pcpm=pcpm,
