@@ -336,7 +336,7 @@ def train_one_epoch(
     return batch_losses
 
 
-def get_camera_wires_trans(cameras):
+def get_camera_wires_trans(cameras, scale: float = 1):
     """
     Plots a set of `cameras` objects into the maplotlib axis `ax` with
     color `color`.
@@ -346,7 +346,7 @@ def get_camera_wires_trans(cameras):
     # cameras.device cuda:0
     # cuda
     assert str(cameras.device).startswith("cuda"), "cameras should be on cuda"
-    cam_wires_canonical = get_camera_wireframe().cuda()[None]
+    cam_wires_canonical = get_camera_wireframe(scale=scale).cuda()[None]
     cam_trans = cameras.get_world_to_view_transform().inverse()
     cam_wires_trans = cam_trans.transform_points(cam_wires_canonical)
     return cam_wires_trans
