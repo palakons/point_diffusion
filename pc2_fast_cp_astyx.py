@@ -276,7 +276,8 @@ def train_one_epoch(
     for batch in dataloader:
 
         # batch = batch.to(device)
-        pc, camera, image_rgb, mask = extract_astyx_batch(batch, device)
+        pc, camera, image_rgb, mask, depths = extract_astyx_batch(
+            batch, device)
         # pc = batch.sequence_point_cloud
         # camera = batch.camera
         # image_rgb = batch.image_rgb
@@ -352,14 +353,14 @@ def get_camera_wires_trans(cameras, scale: float = 1):
     return cam_wires_trans
 
 
-def plot_image_mask(
+def plot_image_depth(
     gt,
     cfg: ProjectConfig,
     fname,
     point_size=0.1,
     cam_wires_trans=None,
     image_rgb=None,
-    mask=None,
+    depth_image=None,
 ):
     if cam_wires_trans is not None:
         assert cam_wires_trans.device == torch.device(
@@ -376,7 +377,7 @@ def plot_image_mask(
         if not os.path.exists(dir_name):
             print("creating dir", dir_name)
             os.makedirs(dir_name)
-        fname = f"{dir_name}/images-masks.png"
+        fname = f"{dir_name}/images-depths.png"
     # print("plot_sample_condition fname", fname)
 
     gt = gt.numpy()
@@ -395,11 +396,23 @@ def plot_image_mask(
         ax.imshow(image_rgb[i].cpu().numpy().transpose(1, 2, 0))
         ax.axis("off")
         ax.set_title("image_rgb")
-        if mask is not None:
+        if depth_image is not None:
             ax = fig.add_subplot(len(gt), 3, 3 * i + 2)
-            ax.imshow(mask[i].cpu().numpy().transpose(1, 2, 0))
+            # show gray scale image, take only the first layer
+            #  depth_image torch.Size([618, 2048])
+            # print("depth_image", depth_image[i].shape)
+            plot = ax.imshow(depth_image[i].cpu().numpy())
+
+            # make colorbar
+            cax = inset_axes(
+                ax, width="5%", height="50%", loc="lower left", borderpad=1
+            )
+            fig.colorbar(plot, cax=cax)
+
+            # ax.imshow(depth_image[i].cpu().numpy().transpose(1, 2, 0))
             ax.axis("off")
-            ax.set_title("mask")
+            ax.set_title("depth image")
+            # show
         # ax[x] is 3d plots
 
         ax = fig.add_subplot(len(gt), 3, 3 * i + 3, projection="3d")
@@ -617,7 +630,7 @@ def plot_sample_condition(
     point_size=0.1,
     cam_wires_trans=None,
     image_rgb=None,
-    mask=None,
+    depths=None,
     cd=None,
 ):
     assert gt.shape[0] == 1, "gt should have shape (1, N, 3)"
@@ -746,7 +759,8 @@ def train(
         epoch = start_epoch
         batch = next(iter(dataloader))
         # batch = batch.to(device)
-        pc, camera, image_rgb, mask = extract_astyx_batch(batch, device)
+        pc, camera, image_rgb, mask, depths = extract_astyx_batch(
+            batch, device)
         # pc = batch.sequence_point_cloud
         # camera = batch.camera
         # image_rgb = batch.image_rgb
@@ -780,18 +794,20 @@ def train(
             0.1,
             cam_wires_trans=get_camera_wires_trans(camera[0]).detach().cpu(),
             image_rgb=image_rgb[:1].detach().cpu(),
-            mask=mask[:1].detach().cpu() if mask is not None else None,
+            # mask=mask[:1].detach().cpu() if mask is not None else None,
+            depths=depths,
             cd=cd_loss.item(),
         )
 
-        plot_image_mask(
+        plot_image_depth(
             pc_condition.cpu(),
             cfg,
             None,
             0.1,
             cam_wires_trans=get_camera_wires_trans(camera[0]).detach().cpu(),
             image_rgb=image_rgb[:1].detach().cpu(),
-            mask=mask[:1].detach().cpu() if mask is not None else None,
+            # depth_image=mask[:1].detach().cpu() if mask is not None else None,
+            depth_image=depths[:1].detach().cpu(),
         )
         return None, None
 
@@ -841,7 +857,7 @@ def train(
 
                 batch = next(iter(dataloader))
                 # batch = batch.to(device)
-                pc, camera, image_rgb, mask = extract_astyx_batch(
+                pc, camera, image_rgb, mask, depths = extract_astyx_batch(
                     batch, device)
                 # pc = batch.sequence_point_cloud
                 # camera = batch.camera
@@ -936,11 +952,12 @@ def train(
                     cam_wires_trans=get_camera_wires_trans(
                         camera[0]).detach().cpu(),
                     image_rgb=image_rgb[:1].detach().cpu(),
-                    mask=mask[:1].detach().cpu() if mask is not None else None,
+                    # mask=mask[:1].detach().cpu() if mask is not None else None,
+                    depths=depths,
                     cd=cd_loss.item(),
                 )
                 if not already_image_mask:
-                    plot_image_mask(
+                    plot_image_depth(
                         pc_condition.cpu(),
                         cfg,
                         None,
@@ -949,8 +966,8 @@ def train(
                         .detach()
                         .cpu(),
                         image_rgb=image_rgb[:1].detach().cpu(),
-                        mask=mask[:1].detach().cpu(
-                        ) if mask is not None else None,
+                        # depth_image=mask[:1].detach().cpu( ) if mask is not None else None,
+                        depth_image=depths[:1].detach().cpu(),
                     )
 
             log_utils(log_type="dynamic", model=model,
@@ -1648,6 +1665,8 @@ def extract_astyx_batch(batch, device, square_image_offset=int((2048-618)/2)):
                                 square_image_offset:square_image_offset+618]
     # print("new_camera_rgb", new_camera_rgb.shape)
 
+    new_depths = depths[:, :, square_image_offset:square_image_offset+618]
+
     principal_points = camera_bases.principal_point
     principal_points -= torch.tensor([square_image_offset, 0],
                                      device=camera_bases.device)
@@ -1656,7 +1675,7 @@ def extract_astyx_batch(batch, device, square_image_offset=int((2048-618)/2)):
 
     pc = Pointclouds(points=radar_data.float().to(device))
     # pc, camera, image_rgb, mask
-    return pc, new_camera_bases.to(device), new_camera_rgb.to(device), None
+    return pc, new_camera_bases.to(device), new_camera_rgb.to(device), None, new_depths.to(device)
 
 
 def extract_co3d_batch(batch, device):
@@ -1782,8 +1801,9 @@ def main(cfg: ProjectConfig):
     # Sample from the model
 
     batch = next(iter(dataloader_train))
-    batch = batch.to(device)
-    pc, camera, image_rgb, mask = extract_astyx_batch(batch)
+    # batch = batch.to(device)
+    pc, camera, image_rgb, mask, depths = extract_astyx_batch(
+        batch, device=device)
 
     samples = {}
     for i in [1, 5, 10, 50, 100, scheduler.config.num_train_timesteps]:
