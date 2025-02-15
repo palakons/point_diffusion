@@ -124,7 +124,7 @@ class AstyxDataset(Dataset):
         )
 
         # square_image_offset = depth.shape[1] - depth.shape[0]
-        print("square_image_offset: ", square_image_offset)
+        # print("square_image_offset: ", square_image_offset)
         image_size_hw = (depth.shape[0], depth.shape[1])
         depth = depth[:,
                       square_image_offset: square_image_offset + depth.shape[0]]
@@ -162,18 +162,19 @@ class AstyxDataset(Dataset):
         ]
 
         # filter points: keeps only points within the image
-        world_points = radar_data
+        # world_points = radar_data
+        world_points = radar_data.clone().detach().float()
         # cam_coord = new_camera_base.get_world_to_view_transform().transform_points(
         #     torch.tensor(world_points, dtype=torch.float32))  # N x3
-        image_coord = new_camera_base.transform_points(
-            torch.tensor(world_points, dtype=torch.float32))  # N x3
+        image_coord = new_camera_base.transform_points(world_points)
+        # torch.tensor(world_points, dtype=torch.float32))  # N x3
         points_uv = image_coord[:, :2]  # N x2
 
-        print("shapes: ", points_uv.shape)
-        print("min axis 0", points_uv.min(axis=0))
-        print("max axis 0", points_uv.max(axis=0))
-        print("filtering from to", square_image_offset,
-              camera_front.shape[1]+square_image_offset)
+        # print("shapes: ", points_uv.shape)
+        # print("min axis 0", points_uv.min(axis=0))
+        # print("max axis 0", points_uv.max(axis=0))
+        # print("filtering from to", square_image_offset,
+        #   camera_front.shape[1]+square_image_offset)
         mask = (
             (points_uv[:, 1] >= 0)
             & (points_uv[:, 1] < camera_front.shape[1])
@@ -181,20 +182,20 @@ class AstyxDataset(Dataset):
             & (points_uv[:, 0] < camera_front.shape[1])
             # & (points_uv[:, 2] > 0)  # Ensure points are in front of the camera
         )
-        print("radar_data: ", radar_data.shape)
+        # print("radar_data: ", radar_data.shape)
         filtered_radar_data = radar_data[mask]
         npoints_filtered = filtered_radar_data.shape[0]
-        print("filtered_radar_data: ", filtered_radar_data.shape)
+        # print("filtered_radar_data: ", filtered_radar_data.shape)
 
-        image_coord_in = new_camera_base.transform_points(
-            torch.tensor(radar_data[mask], dtype=torch.float32))  # N x3
-        image_coord_out = new_camera_base.transform_points(
-            torch.tensor(radar_data[~mask], dtype=torch.float32))  # N x3
+        # image_coord_in = new_camera_base.transform_points(
+        #     torch.tensor(radar_data[mask], dtype=torch.float32))  # N x3
+        # image_coord_out = new_camera_base.transform_points(
+        #     torch.tensor(radar_data[~mask], dtype=torch.float32))  # N x3
 
-        print("in", filtered_radar_data.shape, image_coord_in.shape)
-        print("min max in", image_coord_in.min(
-            axis=0), image_coord_in.max(axis=0))
-        print("out", radar_data[~mask].shape, image_coord_out.shape)
+        # print("in", filtered_radar_data.shape, image_coord_in.shape)
+        # print("min max in", image_coord_in.min(
+        #     axis=0), image_coord_in.max(axis=0))
+        # print("out", radar_data[~mask].shape, image_coord_out.shape)
 
         # print("radar_data: ", radar_data.shape)#radar_data:  torch.Size([2246, 3])
         # sample radar data points to N points
@@ -264,7 +265,7 @@ def custom_collate_fn(batch):
     Ts = torch.concat(T)
     image_sizes_hw = torch.concat(image_sizes_hw)
 
-    print("image_sizes_hw: ", image_sizes_hw)
+    # print("image_sizes_hw: ", image_sizes_hw)
 
     camera_bases = PerspectiveCameras(
         focal_length=focal_lengths, principal_point=principal_points, R=Rs, T=Ts, in_ndc=False, image_size=image_sizes_hw
@@ -391,9 +392,9 @@ def train_one_epoch(
         # print("mask device", mask.device)
 
         x_t = scheduler.add_noise(x_0, noise, timesteps)  # noisy_x
-        if cfg.model.condition_source == "image_rgb":  # or depth
+        if cfg.model.condition_source == "image_rgb_filter":  # or depth
             cond_data = image_rgb
-        elif cfg.model.condition_source == "depth":  # B,c,w,h
+        elif cfg.model.condition_source == "depth_filter":  # B,c,w,h
             # repeat number of channels
             # print("depths", depths.shape)
             # print("image_rgb", image_rgb.shape)
@@ -1296,9 +1297,9 @@ def sample(
     ):
 
         # Conditioning
-        if cfg.model.condition_source == "image_rgb":  # or depth
+        if cfg.model.condition_source == "image_rgb_filter":  # or depth
             cond_data = image_rgb
-        elif cfg.model.condition_source == "depth":  # B,c,w,h
+        elif cfg.model.condition_source == "depth_filter":  # B,c,w,h
             # repeat number of channels
             # print("depths", depths.shape)
             # print("image_rgb", image_rgb.shape)
