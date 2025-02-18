@@ -600,8 +600,8 @@ def plot_image_depth_projected(
         ax.scatter(
             projected_points[:, 0], projected_points[:, 1], marker="x", s=point_size, cmap="jet", c=cam_coord[:, 2].cpu().numpy()
         )
-        print("projected_points", projected_points.shape)
-        print("min max", projected_points.min(), projected_points.max())
+        # print("projected_points", projected_points.shape)
+        # print("min max", projected_points.min(), projected_points.max())
 
         ax = fig.add_subplot(len(gt), 3, 3 * i + 3, projection="3d")
         plot = ax.scatter(
@@ -1748,6 +1748,9 @@ def get_checkpoint_fname_json(cfg: ProjectConfig, db_fname, CHECKPOINT_DIR):
         for line in tqdm(f):
             dat = json.loads(line)
             # print("checking checkpoint", dat["fname"])
+            if not os.path.exists(dat["fname"]):
+                print(dat["fname"].split("/")[-1], "not found")
+                continue
             print(".", end="")
             if match_args_json(dat["args"], to_dict(cfg)):
                 if (
