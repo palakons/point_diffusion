@@ -392,22 +392,24 @@ def train_one_epoch(
         # print("mask device", mask.device)
 
         x_t = scheduler.add_noise(x_0, noise, timesteps)  # noisy_x
-        if cfg.model.condition_source == "image_rgb_filter":  # or depth
-            cond_data = image_rgb
-        elif cfg.model.condition_source == "depth_filter":  # B,c,w,h
-            # repeat number of channels
-            # print("depths", depths.shape)
-            # print("image_rgb", image_rgb.shape)
-            cond_data = depths.repeat(1, 3, 1, 1)
-            # print("depths_rep", depths_rep.shape)
-        else:
-            raise ValueError(
-                f"cfg.model.condition_source {cfg.model.condition_source} not supported, must be 'image_rgb' or 'depth'"
-            )
+        
+        x_t_input = apply_conditioning_to_xt(cfg, x_t, camera, image_rgb, depths, mask, timesteps, pcpm)
+        # if cfg.model.condition_source == "image_rgb_filter":  # or depth
+        #     cond_data = image_rgb
+        # elif cfg.model.condition_source == "depth_filter":  # B,c,w,h
+        #     # repeat number of channels
+        #     # print("depths", depths.shape)
+        #     # print("image_rgb", image_rgb.shape)
+        #     cond_data = depths.repeat(1, 3, 1, 1)
+        #     # print("depths_rep", depths_rep.shape)
+        # else:
+        #     raise ValueError(
+        #         f"cfg.model.condition_source {cfg.model.condition_source} not supported, must be 'image_rgb' or 'depth'"
+        #     )
 
-        x_t_input = pcpm.get_input_with_conditioning(
-            x_t, camera=camera, image_rgb=cond_data, mask=mask, t=timesteps
-        )
+        # x_t_input = pcpm.get_input_with_conditioning(
+        #     x_t, camera=camera, image_rgb=cond_data, mask=mask, t=timesteps
+        # )
         # print("x_t_input", x_t_input.device)
         # print("x_t", x_t.device)
 
@@ -925,7 +927,7 @@ def save_checkpoint(
         json.dump(data, f)
         f.write("\n")
 
-    print("checkpoint saved at", checkpoint_fname)
+    # print("checkpoint saved at", checkpoint_fname)
     # print("saved at", db_fname)
 
 
@@ -1249,6 +1251,29 @@ def train(
         )
         return loss_emas, cd_emas
 
+def apply_conditioning_to_xt(cfg: ProjectConfig, x_t, camera, image_rgb, depths, mask, t, pcpm: PointCloudProjectionModel):
+    
+    if cfg.model.condition_source == "unconditional_filter":
+        cond_data = None
+        x_t_input = x_t
+    elif cfg.model.condition_source in ["image_rgb_filter", "depth_filter"]:
+        if cfg.model.condition_source == "image_rgb_filter":  # or depth
+            cond_data = image_rgb
+        elif cfg.model.condition_source == "depth_filter":  # B,c,w,h
+            # repeat number of channels
+            # print("depths", depths.shape)
+            # print("image_rgb", image_rgb.shape)
+            cond_data = depths.repeat(1, 3, 1, 1)
+            # print("depths_rep", depths_rep.shape)
+        x_t_input = pcpm.get_input_with_conditioning(
+            x_t, camera=camera, image_rgb=cond_data, mask=mask, t=torch.tensor([
+                                                                            t])
+        )
+    else:
+        raise ValueError(
+            f"cfg.model.condition_source {cfg.model.condition_source} not supported, must be 'image_rgb_filter' or 'depth_filter' or  'unconditional_filter'"
+        )
+    return x_t_input
 
 # Sampling function
 @torch.no_grad()
@@ -1298,22 +1323,29 @@ def sample(
     ):
 
         # Conditioning
-        if cfg.model.condition_source == "image_rgb_filter":  # or depth
-            cond_data = image_rgb
-        elif cfg.model.condition_source == "depth_filter":  # B,c,w,h
-            # repeat number of channels
-            # print("depths", depths.shape)
-            # print("image_rgb", image_rgb.shape)
-            cond_data = depths.repeat(1, 3, 1, 1)
-            # print("depths_rep", depths_rep.shape)
-        else:
-            raise ValueError(
-                f"cfg.model.condition_source {cfg.model.condition_source} not supported, must be 'image_rgb' or 'depth'"
-            )
-        x_t_input = pcpm.get_input_with_conditioning(
-            x_t, camera=camera, image_rgb=cond_data, mask=mask, t=torch.tensor([
-                                                                               t])
-        )
+        x_t_input = apply_conditioning_to_xt(cfg, x_t, camera, image_rgb, depths, mask, t, pcpm)
+        # if cfg.model.condition_source == "unconditional_filter":
+        #     cond_data = None
+        #     x_t_input = x_t
+        # elif cfg.model.condition_source in ["image_rgb_filter", "depth_filter"]:
+        #     if cfg.model.condition_source == "image_rgb_filter":  # or depth
+        #         cond_data = image_rgb
+        #     elif cfg.model.condition_source == "depth_filter":  # B,c,w,h
+        #         # repeat number of channels
+        #         # print("depths", depths.shape)
+        #         # print("image_rgb", image_rgb.shape)
+        #         cond_data = depths.repeat(1, 3, 1, 1)
+        #         # print("depths_rep", depths_rep.shape)
+        #     x_t_input = pcpm.get_input_with_conditioning(
+        #         x_t, camera=camera, image_rgb=cond_data, mask=mask, t=torch.tensor([
+        #                                                                         t])
+        #     )
+        # else:
+        #     raise ValueError(
+        #         f"cfg.model.condition_source {cfg.model.condition_source} not supported, must be 'image_rgb_filter' or 'depth_filter' or  'unconditional_filter'"
+        #     )
+        
+
 
         noise_pred = model(x_t_input, t.reshape(1).expand(B))
 
@@ -1544,8 +1576,11 @@ def get_pc2dataset(cfg):
 
 def get_model(cfg: ProjectConfig, device="cpu", pcpm=None):
 
-    assert pcpm is not None, "pcpm must be provided"
-    data_dim = pcpm.in_channels
+    if cfg.model.condition_source == "unconditional_filter":
+        data_dim = 3
+    else:
+        assert pcpm is not None, "pcpm must be provided"
+        data_dim = pcpm.in_channels
     print("data_dim", data_dim)
 
     return PVCNNDiffusionModel3D(
@@ -1612,9 +1647,12 @@ def log_utils(log_type="static", model=None, writer=None, epoch=None):
         cpu_max_ram = psutil.virtual_memory().total / 2**30
         data["cpu/GB_ram"] = cpu_max_ram
         # print(data)
+        
+        data["host/name"] = os.uname().nodename
 
         gpu_mem_util = pynvml.nvmlDeviceGetMemoryInfo(handle)
         data["gpu/mem_utilization_total_GB"] = gpu_mem_util.total / 2**30
+
         for key, value in data.items():
             # if str, add_text, else add_scalar
             if isinstance(value, str):
