@@ -953,7 +953,8 @@ def train(
     model.train()
     tqdm_range = trange(start_epoch, cfg.run.max_steps, desc="Epoch")
     # add run name and host name to checkpoint
-    checkpoint_fname = f"{CHECKPOINT_DIR}/cp_dm_{datetime.now().strftime(f'%Y-%m-%d-%H-%M-%S')}-{cfg.run.name.replace('/', '_') }_{os.uname().nodename}.pth"
+    proc_id = os.getpid()
+    checkpoint_fname = f"{CHECKPOINT_DIR}/cp_dm_{datetime.now().strftime(f'%Y-%m-%d-%H-%M-%S')}-{cfg.run.name.replace('/', '_') }_{os.uname().nodename}_{proc_id}.pth"
     # mkdir if not exist
     if not os.path.exists(os.path.dirname(checkpoint_fname)):
         os.makedirs(os.path.dirname(checkpoint_fname))
