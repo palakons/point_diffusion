@@ -51,8 +51,10 @@ class AstyxDataset(Dataset):
         M,
         N,
         depth_model,
-        root_dir="/data/palakons/dataset_astyx_hires2019/",
+        random_offset: bool = False,
+        root_dir: str = "/data/palakons/dataset_astyx_hires2019/",
         device="cpu",
+        is_scaled=False,
     ):
         # root_dir: path to the directory containing the json files
         self.root_dir = root_dir
@@ -65,6 +67,9 @@ class AstyxDataset(Dataset):
         self.M = M
         self.N = N
         self.depth_model = depth_model  # ['vitl','vitb','vits']
+        self.random_offset = random_offset
+        self.device = device
+        self.is_scaled = is_scaled
 
         self.ids = []
         # list filesin the radar_dir
@@ -81,30 +86,41 @@ class AstyxDataset(Dataset):
                     continue
 
                 if not os.path.exists(self.calibration_dir + f"/{idx:06d}.json"):
-                    print("File not found: ",
-                          self.calibration_dir + f"/{idx:06d}.json")
+                    print("File not found: ", self.calibration_dir + f"/{idx:06d}.json")
                     continue
                 if not os.path.exists(self.camera_dir + f"/{idx:06d}.jpg"):
-                    print("File not found: ",
-                          self.camera_dir + f"/{idx:06d}.jpg")
+                    print("File not found: ", self.camera_dir + f"/{idx:06d}.jpg")
                     continue
                 if not os.path.exists(self.object_dir + f"/{idx:06d}.json"):
-                    print("File not found: ",
-                          self.object_dir + f"/{idx:06d}.json")
+                    print("File not found: ", self.object_dir + f"/{idx:06d}.json")
                     continue
                 self.ids.append(idx)
         # randomly sample for M items
         self.active_ids = random.sample(self.ids, M)
 
-    def __len__(self):
-        return len(self.active_ids)
+        self.data_bank = []
+        for i in range(len(self.active_ids)):
+            self.data_bank.append(self.load_data(self.active_ids[i]))
 
-    def __getitem__(self, idx):
-        idx = self.active_ids[idx]
+        # stat for position data
+        # print("self.data_bank[0][1]", self.data_bank[0][1].shape)
+        # self.data_bank[0][1] torch.Size([128, 3])
+        all_radar_positions = torch.stack([d[1] for d in self.data_bank], dim=0)
+        # print("all_radar_positions", all_radar_positions.shape)
+        # # all_radar_positions torch.Size([10, 128, 3])
+
+        # print("mean", all_radar_positions.shape)
+        # print("mean", all_radar_positions.mean(axis=(0,1)))
+        # print("std", all_radar_positions.shape)
+        # print("std", all_radar_positions.std(axis=(0,1)))
+        # store mean and std
+        self.data_mean = all_radar_positions.mean(axis=(0, 1))
+        self.data_std = all_radar_positions.std(axis=(0, 1))
+
+    def load_data(self, idx):
 
         depth = {}
-        image = plt.imread(
-            self.depth_dir + f"/{idx:06d}_{self.depth_model}.jpg")
+        image = plt.imread(self.depth_dir + f"/{idx:06d}_{self.depth_model}.jpg")
         # if image is of 3 channels, take only the first one
         # print("image.shape: ", image.shape)
         if len(image.shape) == 3:
@@ -112,6 +128,18 @@ class AstyxDataset(Dataset):
         if image.max() > 1.0:
             image = image / 255.0
         depth = torch.tensor(image, dtype=torch.float32)
+        # print("depth: ", depth.shape)  # depth:  torch.Size([618, 2048])
+
+        square_image_offset = (
+            int((depth.shape[1] - depth.shape[0]) / 2)
+            if not self.random_offset
+            else random.randint(0, depth.shape[1] - depth.shape[0])
+        )
+
+        # square_image_offset = depth.shape[1] - depth.shape[0]
+        # print("square_image_offset: ", square_image_offset)
+        image_size_hw = (depth.shape[0], depth.shape[1])
+        depth = depth[:, square_image_offset : square_image_offset + depth.shape[0]]
         # load radar data, .txt
         df = pd.read_csv(
             self.radar_dir + f"/{idx:06d}.txt", sep=" ", skip_blank_lines=True
@@ -119,26 +147,21 @@ class AstyxDataset(Dataset):
         df = df.iloc[:, :3]
         # convert to tensor
         radar_data = torch.tensor(df.values)
-        npoints = radar_data.shape[0]
+        npoints_original = radar_data.shape[0]
 
-        # print("radar_data: ", radar_data.shape)#radar_data:  torch.Size([2246, 3])
-        # sample radar data points to N points
-        radar_data = radar_data[torch.randperm(radar_data.size(0))[: self.N]]
-        while radar_data.shape[0] < self.N:
-            radar_data = torch.cat(
-                [
-                    radar_data,
-                    radar_data[
-                        torch.randperm(radar_data.size(0))[
-                            : self.N - radar_data.shape[0]
-                        ]
-                    ],
-                ]
-            )
-        # print("radar_data: ", radar_data.shape)#radar_data:  torch.Size([N, 3])
         # load calibration data, .json
         with open(self.calibration_dir + f"/{idx:06d}.json") as f:
             calibrations = json.load(f)
+            for c in calibrations["sensors"]:
+                if c["sensor_uid"] == "camera_front":
+                    new_camera_base = calib_to_camera_base(
+                        c["calib_data"], [image_size_hw[0]] * 2, square_image_offset
+                    )
+
+        assert (
+            new_camera_base is not None
+        ), "new_camera_base is None (not found in calibration data)"
+
         # load camera data, .jpg
         camera_front = plt.imread(self.camera_dir + f"/{idx:06d}.jpg").transpose(
             2, 0, 1
@@ -146,95 +169,204 @@ class AstyxDataset(Dataset):
         if camera_front.max() > 1.0:
             camera_front = camera_front / 255.0
         camera_front = torch.tensor(camera_front, dtype=torch.float32)
+        # print("camera_front: ", camera_front.shape) #camera_front:  torch.Size([3, 618, 2048])
+        camera_front = camera_front[
+            :, :, square_image_offset : square_image_offset + camera_front.shape[1]
+        ]
+
+        # filter points: keeps only points within the image
+        # world_points = radar_data
+        world_points = radar_data.clone().detach().float()
+        # cam_coord = new_camera_base.get_world_to_view_transform().transform_points(
+        #     torch.tensor(world_points, dtype=torch.float32))  # N x3
+        image_coord = new_camera_base.transform_points(world_points)
+        # torch.tensor(world_points, dtype=torch.float32))  # N x3
+        points_uv = image_coord[:, :2]  # N x2
+
+        # print("shapes: ", points_uv.shape)
+        # print("min axis 0", points_uv.min(axis=0))
+        # print("max axis 0", points_uv.max(axis=0))
+        # print("filtering from to", square_image_offset,
+        #   camera_front.shape[1]+square_image_offset)
+        mask = (
+            (points_uv[:, 1] >= 0)
+            & (points_uv[:, 1] < camera_front.shape[1])
+            & (points_uv[:, 0] >= 0)
+            & (points_uv[:, 0] < camera_front.shape[1])
+            # & (points_uv[:, 2] > 0)  # Ensure points are in front of the camera
+        )
+        # print("radar_data: ", radar_data.shape)
+        filtered_radar_data = radar_data[mask]
+        npoints_filtered = filtered_radar_data.shape[0]
+        # print("filtered_radar_data: ", filtered_radar_data.shape)
+
+        # image_coord_in = new_camera_base.transform_points(
+        #     torch.tensor(radar_data[mask], dtype=torch.float32))  # N x3
+        # image_coord_out = new_camera_base.transform_points(
+        #     torch.tensor(radar_data[~mask], dtype=torch.float32))  # N x3
+
+        # print("in", filtered_radar_data.shape, image_coord_in.shape)
+        # print("min max in", image_coord_in.min(
+        #     axis=0), image_coord_in.max(axis=0))
+        # print("out", radar_data[~mask].shape, image_coord_out.shape)
+
+        # print("radar_data: ", radar_data.shape)#radar_data:  torch.Size([2246, 3])
+        # sample radar data points to N points
+        filtered_radar_data = filtered_radar_data[
+            torch.randperm(filtered_radar_data.size(0))[: self.N]
+        ]
+
+        while filtered_radar_data.shape[0] < self.N:
+            filtered_radar_data = torch.cat(
+                [
+                    filtered_radar_data,
+                    filtered_radar_data[
+                        torch.randperm(filtered_radar_data.size(0))[
+                            : self.N - filtered_radar_data.shape[0]
+                        ]
+                    ],
+                ]
+            )
+        # print("radar_data: ", radar_data.shape)#radar_data:  torch.Size([N, 3])
+
         # load object data, .json
         with open(self.object_dir + f"/{idx:06d}.json") as f:
-            objects = json.load(f)  # --> convert to tensor
-            # print("objects: ", objects.keys())
-            # if "objects" in objects:
-            #     objects = objects["objects"]
+            objects = json.load(f)
 
-            #     for o in objects:
-            #         print("o: ", o.keys())
-            #         print("o: ", o)
-        # print("types: ", type(depth), type(radar_data), type(camera_base), type(camera_front), type(objects), type(idx), type(npoints)) #types:  <class 'torch.Tensor'> <class 'torch.Tensor'> <class 'dict'> <class 'torch.Tensor'> <class 'dict'> <class 'int'> <class 'int'>
-        return depth, radar_data, calibrations, camera_front, objects, idx, npoints
+        # print("shapes: ", depth.shape, filtered_radar_data.shape, camera_front.shape,len(objects),len(idx),npoints)
+        print(
+            f"idx {idx} npoints_original {npoints_original} npoints_filtered {npoints_filtered} square_image_offset {square_image_offset}"
+        )
+        return (
+            depth,
+            filtered_radar_data,
+            new_camera_base,
+            camera_front,
+            objects,
+            idx,
+            npoints_original,
+            npoints_filtered,
+            square_image_offset,
+        )
+
+    def __len__(self):
+        return len(self.active_ids)
+
+    def __getitem__(self, idx):
+        if not self.is_scaled:
+
+            return self.data_bank[idx]
+
+        (
+            depth,
+            filtered_radar_data,
+            new_camera_base,
+            camera_front,
+            objects,
+            idx,
+            npoints_original,
+            npoints_filtered,
+            square_image_offset,
+        ) = self.data_bank[idx]
+
+        # print("mean", self.data_mean)
+        # print("std", self.data_std)
+        # print("filtered_radar_data", filtered_radar_data.shape)
+        # print("filtered_radar_data", filtered_radar_data[0])
+
+        # newd =(filtered_radar_data-self.data_mean)/self.data_std
+
+        # print("newd", newd.shape)
+
+        # print("filtered_radar_data", newd[0])
+        # mean tensor([38.5517, -0.2240,  1.0346], dtype=torch.float64)                                                             std tensor([20.8821,  3.5820,  1.9252], dtype=torch.float64)                                                             filtered_radar_data torch.Size([128, 3])                                                                  filtered_radar_data tensor([73.2768, -1.1732,  3.0596], dtype=torch.float64)                                                             newd torch.Size([128, 3])                                                                                                                        filtered_radar_data tensor([ 1.6629, -0.2650,  1.0518], dtype=torch.float64)
+
+        return (
+            depth,
+            (filtered_radar_data - self.data_mean) / self.data_std,
+            new_camera_base,
+            camera_front,
+            objects,
+            idx,
+            npoints_original,
+            npoints_filtered,
+            square_image_offset,
+        )
 
 
 def custom_collate_fn(batch):
-    depths, radar_data, calibrations, camera_fronts, objects, idxs, npoints = zip(
-        *batch
-    )
+    (
+        depths,
+        radar_data,
+        camera_base_list,
+        camera_fronts,
+        objects,
+        idxs,
+        npoints,
+        npoints_filtered,
+        square_image_offset,
+    ) = zip(*batch)
 
     npoints_after = torch.tensor(npoints)
+    npoints_filtered_after = torch.tensor(npoints_filtered)
     idxs_after = torch.tensor(idxs)
+    square_image_offset_after = torch.tensor(square_image_offset)
     objects_after = list(objects)
     camera_fronts_after = torch.stack(camera_fronts)
     radar_data_after = torch.stack(radar_data)
     depths_after = torch.stack(depths)
-    # calibrations_after = list(calibrations)
 
-    # print("npoints types: ", type(npoints), type(
-    #     npoints_after), len(npoints_after), "shape: ", npoints_after.shape)
-    # print("index types: ", type(idxs), type(idxs_after),
-    #       len(idxs_after), "shape: ", idxs_after.shape)
-    # print("objects types: ", type(objects), type(
-    #     objects_after), len(objects_after))
-    # print("camera_fronts types: ", type(
-    #     camera_fronts), type(camera_fronts_after), len(camera_fronts_after), "shape: ", camera_fronts_after.shape)
-    # print("calibrations types: ", type(calibrations), type(
-    #     calibrations_after), len(calibrations_after))
-    # print("radar_data types: ", type(radar_data), type(
-    #     radar_data_after), len(radar_data_after), "shape: ", radar_data_after.shape)
-    # print("depths types: ", type(depths), type(
-    #     depths_after), len(depths_after), "shape: ", depths_after.shape)
-
-    camara_bases = []
     focal_length = []
     principal_point = []
     R = []
     T = []
-    for calib in calibrations:
-        for c in calib["sensors"]:
-            if c["sensor_uid"] == "camera_front":
-                camera_base = calib_to_camera_base(c["calib_data"])
-                camara_bases.append(camera_base)
-                # print("camera_base: ", camera_base.R, camera_base.T)
-                focal_length.append(camera_base.focal_length)
-                principal_point.append(camera_base.principal_point)
-                R.append(camera_base.R)
-                T.append(camera_base.T)
+    image_sizes_hw = []
+    for camera_base in camera_base_list:
+        focal_length.append(camera_base.focal_length)
 
-    assert len(camara_bases) == len(calibrations)
+        principal_point.append(camera_base.principal_point)
+        R.append(camera_base.R)
+        T.append(camera_base.T)
+        image_sizes_hw.append(camera_base.image_size)
+
     focal_lengths = torch.concat(focal_length)
     principal_points = torch.concat(principal_point)
     Rs = torch.concat(R)
     Ts = torch.concat(T)
-    # print("shapes: ", focal_lengths.shape,
-    #       principal_points.shape, Rs.shape, Ts.shape)
+    image_sizes_hw = torch.concat(image_sizes_hw)
 
-    camera_base = PerspectiveCameras(
-        focal_length=focal_lengths, principal_point=principal_points, R=Rs, T=Ts
+    # print("image_sizes_hw: ", image_sizes_hw)
+
+    camera_bases = PerspectiveCameras(
+        focal_length=focal_lengths,
+        principal_point=principal_points,
+        R=Rs,
+        T=Ts,
+        in_ndc=False,
+        image_size=image_sizes_hw,
     )
 
     return (
         depths_after,
         radar_data_after,
-        camera_base,
+        camera_bases,
         camera_fronts_after,
         objects_after,
         idxs_after,
         npoints_after,
+        npoints_filtered_after,
+        square_image_offset_after,
     )
 
 
-def calib_to_camera_base(calibration_data):
+def calib_to_camera_base(calibration_data, image_size_hw: tuple, offset: int = 0):
 
     # Convert intrinsic matrix K to tensor
     K = torch.tensor(calibration_data["K"])
 
     # Extract focal length and principal point from K
     focal_length = torch.tensor([[K[0, 0], K[1, 1]]])
-    principal_point = torch.tensor([[K[0, 2], K[1, 2]]])
+    principal_point = torch.tensor([[K[0, 2] - offset, K[1, 2]]])
 
     # Convert extrinsic matrix T_to_ref_COS to tensor
     T_to_ref_COS = torch.tensor(calibration_data["T_to_ref_COS"])
@@ -247,7 +379,12 @@ def calib_to_camera_base(calibration_data):
 
     # Create a PerspectiveCameras object
     return PerspectiveCameras(
-        focal_length=focal_length, principal_point=principal_point, R=R, T=T
+        focal_length=focal_length,
+        principal_point=principal_point,
+        R=R,
+        T=T,
+        in_ndc=False,
+        image_size=[image_size_hw],
     )
 
 
@@ -291,6 +428,37 @@ class PointCloudLoss(nn.Module):
         return (1 - self.emd_weight) * chamfer + self.emd_weight * emd
 
 
+def extract_batch(cfg: ProjectConfig, batch, device):
+
+    if cfg.dataset.type == "astyx":
+        (
+            depths,
+            radar_data,
+            camera,
+            image_rgb,
+            objects,
+            idx,
+            npoints,
+            npoints_filtered,
+            offsets,
+        ) = batch
+        depths = depths.to(device)
+        camera = camera.to(device)
+        mask = None
+        image_rgb = image_rgb.to(device)
+        points = radar_data.float().to(device)
+        pc = Pointclouds(points=points)
+    elif cfg.dataset.type == "co3dv2":
+        batch = batch.to(device)
+        pc = batch.sequence_point_cloud
+        camera = batch.camera
+        image_rgb = batch.image_rgb
+        mask = batch.fg_probability
+        depths = None
+
+    return pc, camera, image_rgb, mask, depths
+
+
 # Training function
 def train_one_epoch(
     dataloader,
@@ -305,16 +473,12 @@ def train_one_epoch(
     assert pcpm is not None, "pcpm must be provided"
     model.train()
 
+    data_mean = dataloader.dataset.data_mean.to(device).float()
+    data_std = dataloader.dataset.data_std.to(device).float()
+
     batch_losses = []
     for batch in dataloader:
-
-        # batch = batch.to(device)
-        pc, camera, image_rgb, mask, depths = extract_astyx_batch(
-            batch, cfg, device)
-        # pc = batch.sequence_point_cloud
-        # camera = batch.camera
-        # image_rgb = batch.image_rgb
-        # mask = batch.fg_probability
+        pc, camera, image_rgb, mask, depths = extract_batch(cfg, batch, device)
 
         x_0 = pcpm.point_cloud_to_tensor(pc, normalize=True, scale=True)
 
@@ -327,24 +491,24 @@ def train_one_epoch(
             device=device,
             dtype=torch.long,
         )
-        # print("timesteps", timesteps.device)
-        # print("noise", noise.device)
-        # print("x_0 device", x_0.device)
-        # print("camera device", camera.device)
-        # print("image_rgb device", image_rgb.device)
-        # print("mask device", mask.device)
-
         x_t = scheduler.add_noise(x_0, noise, timesteps)  # noisy_x
-        x_t_input = pcpm.get_input_with_conditioning(
-            x_t,
-            camera=camera,
-            image_rgb=image_rgb,
-            mask=mask,
-            t=timesteps,
-            # x_t, camera=camera, image_rgb=image_rgb, mask=mask, t=timesteps
+        # print("type x_t", type(x_t))
+        # print("dtype x_t", x_t.dtype)
+        if cfg.dataset.is_scaled:
+            x_t = x_t * data_std + data_mean
+        # print("type x_t", type(x_t))
+        # print("dtype x_t", x_t.dtype)
+        # convert to float32
+        # x_t = x_t.float()
+        # print("dtype x_t", x_t.dtype)
+
+        x_t_input = apply_conditioning_to_xt(
+            cfg, x_t, camera, image_rgb, depths, mask, timesteps, pcpm
         )
-        # print("x_t_input", x_t_input.device)
-        # print("x_t", x_t.device)
+
+        if cfg.dataset.is_scaled:
+            # scale back the first 3 dimensions
+            x_t_input[:, :, :3] = (x_t_input[:, :, :3] - data_mean) / data_std
 
         optimizer.zero_grad()
         noise_pred = model(x_t_input, timesteps)
@@ -356,22 +520,6 @@ def train_one_epoch(
         loss.backward()
         optimizer.step()
         batch_losses.append(loss.item())  # float
-        # print("noise_pred", noise_pred.device)
-        # print("noise", noise.device)
-        # print("loss", loss.device)
-
-        # timesteps cuda:0
-        # noise cuda:0
-        # x_0 device cuda:0
-        # camera device cuda:0
-        # image_rgb device cuda:0
-        # mask device cuda:0
-        # x_t_input cuda:0
-        # x_t cuda:0
-        # noise_pred cuda:0
-        # noise cuda:0
-        # loss cuda:0
-
     return batch_losses
 
 
@@ -453,10 +601,141 @@ def plot_image_depth(
             # show
         # ax[x] is 3d plots
 
+        # experiment plot projected points
+
         ax = fig.add_subplot(len(gt), 3, 3 * i + 3, projection="3d")
         plot = ax.scatter(
             gt[i][:, 0], gt[i][:, 1], gt[i][:, 2], marker=",", s=point_size
         )
+        ax.set_xlabel("X")
+        ax.set_ylabel("Y")
+        ax.set_zlabel("Z")
+
+        if cam_wires_trans is not None:
+            x_, z_, y_ = cam_wires_trans[i].numpy().T.astype(float)
+            # print("coord", x_, y_, z_)
+            (h,) = ax.plot(x_, y_, z_)
+        ax.set_aspect("equal")
+
+    plt.tight_layout()
+    plt.savefig(fname)
+    plt.close()
+    # print("saved image-mask", fname)
+
+
+def plot_image_depth_projected(
+    gt,
+    cfg: ProjectConfig,
+    fname,
+    point_size=0.1,
+    camera=None,
+    image_rgb=None,
+    depth_image=None,
+    data_mean=torch.tensor([0, 0, 0]),
+    data_std=torch.tensor([1, 1, 1]),
+):
+    
+    data_mean = data_mean.float().cpu().numpy()
+    data_std = data_std.float().cpu().numpy()
+    if camera is not None:
+        cam_wires_trans = get_camera_wires_trans(camera).detach().cpu()
+        assert cam_wires_trans.device == torch.device(
+            "cpu"
+        ), "cam_wires_trans should be on cpu"
+    assert gt.device == torch.device("cpu"), "gt should be on cpu"
+
+    # plot_multi_gt(gts,  args, input_pc_file_list, fname=None)
+    if fname is None:
+        dir_name = f"plots/" + cfg.run.name
+        # mkdir
+        if not os.path.exists(dir_name):
+            print("creating dir", dir_name)
+            os.makedirs(dir_name)
+        fname = f"{dir_name}/images-depths_projected.png"
+    # print("plot_sample_condition fname", fname)
+
+    gt = gt.numpy()
+
+    if cfg.dataset.is_scaled:
+        gt = gt * data_std + data_mean
+
+    
+
+    # print("gt", gt.shape)
+    # make sure same number of items, gt, camera, image_rgb, mask
+    assert (
+        len(gt) == len(cam_wires_trans) == len(image_rgb)
+    ), f"gt, camera, image_rgb should have same number of items: {len(gt)}, {len(cam_wires_trans)}, {len(image_rgb)}"
+    fig = plt.figure(figsize=(30, 10 * len(gt)))
+
+    for i in range(len(gt)):
+        world_points = torch.tensor(gt[i], dtype=torch.float32).to(camera[i].device)
+        cam_coord = (
+            camera[i].get_world_to_view_transform().transform_points(world_points)
+        )  # N x3
+
+        image_coord = camera[i].transform_points(world_points)  # N x3
+
+        projected_points = image_coord[:, :2]  # N x2
+        projected_points = projected_points.cpu().numpy()
+
+        ax = fig.add_subplot(len(gt), 3, 3 * i + 1)
+        plot = ax.imshow(image_rgb[i].cpu().numpy().transpose(1, 2, 0))
+        ax.scatter(
+            projected_points[:, 0],
+            projected_points[:, 1],
+            marker="x",
+            s=point_size,
+            cmap="jet",
+            c=cam_coord[:, 2].cpu().numpy(),
+        )
+        cax = inset_axes(ax, width="5%", height="50%", loc="lower left", borderpad=1)
+        fig.colorbar(plot, cax=cax)
+        ax.axis("off")
+        ax.set_title("image_rgb")
+
+        if depth_image is not None:
+            ax = fig.add_subplot(len(gt), 3, 3 * i + 2)
+            # show gray scale image, take only the first layer
+            #  depth_image torch.Size([618, 2048])
+            # print("depth_image", depth_image[i].shape)
+            plot = ax.imshow(depth_image[i].cpu().numpy())
+
+            # make colorbar
+            cax = inset_axes(
+                ax, width="5%", height="50%", loc="lower left", borderpad=1
+            )
+            fig.colorbar(plot, cax=cax)
+
+            # ax.imshow(depth_image[i].cpu().numpy().transpose(1, 2, 0))
+            ax.axis("off")
+            ax.set_title("depth image")
+            # show
+            # ax[x] is 3d plots
+
+            ax.scatter(
+                projected_points[:, 0],
+                projected_points[:, 1],
+                marker="x",
+                s=point_size,
+                cmap="jet",
+                c=cam_coord[:, 2].cpu().numpy(),
+            )
+        # print("projected_points", projected_points.shape)
+        # print("min max", projected_points.min(), projected_points.max())
+
+        ax = fig.add_subplot(len(gt), 3, 3 * i + 3, projection="3d")
+        plot = ax.scatter(
+            gt[i][:, 0],
+            gt[i][:, 1],
+            gt[i][:, 2],
+            marker=",",
+            s=point_size,
+            cmap="jet",
+            c=cam_coord[:, 2].cpu().numpy(),
+        )
+        cax = inset_axes(ax, width="5%", height="50%", loc="lower left", borderpad=1)
+        fig.colorbar(plot, cax=cax)
         ax.set_xlabel("X")
         ax.set_ylabel("Y")
         ax.set_zlabel("Z")
@@ -485,8 +764,7 @@ def plot_quadrants(
     color_map_name="gist_rainbow",
 ):
     # assert camera is on cpu, not cuda
-    assert cam_wires_trans.device == torch.device(
-        "cpu"), "camera should be on cpu"
+    assert cam_wires_trans.device == torch.device("cpu"), "camera should be on cpu"
     fig_size_baseline = 10
 
     fig = plt.figure(figsize=(fig_size_baseline * 4 / 3, fig_size_baseline))
@@ -670,7 +948,11 @@ def plot_sample_condition(
     image_rgb=None,
     depths=None,
     cd=None,
+    data_mean=torch.tensor([0, 0, 0]),
+    data_std=torch.tensor([1, 1, 1]),
 ):
+    data_mean = data_mean.float().cpu().numpy()
+    data_std = data_std.float().cpu().numpy()
     assert gt.shape[0] == 1, "gt should have shape (1, N, 3)"
     if cam_wires_trans is not None:
         assert cam_wires_trans.device == torch.device(
@@ -698,6 +980,17 @@ def plot_sample_condition(
 
     gt = gt.numpy()[0]
     xt = xts[-1].numpy()
+    
+    if cfg.dataset.is_scaled:
+        print("data_mean", data_mean)
+        print("data_std", data_std)
+        print("gt", gt.shape,gt[0])
+        print("xt", xt.shape,xt[0])
+        gt = gt * data_std + data_mean
+        xt = xt * data_std + data_mean
+        print("gt", gt.shape,gt[0])
+        print("xt", xt.shape,xt[0])
+
 
     x_equal_lim, y_equal_lim, z_equal_lim = plot_quadrants(
         [gt, xt],
@@ -753,7 +1046,13 @@ def to_dict(cfg):
 
 def save_checkpoint(
     # (epoch, cd)
-    model, optimizer, cfg, cd_list, loss_list, checkpoint_fname, db_fname
+    model,
+    optimizer,
+    cfg,
+    cd_list,
+    loss_list,
+    checkpoint_fname,
+    db_fname,
 ):
 
     checkpoint = {
@@ -799,7 +1098,8 @@ def train(
     model.train()
     tqdm_range = trange(start_epoch, cfg.run.max_steps, desc="Epoch")
     # add run name and host name to checkpoint
-    checkpoint_fname = f"{CHECKPOINT_DIR}/cp_dm_{datetime.now().strftime(f'%Y-%m-%d-%H-%M-%S')}-{cfg.run.name.replace('/', '_') }_{os.uname().nodename}.pth"
+    proc_id = os.getpid()
+    checkpoint_fname = f"{CHECKPOINT_DIR}/cp_dm_{datetime.now().strftime(f'%Y-%m-%d-%H-%M-%S')}-{cfg.run.name.replace('/', '_') }_{os.uname().nodename}_{proc_id}.pth"
     # mkdir if not exist
     if not os.path.exists(os.path.dirname(checkpoint_fname)):
         os.makedirs(os.path.dirname(checkpoint_fname))
@@ -812,14 +1112,15 @@ def train(
         )
         epoch = start_epoch
         batch = next(iter(dataloader))
-        # batch = batch.to(device)
-        pc, camera, image_rgb, mask, depths = extract_astyx_batch(
-            batch, cfg, device)
+
+        pc, camera, image_rgb, mask, depths = extract_batch(cfg, batch, device)
+
         sampled_point, xts, x0s, steps = sample(
             model,
             scheduler,
             cfg,
             camera=camera[0],
+            depths=depths[:1] if depths is not None else None,
             image_rgb=image_rgb[:1],
             mask=mask[:1] if mask is not None else None,
             num_inference_steps=None,
@@ -827,8 +1128,7 @@ def train(
             pcpm=pcpm,
         )
 
-        pc_condition = pcpm.point_cloud_to_tensor(
-            pc[:1], normalize=True, scale=True)
+        pc_condition = pcpm.point_cloud_to_tensor(pc[:1], normalize=True, scale=True)
         cd_loss, _ = chamfer_distance(sampled_point, pc_condition)
 
         writer.add_scalar("CD_condition", cd_loss.item(), epoch)
@@ -846,7 +1146,8 @@ def train(
             # mask=mask[:1].detach().cpu() if mask is not None else None,
             depths=depths,
             cd=cd_loss.item(),
-        )
+            data_mean=dataloader.dataset.data_mean,
+            data_std=dataloader.dataset.data_std,)
 
         plot_image_depth(
             pc_condition.cpu(),
@@ -856,7 +1157,7 @@ def train(
             cam_wires_trans=get_camera_wires_trans(camera[0]).detach().cpu(),
             image_rgb=image_rgb[:1].detach().cpu(),
             # depth_image=mask[:1].detach().cpu() if mask is not None else None,
-            depth_image=depths[:1].detach().cpu(),
+            depth_image=depths[:1].detach().cpu() if depths is not None else None,
         )
         loss_emas = {k: None for k in loss_ema_factors}
         for epoch, losses in enumerate(prev_losses):
@@ -865,8 +1166,7 @@ def train(
                 if loss_emas[alpha] is None:
                     loss_emas[alpha] = losses
                 else:
-                    loss_emas[alpha] = (1 - alpha) * losses + \
-                        alpha * loss_emas[alpha]
+                    loss_emas[alpha] = (1 - alpha) * losses + alpha * loss_emas[alpha]
 
                 writer.add_scalars(
                     "Loss", {f"ema/{alpha:.4e}": loss_emas[alpha]}, epoch
@@ -884,8 +1184,7 @@ def train(
                 if cd_emas[alpha] is None:
                     cd_emas[alpha] = cd_loss
                 else:
-                    cd_emas[alpha] = (1 - alpha) * cd_loss + \
-                        alpha * cd_emas[alpha]
+                    cd_emas[alpha] = (1 - alpha) * cd_loss + alpha * cd_emas[alpha]
         return loss_emas, cd_emas
 
     else:
@@ -896,8 +1195,7 @@ def train(
                 if loss_emas[alpha] is None:
                     loss_emas[alpha] = losses
                 else:
-                    loss_emas[alpha] = (1 - alpha) * losses + \
-                        alpha * loss_emas[alpha]
+                    loss_emas[alpha] = (1 - alpha) * losses + alpha * loss_emas[alpha]
 
         cd_emas = {
             **{k: None for k in loss_ema_factors},
@@ -910,8 +1208,7 @@ def train(
                 if cd_emas[alpha] is None:
                     cd_emas[alpha] = cd_loss
                 else:
-                    cd_emas[alpha] = (1 - alpha) * cd_loss + \
-                        alpha * cd_emas[alpha]
+                    cd_emas[alpha] = (1 - alpha) * cd_loss + alpha * cd_emas[alpha]
 
         already_image_mask = False
         new_cds = []
@@ -929,8 +1226,7 @@ def train(
                 if loss_emas[alpha] is None:
                     loss_emas[alpha] = losses
                 else:
-                    loss_emas[alpha] = (1 - alpha) * losses + \
-                        alpha * loss_emas[alpha]
+                    loss_emas[alpha] = (1 - alpha) * losses + alpha * loss_emas[alpha]
 
                 writer.add_scalars(
                     "Loss", {f"ema/{alpha:.4e}": loss_emas[alpha]}, epoch
@@ -953,10 +1249,8 @@ def train(
             if (epoch + 1) % cfg.run.vis_freq == 0:
 
                 batch = next(iter(dataloader))
-                # batch = batch.to(device)
-                pc, camera, image_rgb, mask, depths = extract_astyx_batch(
-                    batch, cfg, device
-                )
+
+                pc, camera, image_rgb, mask, depths = extract_batch(cfg, batch, device)
 
                 sampled_point, xts, x0s, steps = sample(
                     model,
@@ -964,6 +1258,7 @@ def train(
                     cfg,
                     camera=camera[0],
                     image_rgb=image_rgb[:1],
+                    depths=depths[:1] if depths is not None else None,
                     mask=mask[:1] if mask is not None else None,
                     num_inference_steps=None,
                     device=device,
@@ -984,8 +1279,7 @@ def train(
                 if False:  # save parameters to pkl
                     import pickle
 
-                    temp_fname = cfg.run.name.replace(
-                        "/", "_") + f"_tes_plots.pkl"
+                    temp_fname = cfg.run.name.replace("/", "_") + f"_tes_plots.pkl"
                     data = {
                         "pc_condition": pc_condition,
                         "xts": xts,
@@ -1005,8 +1299,7 @@ def train(
                 cd_loss, _ = chamfer_distance(sampled_point, pc_condition)
                 new_cds.append((epoch, cd_loss.item()))
 
-                writer.add_scalars(
-                    "CD_condition", {f"ema/0": cd_loss.item()}, epoch)
+                writer.add_scalars("CD_condition", {f"ema/0": cd_loss.item()}, epoch)
 
                 for alpha in cd_emas:
                     if cd_emas[alpha] is None:
@@ -1019,8 +1312,7 @@ def train(
                     #     f"CD_condition/ema/{alpha}", prev_cd_emas[alpha], epoch
                     # )
                     writer.add_scalars(
-                        "CD_condition", {
-                            f"ema/{alpha:.4e}": cd_emas[alpha]}, epoch
+                        "CD_condition", {f"ema/{alpha:.4e}": cd_emas[alpha]}, epoch
                     )
                 plot_sample_condition(
                     pc_condition.cpu(),
@@ -1031,15 +1323,31 @@ def train(
                     epoch,
                     None,
                     0.1,
-                    cam_wires_trans=get_camera_wires_trans(
-                        camera[0]).detach().cpu(),
+                    cam_wires_trans=get_camera_wires_trans(camera[0]).detach().cpu(),
                     image_rgb=image_rgb[:1].detach().cpu(),
                     # mask=mask[:1].detach().cpu() if mask is not None else None,
                     depths=depths,
                     cd=cd_loss.item(),
+                    data_mean=dataloader.dataset.data_mean,
+                    data_std=dataloader.dataset.data_std,
                 )
                 if not already_image_mask:
-                    plot_image_depth(
+                    plot_image_depth_projected(
+                        pc_condition.cpu(),
+                        cfg,
+                        None,
+                        0.1,
+                        camera=camera[0],
+                        image_rgb=image_rgb[:1].detach().cpu(),
+                        # depth_image=mask[:1].detach().cpu( ) if mask is not None else None,
+                        depth_image=(
+                            depths[:1].detach().cpu() if depths is not None else None
+                        ),
+                        data_mean=dataloader.dataset.data_mean,
+                        data_std=dataloader.dataset.data_std,
+                    )
+                    if False:
+                        plot_image_depth(
                         pc_condition.cpu(),
                         cfg,
                         None,
@@ -1049,11 +1357,12 @@ def train(
                         .cpu(),
                         image_rgb=image_rgb[:1].detach().cpu(),
                         # depth_image=mask[:1].detach().cpu( ) if mask is not None else None,
-                        depth_image=depths[:1].detach().cpu(),
+                        depth_image=(
+                            depths[:1].detach().cpu() if depths is not None else None
+                        ),
                     )
 
-            log_utils(log_type="dynamic", model=model,
-                      writer=writer, epoch=epoch)
+            log_utils(log_type="dynamic", model=model, writer=writer, epoch=epoch)
 
         save_checkpoint(
             model,
@@ -1067,7 +1376,40 @@ def train(
         return loss_emas, cd_emas
 
 
+def apply_conditioning_to_xt(
+    cfg: ProjectConfig,
+    x_t,
+    camera,
+    image_rgb,
+    depths,
+    mask,
+    t,
+    pcpm: PointCloudProjectionModel,
+):
+
+    if cfg.model.condition_source == "unconditional_filter":
+        return x_t
+    elif cfg.model.condition_source in ["image_rgb_filter", "depth_filter"]:
+        if cfg.model.condition_source == "image_rgb_filter":  # or depth
+            cond_data = image_rgb
+        elif cfg.model.condition_source == "depth_filter":  # B,c,w,h
+            # repeat number of channels
+            # print("depths", depths.shape)
+            # print("image_rgb", image_rgb.shape)
+            cond_data = depths.repeat(1, 3, 1, 1)
+            # print("depths_rep", depths_rep.shape)
+        return pcpm.get_input_with_conditioning(
+            x_t, camera=camera, image_rgb=cond_data, mask=mask, t=torch.tensor([t])
+        )
+    else:
+        raise ValueError(
+            f"cfg.model.condition_source {cfg.model.condition_source} not supported, must be 'image_rgb_filter' or 'depth_filter' or  'unconditional_filter'"
+        )
+
+
 # Sampling function
+
+
 @torch.no_grad()
 def sample(
     model,
@@ -1075,14 +1417,21 @@ def sample(
     cfg: ProjectConfig,
     camera=None,
     image_rgb=None,
+    depths=None,
     mask=None,
     color_channels=None,
     predict_color=False,
     num_inference_steps=None,
     device="cpu",
     pcpm: PointCloudProjectionModel = None,
+    data_mean=torch.tensor([0, 0, 0]),
+    data_std=torch.tensor([1, 1, 1]),
 ):
     evolution_freq = cfg.run.evolution_freq
+
+    data_mean = data_mean.to(device).float()
+    data_std = data_std.to(device).float()
+
     assert (
         camera is not None and image_rgb is not None
     ), "camera, image_rgb must be provided"
@@ -1114,19 +1463,18 @@ def sample(
     ):
 
         # Conditioning
-        x_t_input = pcpm.get_input_with_conditioning(
-            x_t, camera=camera, image_rgb=image_rgb, mask=mask, t=torch.tensor([
-                                                                               t])
+
+        # use mean and std to scale x_t
+        if cfg.dataset.is_scaled:
+            x_t = x_t * data_std + data_mean
+
+        x_t_input = apply_conditioning_to_xt(
+            cfg, x_t, camera, image_rgb, depths, mask, t, pcpm
         )
-        # print("dev t", t.device)
-        # print("dev x_t_input", x_t_input.device)
-        # print("dev camera", camera.device)
-        # print("dev image_rgb", image_rgb.device)
-        # print("dev mask", mask.device)
-        # dev x_t_input cuda:0
-        # dev camera cuda:0
-        # dev image_rgb cuda:0
-        # dev mask cuda:0
+
+        if cfg.dataset.is_scaled:
+            # scale back the first 3 dimensions
+            x_t_input[:, :, :3] = (x_t_input[:, :, :3] - data_mean) / data_std
 
         noise_pred = model(x_t_input, t.reshape(1).expand(B))
 
@@ -1134,8 +1482,7 @@ def sample(
 
         # Convert output back into a point cloud, undoing normalization and scaling
         output_prev = (
-            pcpm.tensor_to_point_cloud(
-                x_t.prev_sample, denormalize=True, unscale=True)
+            pcpm.tensor_to_point_cloud(x_t.prev_sample, denormalize=True, unscale=True)
             .points_padded()
             .to(device)
         )
@@ -1146,13 +1493,6 @@ def sample(
             .points_padded()
             .to(device)
         )
-        # print("dev noise_pred", noise_pred.device)
-        # print("dev output_prev", output_prev.device)
-        # print("dev output_original_sample", output_original_sample.device)
-
-        # dev noise_pred cuda:0
-        # dev output_prev cuda:0
-        # dev output_original_sample cuda:0
 
         x_t = x_t.prev_sample
         # print("dev x_t", x_t.device)
@@ -1169,106 +1509,12 @@ def sample(
         xs.append(output_prev)
         steps.append(0)
         x0t.append(output_original_sample)
-    # print("shape xs", len(xs), "shape steps", len(steps), "shape x0t", len(x0t))
-    # print("shape xs", xs[0].shape, "shape steps", steps[0].shape, "shape x0t", x0t[0].shape)
-    # shape xs 6 shape steps 6 shape x0t 6
-    # shape xs torch.Size([1, 128, 3]) shape steps torch.Size([]) shape x0t torch.Size([1, 128, 3])
+
     xs = torch.concat(xs, dim=0)
     steps = torch.tensor(steps)
     x0t = torch.concat(x0t, dim=0)
-    # print("shape xs", xs.shape, "shape steps", steps.shape, "shape x0t", x0t.shape)
-    # print('device xs', xs.device, 'device steps', steps.device, 'device x0t', x0t.device)
-    # shape xs torch.Size([6, 128, 3]) shape steps torch.Size([6]) shape x0t torch.Size([6, 128, 3])
-    # device xs cuda:0 device steps cpu device x0t cuda:0
+
     return output_prev, xs, x0t, steps
-
-
-# def match_args(cfg1: CO3DConfig, cfg2: CO3DConfig):
-#     if cfg1.run.seed != cfg2.run.seed:
-#         print("seed mismatch", cfg1.run.seed, cfg2.run.seed)
-#     if cfg1.run.num_inference_steps != cfg2.run.num_inference_steps:
-#         print(
-#             "num_inference_steps mismatch",
-#             cfg1.run.num_inference_steps,
-#             cfg2.run.num_inference_steps,
-#         )
-#     if cfg1.dataset.image_size != cfg2.dataset.image_size:
-#         print("image_size mismatch", cfg1.dataset.image_size,
-#               cfg2.dataset.image_size)
-#     if cfg1.model.beta_schedule != cfg2.model.beta_schedule:
-#         print(
-#             "beta_schedule mismatch", cfg1.model.beta_schedule, cfg2.model.beta_schedule
-#         )
-#     if cfg1.model.point_cloud_model_embed_dim != cfg2.model.point_cloud_model_embed_dim:
-#         print(
-#             "point_cloud_model_embed_dim mismatch",
-#             cfg1.model.point_cloud_model_embed_dim,
-#             cfg2.model.point_cloud_model_embed_dim,
-#         )
-#     if cfg1.dataset.category != cfg2.dataset.category:
-#         print("category mismatch", cfg1.dataset.category, cfg2.dataset.category)
-#     if cfg1.dataset.type != cfg2.dataset.type:
-#         print("type mismatch", cfg1.dataset.type, cfg2.dataset.type)
-#     if cfg1.dataset.max_points != cfg2.dataset.max_points:
-#         print("max_points mismatch", cfg1.dataset.max_points,
-#               cfg2.dataset.max_points)
-#     if cfg1.optimizer.lr != cfg2.optimizer.lr:
-#         print("lr mismatch", cfg1.optimizer.lr, cfg2.optimizer.lr)
-#     if cfg1.dataloader.batch_size != cfg2.dataloader.batch_size:
-#         print(
-#             "batch_size mismatch",
-#             cfg1.dataloader.batch_size,
-#             cfg2.dataloader.batch_size,
-#         )
-#     if cfg1.dataloader.num_scenes != cfg2.dataloader.num_scenes:
-#         print(
-#             "num_scenes mismatch",
-#             cfg1.dataloader.num_scenes,
-#             cfg2.dataloader.num_scenes,
-#         )
-#     if cfg1.loss.loss_type != cfg2.loss.loss_type:
-#         print("loss_type mismatch", cfg1.loss.loss_type, cfg2.loss.loss_type)
-#     if cfg1.optimizer.name != cfg2.optimizer.name:
-#         print("name mismatch", cfg1.optimizer.name, cfg2.optimizer.name)
-#     if cfg1.optimizer.weight_decay != cfg2.optimizer.weight_decay:
-#         print(
-#             "weight_decay mismatch",
-#             cfg1.optimizer.weight_decay,
-#             cfg2.optimizer.weight_decay,
-#         )
-#     if cfg1.optimizer.kwargs.betas[0] != cfg2.optimizer.kwargs.betas[0]:
-#         print(
-#             "beta1 mismatch",
-#             cfg1.optimizer.kwargs.betas[0],
-#             cfg2.optimizer.kwargs.betas[0],
-#         )
-#     if cfg1.optimizer.kwargs.betas[1] != cfg2.optimizer.kwargs.betas[1]:
-#         print(
-#             "beta2 mismatch",
-#             cfg1.optimizer.kwargs.betas[1],
-#             cfg2.optimizer.kwargs.betas[1],
-#         )
-
-
-#     return (
-#         cfg1.run.seed == cfg2.run.seed
-#         and cfg1.run.num_inference_steps == cfg2.run.num_inference_steps
-#         and cfg1.dataset.image_size == cfg2.dataset.image_size
-#         and cfg1.model.beta_schedule == cfg2.model.beta_schedule
-#         and cfg1.model.point_cloud_model_embed_dim
-#         == cfg2.model.point_cloud_model_embed_dim
-#         and cfg1.dataset.category == cfg2.dataset.category
-#         and cfg1.dataset.type == cfg2.dataset.type
-#         and cfg1.dataset.max_points == cfg2.dataset.max_points
-#         and cfg1.optimizer.lr == cfg2.optimizer.lr
-#         and cfg1.dataloader.batch_size == cfg2.dataloader.batch_size
-#         and cfg1.dataloader.num_scenes == cfg2.dataloader.num_scenes
-#         and cfg1.loss.loss_type == cfg2.loss.loss_type
-#         and cfg1.optimizer.name == cfg2.optimizer.name
-#         and cfg1.optimizer.weight_decay == cfg2.optimizer.weight_decay
-#         and cfg1.optimizer.kwargs.betas[0] == cfg2.optimizer.kwargs.betas[0]
-#         and cfg1.optimizer.kwargs.betas[1] == cfg2.optimizer.kwargs.betas[1]
-#     )
 
 
 # PVCNN-Based
@@ -1310,11 +1556,15 @@ class PVCNNDiffusionModel3D(nn.Module):
         return noise_pred
 
 
-def get_astyxdataset(cfg: ProjectConfig):
+def get_astyxdataset(cfg: ProjectConfig, device="cpu"):
     # cfg1.dataloader.batch_size
     print("batch_size", cfg.dataloader.batch_size)
     train_dataset = AstyxDataset(
-        cfg.dataloader.num_scenes, cfg.dataset.max_points, "vits"
+        cfg.dataloader.num_scenes,
+        cfg.dataset.max_points,
+        "vits",
+        device=device,
+        is_scaled=cfg.dataset.is_scaled,
     )
     dataloader_train, dataloader_val, dataloader_vis = (
         DataLoader(
@@ -1459,8 +1709,11 @@ def get_pc2dataset(cfg):
 
 def get_model(cfg: ProjectConfig, device="cpu", pcpm=None):
 
-    assert pcpm is not None, "pcpm must be provided"
-    data_dim = pcpm.in_channels
+    if cfg.model.condition_source == "unconditional_filter":
+        data_dim = 3
+    else:
+        assert pcpm is not None, "pcpm must be provided"
+        data_dim = pcpm.in_channels
     print("data_dim", data_dim)
 
     return PVCNNDiffusionModel3D(
@@ -1473,39 +1726,6 @@ def get_model(cfg: ProjectConfig, device="cpu", pcpm=None):
     ).to(device)
 
 
-# def get_checkpoint_fname(cfg: ProjectConfig, CHECKPOINT_DIR):
-#     # check checkpoint
-#     files = glob.glob(f"{CHECKPOINT_DIR}/cp_dm_*.pth")
-#     max_epoch = 0
-#     current_cp_fname = None
-#     for fname in tqdm(files):
-#         try:
-#             checkpoint = torch.load(fname)
-#             # print("checkpoint", fname)
-#             print(".", end="")
-#             if match_args(checkpoint["args"], cfg):
-#                 if (
-#                     checkpoint["args"].run.max_steps <= cfg.run.max_steps
-#                     and checkpoint["args"].run.max_steps > max_epoch
-#                 ):
-#                     max_epoch = checkpoint["args"].run.max_steps
-#                     current_cp_fname = fname
-#                     # print("current_cp", current_cp_fname)
-#                 else:
-#                     print(
-#                         "epoch in config",
-#                         checkpoint["args"].run.max_steps,
-#                         " is less than max epoch in checkpoint",
-#                         cfg.run.max_steps,
-#                         "or max epoch in checkpoint is less than max epoch in checkpoint",
-#                         max_epoch,
-#                     )
-#         except:
-#             print("error", fname)
-#             continue
-#     return current_cp_fname
-
-
 def get_loss(cfg: ProjectConfig):
     if cfg.loss.loss_type == "mse":
         return nn.MSELoss(reduction="mean")
@@ -1515,26 +1735,6 @@ def get_loss(cfg: ProjectConfig):
         return PointCloudLoss(npoints=cfg.dataset.max_points, emd_weight=1)
     else:
         raise ValueError("loss not supported")
-
-
-# def log_sample_to_tb(x, gt_pc, key, evo, epoch, writer):
-#     sampled_tensor = torch.tensor(x, dtype=torch.float)
-#     gt_pc_tensor = torch.tensor(gt_pc, dtype=torch.float)
-
-#     all_tensor = torch.cat([sampled_tensor, gt_pc_tensor], dim=0)
-
-#     color_sampled = torch.tensor(
-#         [[255, 0, 0] for _ in range(sampled_tensor.shape[0])])  # color: red
-#     color_gt = torch.tensor(
-#         [[0, 255, 0] for _ in range(gt_pc_tensor.shape[0])])  # color: green
-
-#     all_color = torch.cat([color_sampled, color_gt], dim=0)
-#     # print("shape", all_tensor.shape, all_color.shape)
-#     # add dimension to tensor to dim 0
-#     all_tensor = all_tensor.unsqueeze(0)
-#     all_color = all_color.unsqueeze(0)
-#     writer.add_mesh(f"PointCloud_{key}_{evo}", vertices=all_tensor, colors=all_color,
-#                     global_step=epoch)
 
 
 def log_utils(log_type="static", model=None, writer=None, epoch=None):
@@ -1581,8 +1781,11 @@ def log_utils(log_type="static", model=None, writer=None, epoch=None):
         data["cpu/GB_ram"] = cpu_max_ram
         # print(data)
 
+        data["host/name"] = os.uname().nodename
+
         gpu_mem_util = pynvml.nvmlDeviceGetMemoryInfo(handle)
         data["gpu/mem_utilization_total_GB"] = gpu_mem_util.total / 2**30
+
         for key, value in data.items():
             # if str, add_text, else add_scalar
             if isinstance(value, str):
@@ -1605,8 +1808,7 @@ def log_utils(log_type="static", model=None, writer=None, epoch=None):
         gpu_util = pynvml.nvmlDeviceGetUtilizationRates(handle)
         data["gpu/utilization"] = gpu_util.gpu
 
-        gpu_temp = pynvml.nvmlDeviceGetTemperature(
-            handle, pynvml.NVML_TEMPERATURE_GPU)
+        gpu_temp = pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)
         data["gpu/temperature"] = gpu_temp
 
         gpu_mem_util = pynvml.nvmlDeviceGetMemoryInfo(handle)
@@ -1661,45 +1863,49 @@ def log_utils(log_type="static", model=None, writer=None, epoch=None):
 
 
 def match_args_json(cfg1, cfg2):
-
-    return (
-        cfg1["run"]["seed"] == cfg2["run"]["seed"]
-        and cfg1["run"]["num_inference_steps"] == cfg2["run"]["num_inference_steps"]
-        and cfg1["dataset"]["image_size"] == cfg2["dataset"]["image_size"]
-        and cfg1["model"]["beta_schedule"] == cfg2["model"]["beta_schedule"]
-        and cfg1["model"]["point_cloud_model_embed_dim"]
-        == cfg2["model"]["point_cloud_model_embed_dim"]
-        and cfg1["dataset"]["category"] == cfg2["dataset"]["category"]
-        and cfg1["dataset"]["type"] == cfg2["dataset"]["type"]
-        and cfg1["dataset"]["max_points"] == cfg2["dataset"]["max_points"]
-        and cfg1["optimizer"]["lr"] == cfg2["optimizer"]["lr"]
-        and cfg1["dataloader"]["batch_size"] == cfg2["dataloader"]["batch_size"]
-        and cfg1["dataloader"]["num_scenes"] == cfg2["dataloader"]["num_scenes"]
-        and cfg1["loss"]["loss_type"] == cfg2["loss"]["loss_type"]
-        and cfg1["optimizer"]["name"] == cfg2["optimizer"]["name"]
-        and cfg1["optimizer"]["weight_decay"] == cfg2["optimizer"]["weight_decay"]
-        and cfg1["optimizer"]["kwargs"]["betas"][0]
-        == cfg2["optimizer"]["kwargs"]["betas"][0]
-        and cfg1["optimizer"]["kwargs"]["betas"][1]
-        == cfg2["optimizer"]["kwargs"]["betas"][1]
-        and cfg1["model"]["condition_source"] == cfg2["model"]["condition_source"]
-        # and cfg1.run.num_inference_steps == cfg2.run.num_inference_steps
-        # and cfg1.dataset.image_size == cfg2.dataset.image_size
-        # and cfg1.model.beta_schedule == cfg2.model.beta_schedule
-        # and cfg1.model.point_cloud_model_embed_dim
-        # == cfg2.model.point_cloud_model_embed_dim
-        # and cfg1.dataset.category == cfg2.dataset.category
-        # and cfg1.dataset.type == cfg2.dataset.type
-        # and cfg1.dataset.max_points == cfg2.dataset.max_points
-        # and cfg1.optimizer.lr == cfg2.optimizer.lr
-        # and cfg1.dataloader.batch_size == cfg2.dataloader.batch_size
-        # and cfg1.dataloader.num_scenes == cfg2.dataloader.num_scenes
-        # and cfg1.loss.loss_type == cfg2.loss.loss_type
-        # and cfg1.optimizer.name == cfg2.optimizer.name
-        # and cfg1.optimizer.weight_decay == cfg2.optimizer.weight_decay
-        # and cfg1.optimizer.kwargs.betas[0] == cfg2.optimizer.kwargs.betas[0]
-        # and cfg1.optimizer.kwargs.betas[1] == cfg2.optimizer.kwargs.betas[1]
-    )
+    try:
+        return (
+            cfg1["run"]["seed"] == cfg2["run"]["seed"]
+            and cfg1["run"]["num_inference_steps"] == cfg2["run"]["num_inference_steps"]
+            and cfg1["dataset"]["image_size"] == cfg2["dataset"]["image_size"]
+            and cfg1["dataset"]["is_scaled"] == cfg2["dataset"]["is_scaled"]
+            and cfg1["model"]["beta_schedule"] == cfg2["model"]["beta_schedule"]
+            and cfg1["model"]["point_cloud_model_embed_dim"]
+            == cfg2["model"]["point_cloud_model_embed_dim"]
+            and cfg1["dataset"]["category"] == cfg2["dataset"]["category"]
+            and cfg1["dataset"]["type"] == cfg2["dataset"]["type"]
+            and cfg1["dataset"]["max_points"] == cfg2["dataset"]["max_points"]
+            and cfg1["optimizer"]["lr"] == cfg2["optimizer"]["lr"]
+            and cfg1["dataloader"]["batch_size"] == cfg2["dataloader"]["batch_size"]
+            and cfg1["dataloader"]["num_scenes"] == cfg2["dataloader"]["num_scenes"]
+            and cfg1["loss"]["loss_type"] == cfg2["loss"]["loss_type"]
+            and cfg1["optimizer"]["name"] == cfg2["optimizer"]["name"]
+            and cfg1["optimizer"]["weight_decay"] == cfg2["optimizer"]["weight_decay"]
+            and cfg1["optimizer"]["kwargs"]["betas"][0]
+            == cfg2["optimizer"]["kwargs"]["betas"][0]
+            and cfg1["optimizer"]["kwargs"]["betas"][1]
+            == cfg2["optimizer"]["kwargs"]["betas"][1]
+            and cfg1["model"]["condition_source"] == cfg2["model"]["condition_source"]
+            # and cfg1.run.num_inference_steps == cfg2.run.num_inference_steps
+            # and cfg1.dataset.image_size == cfg2.dataset.image_size
+            # and cfg1.model.beta_schedule == cfg2.model.beta_schedule
+            # and cfg1.model.point_cloud_model_embed_dim
+            # == cfg2.model.point_cloud_model_embed_dim
+            # and cfg1.dataset.category == cfg2.dataset.category
+            # and cfg1.dataset.type == cfg2.dataset.type
+            # and cfg1.dataset.max_points == cfg2.dataset.max_points
+            # and cfg1.optimizer.lr == cfg2.optimizer.lr
+            # and cfg1.dataloader.batch_size == cfg2.dataloader.batch_size
+            # and cfg1.dataloader.num_scenes == cfg2.dataloader.num_scenes
+            # and cfg1.loss.loss_type == cfg2.loss.loss_type
+            # and cfg1.optimizer.name == cfg2.optimizer.name
+            # and cfg1.optimizer.weight_decay == cfg2.optimizer.weight_decay
+            # and cfg1.optimizer.kwargs.betas[0] == cfg2.optimizer.kwargs.betas[0]
+            # and cfg1.optimizer.kwargs.betas[1] == cfg2.optimizer.kwargs.betas[1]
+        )
+    except KeyError as e:
+        # print("key not found", e)
+        return False
 
 
 def get_checkpoint_fname_json(cfg: ProjectConfig, db_fname, CHECKPOINT_DIR):
@@ -1716,6 +1922,9 @@ def get_checkpoint_fname_json(cfg: ProjectConfig, db_fname, CHECKPOINT_DIR):
         for line in tqdm(f):
             dat = json.loads(line)
             # print("checking checkpoint", dat["fname"])
+            if not os.path.exists(dat["fname"]):
+                print(dat["fname"].split("/")[-1], "not found")
+                continue
             print(".", end="")
             if match_args_json(dat["args"], to_dict(cfg)):
                 if (
@@ -1739,67 +1948,17 @@ def get_checkpoint_fname_json(cfg: ProjectConfig, db_fname, CHECKPOINT_DIR):
     return current_cp_fname
 
 
-def extract_astyx_batch(batch, cfg, device, square_image_offset=int((2048 - 618) / 2)):
+def get_dataset(cfg: ProjectConfig, device="cpu"):
 
-    depths, radar_data, camera_bases, camera_rgb, objects, idxs, npoints = batch
-
-    square_image_offset = int(square_image_offset)
-
-    assert (
-        0 <= square_image_offset <= 2048 - 618
-    ), "square_image_offset must be between 0 and 2048-618"
-    # image shaoe torch.Size([2, 3, 618, 2048])
-    # print("image shaoe", camera_rgb.shape)
-    # print("square_image_offset", square_image_offset)
-    # pick on the the middle 618x618
-    new_camera_rgb = camera_rgb[
-        :, :, :, square_image_offset: square_image_offset + 618
-    ]
-    # print("new_camera_rgb", new_camera_rgb.shape)
-
-    new_depths = depths[:, :, square_image_offset: square_image_offset + 618]
-    # duplicate axis 1 to 3 dim
-
-    principal_points = camera_bases.principal_point
-    principal_points -= torch.tensor(
-        [square_image_offset, 0], device=camera_bases.device
-    )
-    new_camera_bases = PerspectiveCameras(
-        focal_length=camera_bases.focal_length,
-        principal_point=principal_points,
-        R=camera_bases.R,
-        T=camera_bases.T,
-        device=camera_bases.device,
-    )
-
-    pc = Pointclouds(points=radar_data.float().to(device))
-    # pc, camera, image_rgb, mask
-
-    if cfg.model.condition_source == "image_rgb":
-        pass
-    elif cfg.model.condition_source == "depth":
-        new_camera_rgb = new_depths.unsqueeze(1).repeat(1, 3, 1, 1)
-
-    return (
-        pc,
-        new_camera_bases.to(device),
-        new_camera_rgb.to(device),
-        None,
-        new_depths.to(device),
-    )
-
-
-def extract_co3d_batch(batch, device):
-    # pc = batch.point_clouds.points_padded().to(device)
-    # camera = batch.cameras.to(device)
-    # image_rgb = batch.images_rgb.to(device)
-    # mask = batch.images_mask.to(device)
-    batch = batch.to(device)
-    pc = batch.sequence_point_cloud
-    camera = batch.camera
-    image_rgb = batch.image_rgb
-    mask = batch.fg_probability
-    return pc, camera, image_rgb, mask
+    if cfg.dataset.type == "astyx":
+        dataloader_train, _, _ = get_astyxdataset(cfg, device)
+    elif cfg.dataset.type == "co3dv2":
+        dataloader_train, _, _ = get_pc2dataset(cfg)
+    else:
+        raise ValueError(
+            f"dataset type {cfg.dataset.type} not supported, must be 'astyx' or 'co3dv2'"
+        )
+    return dataloader_train
 
 
 @hydra.main(config_path="config", config_name="config", version_base="1.1")
@@ -1834,7 +1993,25 @@ def main(cfg: ProjectConfig):
         scale_factor=cfg.model.scale_factor,
     ).to(device)
 
-    dataloader_train, _, _ = get_astyxdataset(cfg)
+    dataloader_train = get_dataset(cfg, device=device)
+
+    if False:
+
+        batch = next(iter(dataloader_train))
+
+        # depths, radar_data, camera, image_rgb, objects, idx, npoints, npoints_filtered, offsets = batch
+
+        pc, camera, image_rgb, mask, depths = extract_batch(cfg, batch, device)
+        fname = f"/home/palakons/from_scratch/plot_at_load.png"
+        plot_image_depth_projected(
+            radar_data[:1],
+            None,
+            fname,
+            point_size=1,
+            camera=camera.to(device)[0],
+            image_rgb=image_rgb[:1],
+            depth_image=depths[:1],
+        )
 
     model = get_model(cfg, device=device, pcpm=pcpm)
 
@@ -1875,6 +2052,9 @@ def main(cfg: ProjectConfig):
             current_cp_fname = get_checkpoint_fname_json(
                 cfg, CHECKPOINT_DB_FILE, CHECKPOINT_DIR
             )
+    else:
+        print("CFG dictates not resuming training from checkpoint")
+
     prev_cds, prev_losses = [], []
     if current_cp_fname is not None:
         current_cp = torch.load(current_cp_fname)
@@ -1915,14 +2095,16 @@ def main(cfg: ProjectConfig):
     )
 
     metric_dict = {f"Loss/ema/{k}": loss_emas[k] for k in loss_emas}
-    metric_dict.update({f"CD_condition/ema/{k}": cd_emas[k] for k in cd_emas})
+    # if cd_emas is not None:
+    ema_none = len([k for k in cd_emas if cd_emas[k] is None]) > 0
+    if not ema_none:
+        metric_dict.update({f"CD_condition/ema/{k}": cd_emas[k] for k in cd_emas})
 
     # Sample from the model
 
     batch = next(iter(dataloader_train))
-    # batch = batch.to(device)
-    pc, camera, image_rgb, mask, depths = extract_astyx_batch(
-        batch, cfg, device=device)
+
+    pc, camera, image_rgb, mask, depths = extract_batch(cfg, batch, device)
 
     samples = {}
     for i in [1, 5, 10, 50, 100, scheduler.config.num_train_timesteps]:
@@ -1932,6 +2114,7 @@ def main(cfg: ProjectConfig):
             cfg,
             camera=camera[0],
             image_rgb=image_rgb[:1],
+            depths=depths[:1] if depths is not None else None,
             mask=mask[:1] if mask is not None else None,
             num_inference_steps=i,
             device=device,
@@ -1940,8 +2123,7 @@ def main(cfg: ProjectConfig):
 
     if True:  # Evo plots
         # make the plot that will be logged to tb
-        gt_cond_pc = pcpm.point_cloud_to_tensor(
-            pc[:1], normalize=True, scale=True)
+        gt_cond_pc = pcpm.point_cloud_to_tensor(pc[:1], normalize=True, scale=True)
         # print("samples_updated", samples_updated.shape)
         # print("gt_cond_pc", gt_cond_pc.shape)
         # samples_updated torch.Size([1, 128, 3])

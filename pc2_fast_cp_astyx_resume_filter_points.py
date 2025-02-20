@@ -220,6 +220,7 @@ class AstyxDataset(Dataset):
             objects = json.load(f)
 
         # print("shapes: ", depth.shape, filtered_radar_data.shape, camera_front.shape,len(objects),len(idx),npoints)
+        print(f"idx {idx} npoints_original {npoints_original} npoints_filtered {npoints_filtered} square_image_offset {square_image_offset}")
 
         return (
             depth,
@@ -392,8 +393,9 @@ def train_one_epoch(
         # print("mask device", mask.device)
 
         x_t = scheduler.add_noise(x_0, noise, timesteps)  # noisy_x
-        
-        x_t_input = apply_conditioning_to_xt(cfg, x_t, camera, image_rgb, depths, mask, timesteps, pcpm)
+
+        x_t_input = apply_conditioning_to_xt(
+            cfg, x_t, camera, image_rgb, depths, mask, timesteps, pcpm)
         # if cfg.model.condition_source == "image_rgb_filter":  # or depth
         #     cond_data = image_rgb
         # elif cfg.model.condition_source == "depth_filter":  # B,c,w,h
@@ -1251,11 +1253,11 @@ def train(
         )
         return loss_emas, cd_emas
 
+
 def apply_conditioning_to_xt(cfg: ProjectConfig, x_t, camera, image_rgb, depths, mask, t, pcpm: PointCloudProjectionModel):
-    
+
     if cfg.model.condition_source == "unconditional_filter":
-        cond_data = None
-        x_t_input = x_t
+        return x_t
     elif cfg.model.condition_source in ["image_rgb_filter", "depth_filter"]:
         if cfg.model.condition_source == "image_rgb_filter":  # or depth
             cond_data = image_rgb
@@ -1265,17 +1267,18 @@ def apply_conditioning_to_xt(cfg: ProjectConfig, x_t, camera, image_rgb, depths,
             # print("image_rgb", image_rgb.shape)
             cond_data = depths.repeat(1, 3, 1, 1)
             # print("depths_rep", depths_rep.shape)
-        x_t_input = pcpm.get_input_with_conditioning(
+        return pcpm.get_input_with_conditioning(
             x_t, camera=camera, image_rgb=cond_data, mask=mask, t=torch.tensor([
-                                                                            t])
+                t])
         )
     else:
         raise ValueError(
             f"cfg.model.condition_source {cfg.model.condition_source} not supported, must be 'image_rgb_filter' or 'depth_filter' or  'unconditional_filter'"
         )
-    return x_t_input
 
 # Sampling function
+
+
 @torch.no_grad()
 def sample(
     model,
@@ -1323,7 +1326,8 @@ def sample(
     ):
 
         # Conditioning
-        x_t_input = apply_conditioning_to_xt(cfg, x_t, camera, image_rgb, depths, mask, t, pcpm)
+        x_t_input = apply_conditioning_to_xt(
+            cfg, x_t, camera, image_rgb, depths, mask, t, pcpm)
         # if cfg.model.condition_source == "unconditional_filter":
         #     cond_data = None
         #     x_t_input = x_t
@@ -1344,8 +1348,6 @@ def sample(
         #     raise ValueError(
         #         f"cfg.model.condition_source {cfg.model.condition_source} not supported, must be 'image_rgb_filter' or 'depth_filter' or  'unconditional_filter'"
         #     )
-        
-
 
         noise_pred = model(x_t_input, t.reshape(1).expand(B))
 
@@ -1647,7 +1649,7 @@ def log_utils(log_type="static", model=None, writer=None, epoch=None):
         cpu_max_ram = psutil.virtual_memory().total / 2**30
         data["cpu/GB_ram"] = cpu_max_ram
         # print(data)
-        
+
         data["host/name"] = os.uname().nodename
 
         gpu_mem_util = pynvml.nvmlDeviceGetMemoryInfo(handle)
