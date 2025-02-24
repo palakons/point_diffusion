@@ -501,21 +501,15 @@ def train_one_epoch(
         x_t = scheduler.add_noise(x_0, noise, timesteps)  # noisy_x
         # print("type x_t", type(x_t))
         # print("dtype x_t", x_t.dtype)
-        if cfg.dataset.is_scaled:
-            x_t = x_t * data_std + data_mean
-        # print("type x_t", type(x_t))
-        # print("dtype x_t", x_t.dtype)
-        # convert to float32
-        # x_t = x_t.float()
-        # print("dtype x_t", x_t.dtype)
+        
 
         x_t_input = apply_conditioning_to_xt(
-            cfg, x_t, camera, image_rgb, depths, mask, timesteps, pcpm
+            cfg, (x_t * data_std + data_mean) if cfg.dataset.is_scaled else x_t, camera, image_rgb, depths, mask, timesteps, pcpm
         )
 
         if cfg.dataset.is_scaled:
             # scale back the first 3 dimensions
-            x_t_input[:, :, :3] = (x_t_input[:, :, :3] - data_mean) / data_std
+            x_t_input[:, :, :3] = x_t[:, :, :3] 
 
         optimizer.zero_grad()
         noise_pred = model(x_t_input, timesteps)
@@ -988,18 +982,14 @@ def plot_sample_condition(
         fname = f"{dir_name}/sample_ep_{epoch:05d}.png"
     # print("plot_sample_condition fname", fname)
 
+        
     gt = gt.numpy()[0]
     xt = xts[-1].numpy()
 
+
     if cfg.dataset.is_scaled:
-        print("data_mean", data_mean)
-        print("data_std", data_std)
-        print("gt", gt.shape, gt[0])
-        print("xt", xt.shape, xt[0])
         gt = gt * data_std + data_mean
         xt = xt * data_std + data_mean
-        print("gt", gt.shape, gt[0])
-        print("xt", xt.shape, xt[0])
 
     x_equal_lim, y_equal_lim, z_equal_lim = plot_quadrants(
         [gt, xt],
@@ -1141,7 +1131,9 @@ def train(
 
         pc_condition = pcpm.point_cloud_to_tensor(
             pc[:1], normalize=True, scale=True)
-        cd_loss, _ = chamfer_distance(sampled_point, pc_condition)
+
+        cd_loss, _ = calculate_chamfer_distance(
+            cfg.dataset.is_scaled, dataloader.dataset.data_mean, dataloader.dataset.data_std, sampled_point, pc_condition, device)
 
         writer.add_scalar("CD_condition", cd_loss.item(), epoch)
         plot_sample_condition(
@@ -1318,7 +1310,9 @@ def train(
                     print("saved at", f"outputs/{temp_fname}")
                     exit()
 
-                cd_loss, _ = chamfer_distance(sampled_point, pc_condition)
+                cd_loss, _ = calculate_chamfer_distance(
+                    cfg.dataset.is_scaled, dataloader.dataset.data_mean, dataloader.dataset.data_std, sampled_point, pc_condition, device)
+
                 new_cds.append((epoch, cd_loss.item()))
 
                 writer.add_scalars(
@@ -1338,6 +1332,8 @@ def train(
                         "CD_condition", {
                             f"ema/{alpha:.4e}": cd_emas[alpha]}, epoch
                     )
+                print("shaep   ", xts.shape)
+                print("xts[0]",xts[0][0])
                 plot_sample_condition(
                     pc_condition.cpu(),
                     xts.cpu(),
@@ -1492,18 +1488,14 @@ def sample(
     ):
 
         # Conditioning
-
-        # use mean and std to scale x_t
-        if cfg.dataset.is_scaled:
-            x_t = x_t * data_std + data_mean
-
         x_t_input = apply_conditioning_to_xt(
-            cfg, x_t, camera, image_rgb, depths, mask, t, pcpm
+            cfg, (x_t * data_std + data_mean) if  cfg.dataset.is_scaled else x_t    , camera, image_rgb, depths, mask, t, pcpm
         )
 
         if cfg.dataset.is_scaled:
             # scale back the first 3 dimensions
-            x_t_input[:, :, :3] = (x_t_input[:, :, :3] - data_mean) / data_std
+            x_t_input[:, :, :3] = x_t[:, :, :3] 
+
 
         noise_pred = model(x_t_input, t.reshape(1).expand(B))
 
@@ -1531,7 +1523,6 @@ def sample(
         if (
             evolution_freq is not None and i % evolution_freq == 0
         ) or i == num_inference_steps - 1:
-
             xs.append(output_prev)
             steps.append(t)
             x0t.append(output_original_sample)
@@ -1950,7 +1941,9 @@ def get_checkpoint_fname_json(cfg: ProjectConfig, db_fname, CHECKPOINT_DIR):
     print("db_fname", db_fname)
     print("exists", os.path.exists(db_fname))
     with open(db_fname, "r") as f:
-        for line in tqdm(f):
+        #extract all lines to a list
+        lines = f.readlines()
+        for line in tqdm(lines):
             dat = json.loads(line)
             # print("checking checkpoint", dat["fname"])
             if not os.path.exists(dat["fname"]):
@@ -1992,6 +1985,19 @@ def get_dataset(cfg: ProjectConfig, device="cpu"):
     return dataloader_train
 
 
+def calculate_chamfer_distance(is_scaled, mean, std, gt, pred, device):
+    mean = mean.to(device)
+    std = std.to(device)
+    gt = gt.to(device)
+    pred = pred.to(device)
+
+    # gt, pred: B,N,3
+    if is_scaled:
+        gt = gt * std + mean
+        pred = pred * std + mean
+    return chamfer_distance(gt, pred)
+
+
 @hydra.main(config_path="config", config_name="config", version_base="1.1")
 def main(cfg: ProjectConfig):
     # print(cfg)
@@ -2025,6 +2031,8 @@ def main(cfg: ProjectConfig):
     ).to(device)
 
     dataloader_train = get_dataset(cfg, device=device)
+    
+    writer.add_text("data/ids", str(dataloader_train.dataset.active_ids))
 
     if False:
 
@@ -2105,6 +2113,7 @@ def main(cfg: ProjectConfig):
 
     log_utils(log_type="static", model=model, writer=writer, epoch=None)
 
+    assert cfg.loss.loss_type == "mse", "only mse supported"
     criterion = get_loss(cfg)
     # Train the model
     loss_emas, cd_emas = train(
@@ -2168,10 +2177,9 @@ def main(cfg: ProjectConfig):
 
         for key, value in samples.items():
             samples_updated = samples[key][0]
-            cd_loss, _ = chamfer_distance(
-                gt_cond_pc.to(device),
-                samples_updated.to(device),
-            )
+
+            cd_loss, _ = calculate_chamfer_distance(
+                cfg.dataset.is_scaled, dataloader_train.dataset.data_mean, dataloader_train.dataset.data_std, gt_cond_pc, samples_updated, device)
 
             print(
                 key,
@@ -2182,10 +2190,10 @@ def main(cfg: ProjectConfig):
             error = []
             assert len(samples[key][1]) > 1, "need more than 1 sample to plot"
             for x in samples[key][1]:
-                cd_loss, _ = chamfer_distance(
-                    gt_cond_pc.to(device),
-                    x.unsqueeze(0).to(device),
-                )
+
+                cd_loss, _ = calculate_chamfer_distance(
+                    cfg.dataset.is_scaled, dataloader_train.dataset.data_mean, dataloader_train.dataset.data_std, gt_cond_pc, x.unsqueeze(0), device)
+
                 error.append(cd_loss.item())
             # ax = plt.plot(error, label=key)
             plt.plot(
