@@ -1,11 +1,9 @@
-import logging
 from pytorch3d.structures import Pointclouds
 import hydra
 import glob
 from datetime import datetime
 from pathlib import Path
 import inspect
-import time
 from pytorch3d.vis.plotly_vis import get_camera_wireframe
 
 from pytorch3d.implicitron.dataset.json_index_dataset_map_provider_v2 import (
@@ -28,8 +26,7 @@ import numpy as np
 import random
 from torch.utils.tensorboard import SummaryWriter
 from model.point_cloud_model import PointCloudModel
-from model.projection_model_time import PointCloudProjectionModel
-# from model.projection_model import PointCloudProjectionModel
+from model.projection_model import PointCloudProjectionModel
 import os
 from pytorch3d.implicitron.dataset.data_loader_map_provider import (
     SequenceDataLoaderMapProvider,
@@ -47,20 +44,6 @@ import pandas as pd
 from torch.utils.data import Dataset, DataLoader
 from pytorch3d.renderer.cameras import PerspectiveCameras
 
-CSV_TIME_FILE = "/home/palakons/from_scratch/timer.csv"
-
-# logging.basicConfig(
-#     level=logging.INFO,
-#     format="%(asctime)s,%(name)s,%(levelname)s,%(message)s",
-#     filename="/home/palakons/from_scratch/app.log",
-#     filemode='a',  # Append mode.
-# )
-logger = logging.getLogger(__name__)
-
-if logger.hasHandlers():
-    logger.handlers.clear()
-logger.propagate = False
-
 
 class AstyxDataset(Dataset):
     def __init__(
@@ -72,6 +55,7 @@ class AstyxDataset(Dataset):
         root_dir: str = "/data/palakons/dataset_astyx_hires2019/",
         device="cpu",
         is_scaled=False,
+        img_size=618,
     ):
         # root_dir: path to the directory containing the json files
         self.root_dir = root_dir
@@ -87,6 +71,7 @@ class AstyxDataset(Dataset):
         self.random_offset = random_offset
         self.device = device
         self.is_scaled = is_scaled
+        self.img_size = img_size
 
         self.ids = []
         # list filesin the radar_dir
@@ -143,6 +128,7 @@ class AstyxDataset(Dataset):
         depth = {}
         image = plt.imread(
             self.depth_dir + f"/{idx:06d}_{self.depth_model}.jpg")
+
         # if image is of 3 channels, take only the first one
         # print("image.shape: ", image.shape)
         if len(image.shape) == 3:
@@ -163,6 +149,16 @@ class AstyxDataset(Dataset):
         image_size_hw = (depth.shape[0], depth.shape[1])
         depth = depth[:,
                       square_image_offset: square_image_offset + depth.shape[0]]
+
+        # resize image to self.img_size
+
+        depth = torch.nn.functional.interpolate(
+            depth.unsqueeze(0).unsqueeze(0),
+            size=(self.img_size, self.img_size),
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(0).squeeze(0)
+
         # load radar data, .txt
         df = pd.read_csv(
             self.radar_dir + f"/{idx:06d}.txt", sep=" ", skip_blank_lines=True
@@ -179,7 +175,7 @@ class AstyxDataset(Dataset):
                 if c["sensor_uid"] == "camera_front":
                     new_camera_base = calib_to_camera_base(
                         c["calib_data"], [image_size_hw[0]] *
-                        2, square_image_offset
+                        2, square_image_offset, self.img_size
                     )
 
         assert (
@@ -197,6 +193,14 @@ class AstyxDataset(Dataset):
         camera_front = camera_front[
             :, :, square_image_offset: square_image_offset + camera_front.shape[1]
         ]
+
+        # resize image to self.img_size
+        camera_front = torch.nn.functional.interpolate(
+            camera_front.unsqueeze(0),
+            size=(self.img_size, self.img_size),
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(0)
 
         # filter points: keeps only points within the image
         # world_points = radar_data
@@ -281,7 +285,6 @@ class AstyxDataset(Dataset):
 
             return self.data_bank[idx]
 
-        st_time = time.time()
         (
             depth,
             filtered_radar_data,
@@ -293,10 +296,6 @@ class AstyxDataset(Dataset):
             npoints_filtered,
             square_image_offset,
         ) = self.data_bank[idx]
-
-        logger.info(
-            f"{os.getpid()}, __getitem__/1_data_bank, {time.time()-st_time}")
-        st_time = time.time()
 
         # print("mean", self.data_mean)
         # print("std", self.data_std)
@@ -310,7 +309,7 @@ class AstyxDataset(Dataset):
         # print("filtered_radar_data", newd[0])
         # mean tensor([38.5517, -0.2240,  1.0346], dtype=torch.float64)                                                             std tensor([20.8821,  3.5820,  1.9252], dtype=torch.float64)                                                             filtered_radar_data torch.Size([128, 3])                                                                  filtered_radar_data tensor([73.2768, -1.1732,  3.0596], dtype=torch.float64)                                                             newd torch.Size([128, 3])                                                                                                                        filtered_radar_data tensor([ 1.6629, -0.2650,  1.0518], dtype=torch.float64)
 
-        output = (
+        return (
             depth,
             (filtered_radar_data - self.data_mean) / self.data_std,
             new_camera_base,
@@ -321,15 +320,9 @@ class AstyxDataset(Dataset):
             npoints_filtered,
             square_image_offset,
         )
-        logger.info(
-            f"{os.getpid()}, __getitem__/2_norm, {time.time()-st_time}")
-
-        return output
 
 
 def custom_collate_fn(batch):
-
-    st_time = time.time()
     (
         depths,
         radar_data,
@@ -342,27 +335,15 @@ def custom_collate_fn(batch):
         square_image_offset,
     ) = zip(*batch)
 
-    logger.info(
-        f"{os.getpid()}, custom_collate_fn/1_zip, {time.time()-st_time}")
-    st_time = time.time()
-
     npoints_after = torch.as_tensor(npoints)
     npoints_filtered_after = torch.as_tensor(npoints_filtered)
     idxs_after = torch.as_tensor(idxs)
     square_image_offset_after = torch.as_tensor(square_image_offset)
 
-    logger.info(
-        f"{os.getpid()},custom_collate_fn/2_as_tensor,{time.time()-st_time}")
-    st_time = time.time()
-
     objects_after = list(objects)
     camera_fronts_after = torch.stack(camera_fronts)
     radar_data_after = torch.stack(radar_data)
     depths_after = torch.stack(depths)
-
-    logger.info(
-        f"{os.getpid()},custom_collate_fn/3_stack,{time.time()-st_time}")
-    st_time = time.time()
 
     focal_length = []
     principal_point = []
@@ -383,10 +364,6 @@ def custom_collate_fn(batch):
     Ts = torch.concat(T)
     image_sizes_hw = torch.concat(image_sizes_hw)
 
-    logger.info(
-        f"{os.getpid()},custom_collate_fn/4_prepare,{time.time()-st_time}")
-    st_time = time.time()
-
     # print("image_sizes_hw: ", image_sizes_hw)
 
     camera_bases = PerspectiveCameras(
@@ -397,9 +374,6 @@ def custom_collate_fn(batch):
         in_ndc=False,
         image_size=image_sizes_hw,
     )
-
-    logger.info(
-        f"{os.getpid()},custom_collate_fn/5_PerspectiveCameras,{time.time()-st_time}")
 
     return (
         depths_after,
@@ -479,10 +453,19 @@ def custom_collate_fn_org(batch):
     )
 
 
-def calib_to_camera_base(calibration_data, image_size_hw: tuple, offset: int = 0):
+def calib_to_camera_base(calibration_data, image_size_hw: tuple, offset: int = 0, image_size: int = 618):
 
+    s = image_size/618
     # Convert intrinsic matrix K to tensor
     K = torch.tensor(calibration_data["K"])
+
+    K[0, 0] = K[0, 0] * s
+    K[1, 1] = K[1, 1] * s
+
+    K[0, 2] = K[0, 2] * s
+    K[1, 2] = K[1, 2] * s
+
+    offset = offset * s
 
     # Extract focal length and principal point from K
     focal_length = torch.tensor([[K[0, 0], K[1, 1]]])
@@ -598,23 +581,12 @@ def train_one_epoch(
     data_std = dataloader.dataset.data_std.to(device).float()
 
     batch_losses = []
-    st_time = time.time()
     for batch in dataloader:
-
-        logger.info(f"{os.getpid()},dataloader,{time.time()-st_time}")
-        st_time = time.time()
 
         pc, camera, image_rgb, mask, depths, idx = extract_batch(
             cfg, batch, device)
 
-        logger.info(f"{os.getpid()},extract_batch,{time.time()-st_time}")
-        st_time = time.time()
-
         x_0 = pcpm.point_cloud_to_tensor(pc, normalize=True, scale=True)
-
-        logger.info(
-            f"{os.getpid()},point_cloud_to_tensor,{time.time()-st_time}")
-        st_time = time.time()
 
         B, N, D = x_0.shape
         noise = torch.randn_like(x_0)
@@ -640,10 +612,6 @@ def train_one_epoch(
             pcpm,
         )
 
-        logger.info(
-            f"{os.getpid()},apply_conditioning_to_xt,{time.time()-st_time}")
-        st_time = time.time()
-
         if cfg.dataset.is_scaled:
             # scale back the first 3 dimensions
             x_t_input[:, :, :3] = x_t[:, :, :3]
@@ -651,24 +619,13 @@ def train_one_epoch(
         optimizer.zero_grad()
         noise_pred = model(x_t_input, timesteps)
 
-        logger.info(f"{os.getpid()},forward,{time.time()-st_time}")
-        st_time = time.time()
-
         if not noise_pred.shape == noise.shape:
             raise ValueError(f"{noise_pred.shape} and {noise.shape} not equal")
 
         loss = criterion(noise_pred, noise)
         loss.backward()
-
-        logger.info(f"{os.getpid()},backward,{time.time()-st_time}")
-        st_time = time.time()
-
         optimizer.step()
-
         batch_losses.append(loss.item())  # float
-
-        logger.info(f"{os.getpid()},step,{time.time()-st_time}")
-        st_time = time.time()
     return batch_losses
 
 
@@ -1385,7 +1342,6 @@ def train(
                     "Loss/average", {f"ema_{alpha:.2e}": losses}, epoch)
 
             if (epoch + 1) % cfg.run.checkpoint_freq == 0:
-                st_time = time.time()
                 temp_epochs = cfg.run.max_steps
                 cfg.run.max_steps = epoch + 1
 
@@ -1417,9 +1373,6 @@ def train(
                 )
 
                 cfg.run.max_steps = temp_epochs
-
-                logger.info(
-                    f"{os.getpid()},save checkpoint,{time.time()-st_time}")
             if (epoch + 1) % cfg.run.vis_freq == 0:
 
                 cd_list = []
@@ -1429,19 +1382,11 @@ def train(
                     print("creating dir", dir_name)
                     os.makedirs(dir_name)
 
-                st_time = time.time()
                 for batch in dataloader:
-
-                    logger.info(
-                        f"{os.getpid()},sample-viz/1_dataloader,{time.time()-st_time}")
-                    st_time = time.time()
 
                     pc, camera, image_rgb, mask, depths, idx = extract_batch(
                         cfg, batch, device
                     )
-                    logger.info(
-                        f"{os.getpid()},sample-viz/2_extract_batch,{time.time()-st_time}")
-                    st_time = time.time()
 
                     for i in range(len(pc)):
 
@@ -1460,16 +1405,10 @@ def train(
                             data_mean=dataloader.dataset.data_mean,
                             data_std=dataloader.dataset.data_std,
                         )
-                        logger.info(
-                            f"{os.getpid()},sample-viz/3_sample,{time.time()-st_time}")
-                        st_time = time.time()
 
                         pc_condition = pcpm.point_cloud_to_tensor(
                             pc[i: i + 1], normalize=True, scale=True
                         )
-                        logger.info(
-                            f"{os.getpid()},sample-viz/4_point_cloud_to_tensor,{time.time()-st_time}")
-                        st_time = time.time()
 
                         cd_loss, _ = calculate_chamfer_distance(
                             cfg.dataset.is_scaled,
@@ -1479,10 +1418,6 @@ def train(
                             pc_condition,
                             device,
                         )
-                        logger.info(
-                            f"{os.getpid()},sample-viz/5_calculate_chamfer_distance,{time.time()-st_time}")
-                        st_time = time.time()
-
                         cd_loss_item = cd_loss.item()
                         cd_list.append(cd_loss_item)
                         # new_cds.append((epoch, cd_loss_item))  # {"epochs": [], "data": {}}
@@ -1513,9 +1448,6 @@ def train(
                                 {f"ema_{alpha:.2e}": cd_loss_item},
                                 epoch,
                             )
-                        logger.info(
-                            f"{os.getpid()},sample-viz/6_tensorboard,{time.time()-st_time}")
-                        st_time = time.time()
                         plot_sample_condition(
                             pc_condition.cpu(),
                             xts.cpu(),
@@ -1536,9 +1468,6 @@ def train(
                             data_mean=dataloader.dataset.data_mean,
                             data_std=dataloader.dataset.data_std,
                         )
-                        logger.info(
-                            f"{os.getpid()},sample-viz/7_plot_sample_condition,{time.time()-st_time}")
-                        st_time = time.time()
                         if not already_image_mask:
                             plot_image_depth_projected(
                                 pc_condition.cpu(),
@@ -1575,10 +1504,6 @@ def train(
                                     ),
                                 )
 
-                        logger.info(
-                            f"{os.getpid()},sample-viz/8_plot_image_depth_projected,{time.time()-st_time}")
-                        st_time = time.time()
-
                 cd_ave = sum(cd_list)/len(cd_list)
                 if "ave" not in cd_emas:
                     cd_emas["ave"] = {
@@ -1598,19 +1523,8 @@ def train(
                         epoch,
                     )
 
-                logger.info(
-                    f"{os.getpid()},sample-viz/8_tensorboard,{time.time()-st_time}")
-                st_time = time.time()
-
                 log_utils(log_type="dynamic", model=model,
                           writer=writer, epoch=epoch)
-
-                logger.info(
-                    f"{os.getpid()},sample-viz/9_log_utils,{time.time()-st_time}")
-                st_time = time.time()
-
-        # for handler in logger.handlers:
-        #     handler.flush()
 
         combined_cds = {
             "epochs": list(prev_cds["epochs"]) + list(new_cds["epochs"]),
@@ -1658,7 +1572,10 @@ def apply_conditioning_to_xt(
             # repeat number of channels
             # print("depths", depths.shape)
             # print("image_rgb", image_rgb.shape)
+            if len(depths.shape) == 3:
+                depths.unsqueeze_(1)
             cond_data = depths.repeat(1, 3, 1, 1)
+            assert cond_data.shape == image_rgb.shape, f"cond_data {cond_data.shape} should be same as image_rgb {image_rgb.shape}"#AssertionError: cond_data torch.Size([1, 6, 618, 618]) should be same as image_rgb torch.Size([2, 3, 618, 618])
             # print("depths_rep", depths_rep.shape)
         # print("shape x_t",x_t.shape)
         # print("T shape",t.shape)
@@ -1693,9 +1610,6 @@ def sample(
     data_mean=torch.tensor([0, 0, 0]),
     data_std=torch.tensor([1, 1, 1]),
 ):
-
-    st_time = time.time()
-
     evolution_freq = cfg.run.evolution_freq
 
     data_mean = data_mean.to(device).float()
@@ -1727,8 +1641,6 @@ def sample(
     xs = []
     x0t = []
     steps = []
-    logger.info(f"{os.getpid()}, sample/1_setup, {time.time()-st_time}")
-    st_time = time.time()
     for i, t in enumerate(
         tqdm(scheduler.timesteps.to(device), desc="Sampling", leave=False)
     ):
@@ -1744,9 +1656,6 @@ def sample(
             t,
             pcpm,
         )
-        logger.info(
-            f"{os.getpid()}, sample/2_apply_conditioning_to_xt, {time.time()-st_time}")
-        st_time = time.time()
 
         if cfg.dataset.is_scaled:
             # scale back the first 3 dimensions
@@ -1754,14 +1663,7 @@ def sample(
 
         noise_pred = model(x_t_input, t.reshape(1).expand(B))
 
-        logger.info(
-            f"{os.getpid()}, sample/3_model_inference, {time.time()-st_time}")
-        st_time = time.time()
-
         x_t = scheduler.step(noise_pred, t, x_t, **extra_step_kwargs)
-
-        logger.info(f"{os.getpid()}, sample/4_DM_step, {time.time()-st_time}")
-        st_time = time.time()
 
         # Convert output back into a point cloud, undoing normalization and scaling
         output_prev = (
@@ -1788,10 +1690,6 @@ def sample(
             xs.append(output_prev)
             steps.append(t)
             x0t.append(output_original_sample)
-
-        logger.info(
-            f"{os.getpid()}, sample/5_extraction, {time.time()-st_time}")
-        st_time = time.time()
     if num_inference_steps == 1:
         xs.append(output_prev)
         steps.append(0)
@@ -1800,9 +1698,6 @@ def sample(
     xs = torch.concat(xs, dim=0)
     steps = torch.tensor(steps)
     x0t = torch.concat(x0t, dim=0)
-
-    logger.info(f"{os.getpid()}, sample/6_tensor_ops, {time.time()-st_time}")
-    st_time = time.time()
 
     return output_prev, xs, x0t, steps
 
@@ -1855,6 +1750,7 @@ def get_astyxdataset(cfg: ProjectConfig, device="cpu"):
         "vits",
         device=device,
         is_scaled=cfg.dataset.is_scaled,
+        img_size=cfg.dataset.image_size,
     )
     dataloader_train, dataloader_val, dataloader_vis = (
         DataLoader(
@@ -1862,7 +1758,6 @@ def get_astyxdataset(cfg: ProjectConfig, device="cpu"):
             batch_size=cfg.dataloader.batch_size,
             num_workers=cfg.dataloader.num_workers,
             collate_fn=custom_collate_fn,
-            pin_memory=True,
         ),
         None,
         None,
@@ -2108,11 +2003,9 @@ def log_utils(log_type="static", model=None, writer=None, epoch=None):
             gpu_mem_util.used / gpu_mem_util.total * 100
         )
         data["gpu/mem_utilization_GB"] = gpu_mem_util.used / 2**30
-        try:
-            gpu_fan_speed = pynvml.nvmlDeviceGetFanSpeed(handle)
-            data["gpu/fan_speed"] = gpu_fan_speed
-        except Exception as e:
-            print("error", e)
+
+        gpu_fan_speed = pynvml.nvmlDeviceGetFanSpeed(handle)
+        data["gpu/fan_speed"] = gpu_fan_speed
 
         gpu_power = pynvml.nvmlDeviceGetPowerUsage(handle)
         data["gpu/power_consumption"] = gpu_power / 1000  # Convert to watts
@@ -2166,6 +2059,8 @@ def match_args_json(cfg1, cfg2):
             and cfg1["model"]["beta_schedule"] == cfg2["model"]["beta_schedule"]
             and cfg1["model"]["point_cloud_model_embed_dim"]
             == cfg2["model"]["point_cloud_model_embed_dim"]
+            and cfg1["model"]["point_cloud_model"]
+            == cfg2["model"]["point_cloud_model"]
             and cfg1["dataset"]["category"] == cfg2["dataset"]["category"]
             and cfg1["dataset"]["type"] == cfg2["dataset"]["type"]
             and cfg1["dataset"]["max_points"] == cfg2["dataset"]["max_points"]
@@ -2180,6 +2075,8 @@ def match_args_json(cfg1, cfg2):
             and cfg1["optimizer"]["kwargs"]["betas"][1]
             == cfg2["optimizer"]["kwargs"]["betas"][1]
             and cfg1["model"]["condition_source"] == cfg2["model"]["condition_source"]
+            and cfg1["model"]["use_mask"] == cfg2["model"]["use_mask"]
+            and cfg1["model"]["use_distance_transform"] == cfg2["model"]["use_distance_transform"]
             # and cfg1.run.num_inference_steps == cfg2.run.num_inference_steps
             # and cfg1.dataset.image_size == cfg2.dataset.image_size
             # and cfg1.model.beta_schedule == cfg2.model.beta_schedule
@@ -2320,15 +2217,6 @@ def process_ema_prev_values(writer, ema_factors, epochs, prev_values: dict, name
 
 @hydra.main(config_path="config", config_name="config", version_base="1.1")
 def main(cfg: ProjectConfig):
-
-    log_filepath = f'/home/palakons/from_scratch/app_4.csv'
-    file_handler = logging.FileHandler(log_filepath, mode='a')
-    formatter = logging.Formatter(
-        f'%(asctime)s,%(name)s,%(levelname)s,{cfg.run.name.replace("/", "_")},%(message)s')
-    file_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
-
-    st_time = time.time()
     # print(cfg)
     CHECKPOINT_DIR = "checkpoint_pc2"
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
@@ -2357,7 +2245,6 @@ def main(cfg: ProjectConfig):
         colors_mean=cfg.model.colors_mean,
         colors_std=cfg.model.colors_std,
         scale_factor=cfg.model.scale_factor,
-        run_name=cfg.run.name.replace("/", "_"),
     ).to(device)
 
     dataloader_train = get_dataset(cfg, device=device)
@@ -2446,11 +2333,6 @@ def main(cfg: ProjectConfig):
 
     assert cfg.loss.loss_type == "mse", "only mse supported"
     criterion = get_loss(cfg)
-
-    print(f"time: before tain {time.time()-st_time:.2f}")
-    # save into csv CSV_TIME_FILE
-
-    logger.info(f"{os.getpid()},before train,{time.time()-st_time}")
     # Train the model
     loss_emas, cd_emas = train(
         model,
@@ -2469,10 +2351,6 @@ def main(cfg: ProjectConfig):
         prev_losses=prev_losses,
         CHECKPOINT_DB_FILE=CHECKPOINT_DB_FILE,
     )
-
-    for handler in logger.handlers:
-        handler.flush()
-    exit()
 
     metric_dict = {
         **{f"Loss_ave/ema_{k:.2e}": loss_emas["ave"][k] for k in loss_emas["ave"]},
@@ -2504,7 +2382,7 @@ def main(cfg: ProjectConfig):
             data_std=dataloader_train.dataset.data_std,
         )
 
-    if False:  # Evo plots
+    if True:  # Evo plots
         # make the plot that will be logged to tb
         gt_cond_pc = pcpm.point_cloud_to_tensor(
             pc[:1], normalize=True, scale=True)
@@ -2578,7 +2456,8 @@ def main(cfg: ProjectConfig):
         "num_inference_steps": cfg.run.num_inference_steps,  #
         "image_size": cfg.dataset.image_size,  #
         "beta_schedule": cfg.model.beta_schedule,  #
-        "point_cloud_model_embed_dim": cfg.model.point_cloud_model_embed_dim,  #
+        "point_cloud_model_embed_dim": cfg.model.point_cloud_model_embed_dim,
+        "point_cloud_model": cfg.model.point_cloud_model,  #
         "dataset_cat": cfg.dataset.category,
         "dataset_source": cfg.dataset.type,
         "max_points": cfg.dataset.max_points,  #
@@ -2592,14 +2471,8 @@ def main(cfg: ProjectConfig):
         "optimizer_beta_1": cfg.optimizer.kwargs.betas[1],
     }
 
-    try:
-        writer.add_hparams(hparam_dict, metric_dict)
-    except Exception as e:
-        print("error adding hparams", e)
+    writer.add_hparams(hparam_dict, metric_dict)
     writer.close()
-
-    for handler in logger.handlers:
-        handler.flush()
 
 
 if __name__ == "__main__":
