@@ -1,9 +1,12 @@
+import logging
 from pytorch3d.structures import Pointclouds
 import hydra
 import glob
 from datetime import datetime
 from pathlib import Path
 import inspect
+import time
+import time_profiler as tp
 from pytorch3d.vis.plotly_vis import get_camera_wireframe
 
 from pytorch3d.implicitron.dataset.json_index_dataset_map_provider_v2 import (
@@ -26,7 +29,9 @@ import numpy as np
 import random
 from torch.utils.tensorboard import SummaryWriter
 from model.point_cloud_model import PointCloudModel
-from model.projection_model import PointCloudProjectionModel
+# from model.projection_model_time import PointCloudProjectionModel
+from model.projection_model_time_supasorn import PointCloudProjectionModel
+# from model.projection_model import PointCloudProjectionModel
 import os
 from pytorch3d.implicitron.dataset.data_loader_map_provider import (
     SequenceDataLoaderMapProvider,
@@ -44,6 +49,27 @@ import pandas as pd
 from torch.utils.data import Dataset, DataLoader
 from pytorch3d.renderer.cameras import PerspectiveCameras
 
+CSV_TIME_FILE = "/home/palakons/from_scratch/timer.csv"
+
+
+
+# logging.basicConfig(
+#     level=logging.INFO,
+#     format="%(asctime)s,%(name)s,%(levelname)s,%(message)s",
+#     filename="/home/palakons/from_scratch/app.log",
+#     filemode='a',  # Append mode.
+# )
+log_filepath = "/home/palakons/from_scratch/app_2.csv"
+logger = logging.getLogger(__name__)
+
+if logger.hasHandlers():
+    logger.handlers.clear()
+file_handler = logging.FileHandler(log_filepath, mode='a')
+formatter = logging.Formatter("%(asctime)s,%(name)s,%(levelname)s,%(message)s")
+file_handler.setFormatter(formatter)
+logger.addHandler(file_handler)
+logger.propagate = False
+
 
 class AstyxDataset(Dataset):
     def __init__(
@@ -55,7 +81,6 @@ class AstyxDataset(Dataset):
         root_dir: str = "/data/palakons/dataset_astyx_hires2019/",
         device="cpu",
         is_scaled=False,
-        img_size=618,
     ):
         # root_dir: path to the directory containing the json files
         self.root_dir = root_dir
@@ -71,7 +96,6 @@ class AstyxDataset(Dataset):
         self.random_offset = random_offset
         self.device = device
         self.is_scaled = is_scaled
-        self.img_size = img_size
 
         self.ids = []
         # list filesin the radar_dir
@@ -128,7 +152,6 @@ class AstyxDataset(Dataset):
         depth = {}
         image = plt.imread(
             self.depth_dir + f"/{idx:06d}_{self.depth_model}.jpg")
-
         # if image is of 3 channels, take only the first one
         # print("image.shape: ", image.shape)
         if len(image.shape) == 3:
@@ -149,16 +172,6 @@ class AstyxDataset(Dataset):
         image_size_hw = (depth.shape[0], depth.shape[1])
         depth = depth[:,
                       square_image_offset: square_image_offset + depth.shape[0]]
-
-        # resize image to self.img_size
-
-        depth = torch.nn.functional.interpolate(
-            depth.unsqueeze(0).unsqueeze(0),
-            size=(self.img_size, self.img_size),
-            mode="bilinear",
-            align_corners=False,
-        ).squeeze(0).squeeze(0)
-
         # load radar data, .txt
         df = pd.read_csv(
             self.radar_dir + f"/{idx:06d}.txt", sep=" ", skip_blank_lines=True
@@ -175,7 +188,7 @@ class AstyxDataset(Dataset):
                 if c["sensor_uid"] == "camera_front":
                     new_camera_base = calib_to_camera_base(
                         c["calib_data"], [image_size_hw[0]] *
-                        2, square_image_offset, self.img_size
+                        2, square_image_offset
                     )
 
         assert (
@@ -193,14 +206,6 @@ class AstyxDataset(Dataset):
         camera_front = camera_front[
             :, :, square_image_offset: square_image_offset + camera_front.shape[1]
         ]
-
-        # resize image to self.img_size
-        camera_front = torch.nn.functional.interpolate(
-            camera_front.unsqueeze(0),
-            size=(self.img_size, self.img_size),
-            mode="bilinear",
-            align_corners=False,
-        ).squeeze(0)
 
         # filter points: keeps only points within the image
         # world_points = radar_data
@@ -285,6 +290,7 @@ class AstyxDataset(Dataset):
 
             return self.data_bank[idx]
 
+        st_time = time.time()
         (
             depth,
             filtered_radar_data,
@@ -296,6 +302,10 @@ class AstyxDataset(Dataset):
             npoints_filtered,
             square_image_offset,
         ) = self.data_bank[idx]
+
+        logger.info(
+            f"{os.getpid()}, __getitem__/1_data_bank, {time.time()-st_time}")
+        st_time = time.time()
 
         # print("mean", self.data_mean)
         # print("std", self.data_std)
@@ -309,7 +319,7 @@ class AstyxDataset(Dataset):
         # print("filtered_radar_data", newd[0])
         # mean tensor([38.5517, -0.2240,  1.0346], dtype=torch.float64)                                                             std tensor([20.8821,  3.5820,  1.9252], dtype=torch.float64)                                                             filtered_radar_data torch.Size([128, 3])                                                                  filtered_radar_data tensor([73.2768, -1.1732,  3.0596], dtype=torch.float64)                                                             newd torch.Size([128, 3])                                                                                                                        filtered_radar_data tensor([ 1.6629, -0.2650,  1.0518], dtype=torch.float64)
 
-        return (
+        output = (
             depth,
             (filtered_radar_data - self.data_mean) / self.data_std,
             new_camera_base,
@@ -320,9 +330,15 @@ class AstyxDataset(Dataset):
             npoints_filtered,
             square_image_offset,
         )
+        logger.info(
+            f"{os.getpid()}, __getitem__/2_norm, {time.time()-st_time}")
+
+        return output
 
 
 def custom_collate_fn(batch):
+
+    st_time = time.time()
     (
         depths,
         radar_data,
@@ -335,15 +351,27 @@ def custom_collate_fn(batch):
         square_image_offset,
     ) = zip(*batch)
 
+    logger.info(
+        f"{os.getpid()}, custom_collate_fn/1_zip, {time.time()-st_time}")
+    st_time = time.time()
+
     npoints_after = torch.as_tensor(npoints)
     npoints_filtered_after = torch.as_tensor(npoints_filtered)
     idxs_after = torch.as_tensor(idxs)
     square_image_offset_after = torch.as_tensor(square_image_offset)
 
+    logger.info(
+        f"{os.getpid()},custom_collate_fn/2_as_tensor,{time.time()-st_time}")
+    st_time = time.time()
+
     objects_after = list(objects)
     camera_fronts_after = torch.stack(camera_fronts)
     radar_data_after = torch.stack(radar_data)
     depths_after = torch.stack(depths)
+
+    logger.info(
+        f"{os.getpid()},custom_collate_fn/3_stack,{time.time()-st_time}")
+    st_time = time.time()
 
     focal_length = []
     principal_point = []
@@ -364,6 +392,10 @@ def custom_collate_fn(batch):
     Ts = torch.concat(T)
     image_sizes_hw = torch.concat(image_sizes_hw)
 
+    logger.info(
+        f"{os.getpid()},custom_collate_fn/4_prepare,{time.time()-st_time}")
+    st_time = time.time()
+
     # print("image_sizes_hw: ", image_sizes_hw)
 
     camera_bases = PerspectiveCameras(
@@ -374,6 +406,9 @@ def custom_collate_fn(batch):
         in_ndc=False,
         image_size=image_sizes_hw,
     )
+
+    logger.info(
+        f"{os.getpid()},custom_collate_fn/5_PerspectiveCameras,{time.time()-st_time}")
 
     return (
         depths_after,
@@ -453,19 +488,10 @@ def custom_collate_fn_org(batch):
     )
 
 
-def calib_to_camera_base(calibration_data, image_size_hw: tuple, offset: int = 0, image_size: int = 618):
+def calib_to_camera_base(calibration_data, image_size_hw: tuple, offset: int = 0):
 
-    s = image_size/618
     # Convert intrinsic matrix K to tensor
     K = torch.tensor(calibration_data["K"])
-
-    K[0, 0] = K[0, 0] * s
-    K[1, 1] = K[1, 1] * s
-
-    K[0, 2] = K[0, 2] * s
-    K[1, 2] = K[1, 2] * s
-
-    offset = offset * s
 
     # Extract focal length and principal point from K
     focal_length = torch.tensor([[K[0, 0], K[1, 1]]])
@@ -516,7 +542,7 @@ class PointCloudLoss(nn.Module):
             raise ValueError("emd_weight must be between 0 and 1")
         self.npoints = npoints
         self.emd_weight = emd_weight
-        self.sinkhorn_loss = SamplesLoss("sinkhorn", p=2)  # take (N,3) tensors
+        self.sinkhorn_loss = SamplesLoss("sinkhorn", p=2)
 
     def forward(self, y_true: torch.Tensor, y_pred: torch.Tensor) -> torch.Tensor:
         assert y_true.size() == y_pred.size()
@@ -527,22 +553,7 @@ class PointCloudLoss(nn.Module):
         chamfer = chamfer_distance(y_true, y_pred)[0]
         if self.emd_weight == 0:
             return chamfer
-        # print("y_true", y_true.shape)
-        # print("y_pred", y_pred.shape)
-        # y_true torch.Size([2, 128, 3])
-        # y_pred torch.Size([2, 128, 3])
-        # flat the first 2 dimensions to be    torch.Size([ 256, 3])
-        y_true = y_true.reshape(-1, 3)
-        y_pred = y_pred.reshape(-1, 3)
-
-        # print("y_true", y_true.shape) ## should be  torch.Size([ 256, 3])
-        # print("y_pred", y_pred.shape)
         emd = self.sinkhorn_loss(y_true, y_pred)
-        # reshape to the original shape
-        y_true = y_true.reshape(-1, self.npoints, 3)
-        y_pred = y_pred.reshape(-1, self.npoints, 3)
-        # print("y_true", y_true.shape) # should be  torch.Size([2, 128, 3])
-        # print("y_pred", y_pred.shape)
         return (1 - self.emd_weight) * chamfer + self.emd_weight * emd
 
 
@@ -592,16 +603,26 @@ def train_one_epoch(
     assert pcpm is not None, "pcpm must be provided"
     model.train()
 
+    tp.tic("mean")
     data_mean = dataloader.dataset.data_mean.to(device).float()
     data_std = dataloader.dataset.data_std.to(device).float()
+    tp.toca("mean")
 
     batch_losses = []
+    tp.tic("outside")
+    tp.tic("data")
     for batch in dataloader:
+        tp.tic("inside")
+        tp.toca("data")
 
+        tp.tic("extract")
         pc, camera, image_rgb, mask, depths, idx = extract_batch(
             cfg, batch, device)
+        tp.toca("extract")
 
+        tp.tic("totensor")
         x_0 = pcpm.point_cloud_to_tensor(pc, normalize=True, scale=True)
+        tp.toca("totensor")
 
         B, N, D = x_0.shape
         noise = torch.randn_like(x_0)
@@ -616,6 +637,7 @@ def train_one_epoch(
         # print("type x_t", type(x_t))
         # print("dtype x_t", x_t.dtype)
 
+        tp.tic("cond")
         x_t_input = apply_conditioning_to_xt(
             cfg,
             (x_t * data_std + data_mean) if cfg.dataset.is_scaled else x_t,
@@ -626,21 +648,37 @@ def train_one_epoch(
             timesteps,
             pcpm,
         )
+        tp.toca("cond")
+
 
         if cfg.dataset.is_scaled:
             # scale back the first 3 dimensions
             x_t_input[:, :, :3] = x_t[:, :, :3]
 
         optimizer.zero_grad()
+        tp.tic("model")
         noise_pred = model(x_t_input, timesteps)
+        tp.toca("model")
 
         if not noise_pred.shape == noise.shape:
             raise ValueError(f"{noise_pred.shape} and {noise.shape} not equal")
 
+        tp.tic("backward")
         loss = criterion(noise_pred, noise)
         loss.backward()
+        tp.toca("backward")
+
+
+        tp.tic("optstep")
         optimizer.step()
+        tp.toca("optstep")
+
         batch_losses.append(loss.item())  # float
+        tp.toca("inside")
+        tp.tic("data")
+    tp.toca("data")
+    
+    tp.toca("outside")
     return batch_losses
 
 
@@ -1105,7 +1143,7 @@ def plot_sample_condition(
             print("creating dir", dir_name)
             os.makedirs(dir_name)
         fname = f"{dir_name}/sample_ep_{epoch:05d}.png"
-    # print("plot_sample_condition fname", fname)
+    print("plot_sample_condition fname", fname)
 
     gt = gt.numpy()[0]
     xt = xts[-1].numpy()
@@ -1205,8 +1243,7 @@ def aggregate_ema(value_list, ema_factor):
     ema = value_list[0]
     ema_list = [ema]
     for i, value in enumerate(value_list[1:]):
-        # ema = (1 - ema_factor) * ema + ema_factor * value #bad
-        ema = ema_factor * ema + (1 - ema_factor) * value
+        ema = (1 - ema_factor) * ema + ema_factor * value
         ema_list.append(ema)
     return ema_list
 
@@ -1245,14 +1282,13 @@ def train(
         os.makedirs(os.path.dirname(checkpoint_fname))
     print("checkpoint to be saved at", checkpoint_fname)
 
-    loss_emas = process_ema_prev_values(cfg,
-                                        writer, list(
-                                            loss_ema_factors) + [0], None, prev_losses, "Loss"
-                                        )  # {"ave": [loss]}
-    cd_emas = process_ema_prev_values(cfg,
-                                      writer, list(cd_ema_factors) +
-                                      [0], prev_cds["epochs"], prev_cds["data"], "CD"
-                                      )  # {"epoch":[],  data:{scene_id: [cd]}}
+    loss_emas = process_ema_prev_values(
+        writer, list(loss_ema_factors) + [0], None, prev_losses, "Loss"
+    )  # {"ave": [loss]}
+    cd_emas = process_ema_prev_values(
+        writer, list(cd_ema_factors) +
+        [0], prev_cds["epochs"], prev_cds["data"], "CD"
+    )  # {"epoch":[],  data:{scene_id: [cd]}}
 
     if start_epoch == cfg.run.max_steps:  # no training, checkpoint available
         print(
@@ -1262,12 +1298,6 @@ def train(
         )
         epoch = start_epoch
         batch = next(iter(dataloader))
-
-        dir_name = f"plots/{cfg.run.name}"
-
-        if not os.path.exists(dir_name):
-            print("creating dir", dir_name)
-            os.makedirs(dir_name)
 
         pc, camera, image_rgb, mask, depths, idx = extract_batch(
             cfg, batch, device)
@@ -1365,6 +1395,7 @@ def train(
                     "Loss/average", {f"ema_{alpha:.2e}": losses}, epoch)
 
             if (epoch + 1) % cfg.run.checkpoint_freq == 0:
+                st_time = time.time()
                 temp_epochs = cfg.run.max_steps
                 cfg.run.max_steps = epoch + 1
 
@@ -1396,6 +1427,9 @@ def train(
                 )
 
                 cfg.run.max_steps = temp_epochs
+
+                logger.info(
+                    f"{os.getpid()},save checkpoint,{time.time()-st_time}")
             if (epoch + 1) % cfg.run.vis_freq == 0:
 
                 cd_list = []
@@ -1405,11 +1439,19 @@ def train(
                     print("creating dir", dir_name)
                     os.makedirs(dir_name)
 
+                st_time = time.time()
                 for batch in dataloader:
+
+                    logger.info(
+                        f"{os.getpid()},sample-viz/1_dataloader,{time.time()-st_time}")
+                    st_time = time.time()
 
                     pc, camera, image_rgb, mask, depths, idx = extract_batch(
                         cfg, batch, device
                     )
+                    logger.info(
+                        f"{os.getpid()},sample-viz/2_extract_batch,{time.time()-st_time}")
+                    st_time = time.time()
 
                     for i in range(len(pc)):
 
@@ -1428,10 +1470,16 @@ def train(
                             data_mean=dataloader.dataset.data_mean,
                             data_std=dataloader.dataset.data_std,
                         )
+                        logger.info(
+                            f"{os.getpid()},sample-viz/3_sample,{time.time()-st_time}")
+                        st_time = time.time()
 
                         pc_condition = pcpm.point_cloud_to_tensor(
                             pc[i: i + 1], normalize=True, scale=True
                         )
+                        logger.info(
+                            f"{os.getpid()},sample-viz/4_point_cloud_to_tensor,{time.time()-st_time}")
+                        st_time = time.time()
 
                         cd_loss, _ = calculate_chamfer_distance(
                             cfg.dataset.is_scaled,
@@ -1441,6 +1489,10 @@ def train(
                             pc_condition,
                             device,
                         )
+                        logger.info(
+                            f"{os.getpid()},sample-viz/5_calculate_chamfer_distance,{time.time()-st_time}")
+                        st_time = time.time()
+
                         cd_loss_item = cd_loss.item()
                         cd_list.append(cd_loss_item)
                         # new_cds.append((epoch, cd_loss_item))  # {"epochs": [], "data": {}}
@@ -1471,6 +1523,9 @@ def train(
                                 {f"ema_{alpha:.2e}": cd_loss_item},
                                 epoch,
                             )
+                        logger.info(
+                            f"{os.getpid()},sample-viz/6_tensorboard,{time.time()-st_time}")
+                        st_time = time.time()
                         plot_sample_condition(
                             pc_condition.cpu(),
                             xts.cpu(),
@@ -1491,9 +1546,10 @@ def train(
                             data_mean=dataloader.dataset.data_mean,
                             data_std=dataloader.dataset.data_std,
                         )
+                        logger.info(
+                            f"{os.getpid()},sample-viz/7_plot_sample_condition,{time.time()-st_time}")
+                        st_time = time.time()
                         if not already_image_mask:
-                            if not os.path.exists(f"plots/{cfg.run.name}"):
-                                os.makedirs(f"plots/{cfg.run.name}")
                             plot_image_depth_projected(
                                 pc_condition.cpu(),
                                 cfg,
@@ -1529,6 +1585,10 @@ def train(
                                     ),
                                 )
 
+                        logger.info(
+                            f"{os.getpid()},sample-viz/8_plot_image_depth_projected,{time.time()-st_time}")
+                        st_time = time.time()
+
                 cd_ave = sum(cd_list)/len(cd_list)
                 if "ave" not in cd_emas:
                     cd_emas["ave"] = {
@@ -1548,8 +1608,20 @@ def train(
                         epoch,
                     )
 
+                logger.info(
+                    f"{os.getpid()},sample-viz/8_tensorboard,{time.time()-st_time}")
+                st_time = time.time()
+
                 log_utils(log_type="dynamic", model=model,
                           writer=writer, epoch=epoch)
+
+                logger.info(
+                    f"{os.getpid()},sample-viz/9_log_utils,{time.time()-st_time}")
+                st_time = time.time()
+
+        tp.tocaList()
+        for handler in logger.handlers:
+            handler.flush()
 
         combined_cds = {
             "epochs": list(prev_cds["epochs"]) + list(new_cds["epochs"]),
@@ -1597,12 +1669,7 @@ def apply_conditioning_to_xt(
             # repeat number of channels
             # print("depths", depths.shape)
             # print("image_rgb", image_rgb.shape)
-
-            if len(depths.shape) == 3:
-                depths.unsqueeze_(1)
             cond_data = depths.repeat(1, 3, 1, 1)
-            # AssertionError: cond_data torch.Size([1, 6, 618, 618]) should be same as image_rgb torch.Size([2, 3, 618, 618])
-            assert cond_data.shape == image_rgb.shape, f"cond_data {cond_data.shape} should be same as image_rgb {image_rgb.shape}"
             # print("depths_rep", depths_rep.shape)
         # print("shape x_t",x_t.shape)
         # print("T shape",t.shape)
@@ -1637,6 +1704,9 @@ def sample(
     data_mean=torch.tensor([0, 0, 0]),
     data_std=torch.tensor([1, 1, 1]),
 ):
+
+    st_time = time.time()
+
     evolution_freq = cfg.run.evolution_freq
 
     data_mean = data_mean.to(device).float()
@@ -1668,6 +1738,8 @@ def sample(
     xs = []
     x0t = []
     steps = []
+    logger.info(f"{os.getpid()}, sample/1_setup, {time.time()-st_time}")
+    st_time = time.time()
     for i, t in enumerate(
         tqdm(scheduler.timesteps.to(device), desc="Sampling", leave=False)
     ):
@@ -1683,6 +1755,9 @@ def sample(
             t,
             pcpm,
         )
+        logger.info(
+            f"{os.getpid()}, sample/2_apply_conditioning_to_xt, {time.time()-st_time}")
+        st_time = time.time()
 
         if cfg.dataset.is_scaled:
             # scale back the first 3 dimensions
@@ -1690,7 +1765,14 @@ def sample(
 
         noise_pred = model(x_t_input, t.reshape(1).expand(B))
 
+        logger.info(
+            f"{os.getpid()}, sample/3_model_inference, {time.time()-st_time}")
+        st_time = time.time()
+
         x_t = scheduler.step(noise_pred, t, x_t, **extra_step_kwargs)
+
+        logger.info(f"{os.getpid()}, sample/4_DM_step, {time.time()-st_time}")
+        st_time = time.time()
 
         # Convert output back into a point cloud, undoing normalization and scaling
         output_prev = (
@@ -1717,6 +1799,10 @@ def sample(
             xs.append(output_prev)
             steps.append(t)
             x0t.append(output_original_sample)
+
+        logger.info(
+            f"{os.getpid()}, sample/5_extraction, {time.time()-st_time}")
+        st_time = time.time()
     if num_inference_steps == 1:
         xs.append(output_prev)
         steps.append(0)
@@ -1725,6 +1811,9 @@ def sample(
     xs = torch.concat(xs, dim=0)
     steps = torch.tensor(steps)
     x0t = torch.concat(x0t, dim=0)
+
+    logger.info(f"{os.getpid()}, sample/6_tensor_ops, {time.time()-st_time}")
+    st_time = time.time()
 
     return output_prev, xs, x0t, steps
 
@@ -1777,7 +1866,6 @@ def get_astyxdataset(cfg: ProjectConfig, device="cpu"):
         "vits",
         device=device,
         is_scaled=cfg.dataset.is_scaled,
-        img_size=cfg.dataset.image_size,
     )
     dataloader_train, dataloader_val, dataloader_vis = (
         DataLoader(
@@ -1785,7 +1873,7 @@ def get_astyxdataset(cfg: ProjectConfig, device="cpu"):
             batch_size=cfg.dataloader.batch_size,
             num_workers=cfg.dataloader.num_workers,
             collate_fn=custom_collate_fn,
-            shuffle=cfg.dataloader.shuffle,
+            pin_memory=True,
         ),
         None,
         None,
@@ -1951,18 +2039,18 @@ def get_loss(cfg: ProjectConfig):
         raise ValueError("loss not supported")
 
 
-def log_utils(log_type="static", model=None, writer=None, epoch=None):
+def log_utils(log_type="statp.tic", model=None, writer=None, epoch=None):
     assert log_type in [
-        "static",
+        "statp.tic",
         "dynamic",
-    ], f"log_type {log_type} must be either 'static' or 'dynamic'"
+    ], f"log_type {log_type} must be either 'statp.tic' or 'dynamic'"
     assert writer is not None, "writer must be provided"
 
     data = {}
 
-    if log_type == "static":
+    if log_type == "statp.tic":
         if model is None:
-            raise ValueError("model must be provided for static logging")
+            raise ValueError("model must be provided for statp.tic logging")
 
         # model param_count
         param_count = sum(p.numel() for p in model.parameters()) / 1e6
@@ -2045,11 +2133,11 @@ def log_utils(log_type="static", model=None, writer=None, epoch=None):
         data["cpu/utilization"] = cpu_util
         # print(psutil.sensors_temperatures())
 
-        # {'nvme': [shwtemp(label='Composite', current=35.85, high=84.85, critical=84.85), shwtemp(label='Sensor 1', current=35.85, high=65261.85, critical=65261.85), shwtemp(label='Sensor 2', current=40.85, high=65261.85, critical=65261.85)], 'enp3s0': [shwtemp(label='MAC Temperature', current=51.124, high=None, critical=None)], 'k10temp': [shwtemp(label='Tctl', current=77.875, high=None, critical=None), shwtemp(label='Tdie', current=50.875, high=None, critical=None), shwtemp(label='Tccd1', current=68.75, high=None, critical=None), shwtemp(label='Tctl', current=76.75, high=None, critical=None), shwtemp(label='Tdie', current=49.75, high=None, critical=None)], 'iwlwifi_1': [shwtemp(label='', current=31.0, high=None, critical=None)]}
+        # {'nvme': [shwtemp(label='Composite', current=35.85, high=84.85, critp.tical=84.85), shwtemp(label='Sensor 1', current=35.85, high=65261.85, critp.tical=65261.85), shwtemp(label='Sensor 2', current=40.85, high=65261.85, critp.tical=65261.85)], 'enp3s0': [shwtemp(label='MAC Temperature', current=51.124, high=None, critp.tical=None)], 'k10temp': [shwtemp(label='Tctl', current=77.875, high=None, critp.tical=None), shwtemp(label='Tdie', current=50.875, high=None, critp.tical=None), shwtemp(label='Tccd1', current=68.75, high=None, critp.tical=None), shwtemp(label='Tctl', current=76.75, high=None, critp.tical=None), shwtemp(label='Tdie', current=49.75, high=None, critp.tical=None)], 'iwlwifi_1': [shwtemp(label='', current=31.0, high=None, critp.tical=None)]}
         for key, value in psutil.sensors_temperatures().items():
             # print(key,":")
             for sensor in value:
-                # print(sensor.label, sensor.current, sensor.high, sensor.critical)
+                # print(sensor.label, sensor.current, sensor.high, sensor.critp.tical)
                 data[f"temperature/{key}/{sensor.label}"] = sensor.current
 
         cpu_mem = psutil.virtual_memory()
@@ -2087,15 +2175,12 @@ def match_args_json(cfg1, cfg2):
             and cfg1["model"]["beta_schedule"] == cfg2["model"]["beta_schedule"]
             and cfg1["model"]["point_cloud_model_embed_dim"]
             == cfg2["model"]["point_cloud_model_embed_dim"]
-            and cfg1["model"]["point_cloud_model"]
-            == cfg2["model"]["point_cloud_model"]
             and cfg1["dataset"]["category"] == cfg2["dataset"]["category"]
             and cfg1["dataset"]["type"] == cfg2["dataset"]["type"]
             and cfg1["dataset"]["max_points"] == cfg2["dataset"]["max_points"]
             and cfg1["optimizer"]["lr"] == cfg2["optimizer"]["lr"]
             and cfg1["dataloader"]["batch_size"] == cfg2["dataloader"]["batch_size"]
             and cfg1["dataloader"]["num_scenes"] == cfg2["dataloader"]["num_scenes"]
-            and cfg1["dataloader"]["shuffle"] == cfg2["dataloader"]["shuffle"]
             and cfg1["loss"]["loss_type"] == cfg2["loss"]["loss_type"]
             and cfg1["optimizer"]["name"] == cfg2["optimizer"]["name"]
             and cfg1["optimizer"]["weight_decay"] == cfg2["optimizer"]["weight_decay"]
@@ -2104,8 +2189,6 @@ def match_args_json(cfg1, cfg2):
             and cfg1["optimizer"]["kwargs"]["betas"][1]
             == cfg2["optimizer"]["kwargs"]["betas"][1]
             and cfg1["model"]["condition_source"] == cfg2["model"]["condition_source"]
-            and cfg1["model"]["use_mask"] == cfg2["model"]["use_mask"]
-            and cfg1["model"]["use_distance_transform"] == cfg2["model"]["use_distance_transform"]
             # and cfg1.run.num_inference_steps == cfg2.run.num_inference_steps
             # and cfg1.dataset.image_size == cfg2.dataset.image_size
             # and cfg1.model.beta_schedule == cfg2.model.beta_schedule
@@ -2196,8 +2279,7 @@ def calculate_chamfer_distance(is_scaled, mean, std, gt, pred, device):
     return chamfer_distance(gt, pred)
 
 
-def process_ema_prev_values(cfg: ProjectConfig, writer, ema_factors, epochs, prev_values: dict, name):
-    print("process_ema_prev_values", name)
+def process_ema_prev_values(writer, ema_factors, epochs, prev_values: dict, name):
 
     emas = {idx: {k: None for k in ema_factors} for idx in prev_values}
     if "ave" not in emas:
@@ -2205,18 +2287,16 @@ def process_ema_prev_values(cfg: ProjectConfig, writer, ema_factors, epochs, pre
 
     all_scenes = []
 
-    for scene_id, losses in tqdm(prev_values.items()):  # {scene_id: [loss]}
+    for scene_id, losses in prev_values.items():  # {scene_id: [loss]}
         if len(losses) == 0:
             continue
-        for alpha in tqdm(ema_factors, desc=f"ema factors for {scene_id}", leave=False):
+        for alpha in ema_factors:
             ema_list = aggregate_ema(losses, alpha)
             emas[scene_id][alpha] = ema_list[-1]
-            ep_use = epochs[:: cfg.dataloader.num_scenes] if epochs is not None else range(
-                len(ema_list))
-            tt = tqdm(zip(ep_use, ema_list
-                          ), desc=f"ema list for {alpha}", leave=False, total=min(len(ema_list), len(ep_use)))
-            for epoch, ema in tt:
-                tt.set_description(f"{alpha}: {ema:.4f}")
+            for epoch, ema in zip(
+                epochs if epochs is not None else range(
+                    len(ema_list)), ema_list
+            ):
                 writer.add_scalars(
                     (
                         f"{name}/scene_{scene_id:03d}"
@@ -2249,6 +2329,8 @@ def process_ema_prev_values(cfg: ProjectConfig, writer, ema_factors, epochs, pre
 
 @hydra.main(config_path="config", config_name="config", version_base="1.1")
 def main(cfg: ProjectConfig):
+
+    st_time = time.time()
     # print(cfg)
     CHECKPOINT_DIR = "checkpoint_pc2"
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
@@ -2361,10 +2443,15 @@ def main(cfg: ProjectConfig):
     else:
         print("no checkpoint found")
 
-    log_utils(log_type="static", model=model, writer=writer, epoch=None)
+    log_utils(log_type="statp.tic", model=model, writer=writer, epoch=None)
 
-    # assert cfg.loss.loss_type == "mse", "only mse supported"
+    assert cfg.loss.loss_type == "mse", "only mse supported"
     criterion = get_loss(cfg)
+
+    print(f"time: before tain {time.time()-st_time:.2f}")
+    # save into csv CSV_TIME_FILE
+
+    logger.info(f"{os.getpid()},before train,{time.time()-st_time}")
     # Train the model
     loss_emas, cd_emas = train(
         model,
@@ -2383,6 +2470,10 @@ def main(cfg: ProjectConfig):
         prev_losses=prev_losses,
         CHECKPOINT_DB_FILE=CHECKPOINT_DB_FILE,
     )
+
+    for handler in logger.handlers:
+        handler.flush()
+    exit()
 
     metric_dict = {
         **{f"Loss_ave/ema_{k:.2e}": loss_emas["ave"][k] for k in loss_emas["ave"]},
@@ -2414,7 +2505,7 @@ def main(cfg: ProjectConfig):
             data_std=dataloader_train.dataset.data_std,
         )
 
-    if True:  # Evo plots
+    if False:  # Evo plots
         # make the plot that will be logged to tb
         gt_cond_pc = pcpm.point_cloud_to_tensor(
             pc[:1], normalize=True, scale=True)
@@ -2477,6 +2568,9 @@ def main(cfg: ProjectConfig):
         writer.add_figure(f"Evolution", plt.gcf(), cfg.run.max_steps)
         plt.close()
 
+        # add cd to metric_dict
+        metric_dict = {**{f"CD": cd_loss}, **metric_dict}
+
     print("done evo plots")
 
     hparam_dict = {
@@ -2485,8 +2579,7 @@ def main(cfg: ProjectConfig):
         "num_inference_steps": cfg.run.num_inference_steps,  #
         "image_size": cfg.dataset.image_size,  #
         "beta_schedule": cfg.model.beta_schedule,  #
-        "point_cloud_model_embed_dim": cfg.model.point_cloud_model_embed_dim,
-        "point_cloud_model": cfg.model.point_cloud_model,  #
+        "point_cloud_model_embed_dim": cfg.model.point_cloud_model_embed_dim,  #
         "dataset_cat": cfg.dataset.category,
         "dataset_source": cfg.dataset.type,
         "max_points": cfg.dataset.max_points,  #
@@ -2500,8 +2593,14 @@ def main(cfg: ProjectConfig):
         "optimizer_beta_1": cfg.optimizer.kwargs.betas[1],
     }
 
-    writer.add_hparams(hparam_dict, metric_dict)
+    try:
+        writer.add_hparams(hparam_dict, metric_dict)
+    except Exception as e:
+        print("error adding hparams", e)
     writer.close()
+
+    for handler in logger.handlers:
+        handler.flush()
 
 
 if __name__ == "__main__":
