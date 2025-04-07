@@ -1362,7 +1362,7 @@ def train(
                     else ((1 - alpha) * losses + alpha * loss_emas["ave"][alpha])
                 )
                 writer.add_scalars(
-                    "Loss/average", {f"ema_{alpha:.2e}": losses}, epoch)
+                    "Loss/average", {f"ema_{alpha:.2e}": loss_emas["ave"][alpha]}, epoch)
 
             if (epoch + 1) % cfg.run.checkpoint_freq == 0:
                 temp_epochs = cfg.run.max_steps
@@ -1468,7 +1468,7 @@ def train(
                             )
                             writer.add_scalars(
                                 f"CD/scene_{idx_i:03d}",
-                                {f"ema_{alpha:.2e}": cd_loss_item},
+                                {f"ema_{alpha:.2e}": cd_emas[idx_i][alpha]},
                                 epoch,
                             )
                         plot_sample_condition(
@@ -1544,7 +1544,7 @@ def train(
                     )
                     writer.add_scalars(
                         f"CD/average",
-                        {f"ema_{alpha:.2e}": cd_ave},
+                        {f"ema_{alpha:.2e}": cd_emas["ave"][alpha]},
                         epoch,
                     )
 
