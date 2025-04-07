@@ -8,8 +8,8 @@ from hydra.conf import RunDir
 
 @dataclass
 class CustomHydraRunDir(RunDir):
-    dir: str = '/home/palakons/logs'
-    # dir: str = 'logs/outputs/${run.name}/${now:%Y-%m-%d--%H-%M-%S}'
+    # dir: str = './outputs/${run.name}/${now:%Y-%m-%d--%H-%M-%S}'
+    dir: str = 'singularity_logs/outputs/${run.name}/${now:%Y-%m-%d--%H-%M-%S}'
 
 
 @dataclass
@@ -23,22 +23,22 @@ class RunConfig:
     vis_before_training: bool = False
     limit_train_batches: Optional[int] = None
     limit_val_batches: Optional[int] = None
-    max_steps: int = 2_500
-    checkpoint_freq: int = 1000
+    max_steps: int = 100_000
+    checkpoint_freq: int = 1_000
     val_freq: int = 5_000
-    vis_freq: int = 100
+    # vis_freq: int = 2
+    vis_freq: int = 5_000
     log_step_freq: int = 20
     print_step_freq: int = 100
-    evolution_freq: int = 10
 
     # Inference config
     num_inference_steps: int = 1000
     diffusion_scheduler: Optional[str] = 'ddpm'
     num_samples: int = 1
     num_sample_batches: Optional[int] = None
-    sample_from_ema: bool = False
+    sample_from_ema: bool = False 
     sample_save_evolutions: bool = True  # temporarily set by default
-
+    
     # Training config
     freeze_feature_model: bool = True
 
@@ -49,28 +49,28 @@ class RunConfig:
 
 @dataclass
 class LoggingConfig:
-    wandb: bool = False  # --True
-    wandb_project: str = 'pc2'
+    wandb: bool = True #fix here 
+    wandb_project: str = 'pc2-astyx'
 
 
 @dataclass
 class PointCloudProjectionModelConfig:
-
+    
     # Feature extraction arguments
     image_size: int = '${dataset.image_size}'
-    # or 'vit_base_patch16_224_mae' or 'identity'
-    image_feature_model: str = 'vit_small_patch16_224_msn'
+    image_feature_model: str = 'vit_small_patch16_224_msn'  # or 'vit_base_patch16_224_mae' or 'identity'
     use_local_colors: bool = True
     use_local_features: bool = True
     use_global_features: bool = False
+    # use_mask: bool = False
     use_mask: bool = True
     use_distance_transform: bool = True
-
+    
     # TODO
     # # New for the rebuttal
     # use_naive_projection: bool = False
     # use_feature_blur: bool = False
-
+    
     # Point cloud data arguments. Note these are here because the processing happens
     # inside the model, rather than inside the dataset.
     scale_factor: float = "${dataset.scale_factor}"
@@ -79,8 +79,6 @@ class PointCloudProjectionModelConfig:
     color_channels: int = 3
     predict_shape: bool = True
     predict_color: bool = False
-
-    condition_source: str = 'image_rgb'  # depth
 
 
 @dataclass
@@ -117,21 +115,21 @@ class DatasetConfig:
 @dataclass
 class PointCloudDatasetConfig(DatasetConfig):
     eval_split: str = 'val'
-    # max_points: int = 16_384
-    max_points: int = 128  # **
+    max_points: int = 16_384
     image_size: int = 224
     scale_factor: float = 1.0
-    # for only running on a subset of data points
-    restrict_model_ids: Optional[List] = None
+    restrict_model_ids: Optional[List] = None  # for only running on a subset of data points
 
 
 @dataclass
 class CO3DConfig(PointCloudDatasetConfig):
-    type: str = 'co3dv2--'
-    is_scaled: bool = False
-    root: str = os.getenv('CO3DV2_DATASET_ROOT')
-    category: str = 'car'
-    subset_name: str = 'set_lists'
+    type: str = 'astyx'
+    # root: str = os.getenv('CO3DV2_DATASET_ROOT')
+    root: str = os.getenv('ASTYX_DATASET_ROOT')
+    # category: str = 'hydrant'
+    category: str = 'scene'
+    subset_name: str = '80-20' #need here work
+    # ['manyview_dev_1'(1 0 0), 'manyview_test_0' (bad), 'manyview_dev_0' ( 0 1 1 ), 'fewview_dev' (error), 'fewview_test' bad, 'fewview_train' bad]
     mask_images: bool = '${model.use_mask}'
 
 
@@ -165,11 +163,8 @@ class AugmentationConfig:
 
 @dataclass
 class DataloaderConfig:
-    # batch_size: int = 8  # 2 for debug
-    batch_size: int = 1  # 2 for debug
-    num_scenes: int = 1  # **
+    batch_size: int = 12  # 2 for debug
     num_workers: int = 6  # 0 for debug
-    shuffle: bool = False
 
 
 @dataclass
@@ -177,11 +172,11 @@ class LossConfig:
     diffusion_weight: float = 1.0
     rgb_weight: float = 1.0
     consistency_weight: float = 1.0
-    loss_type: str = 'mse'  # 'chamfer' or 'emd'
 
 
 @dataclass
 class CheckpointConfig:
+    # resume: Optional[str] = "/home/outputs/debug/2024-10-08--11-34-20/checkpoint-latest.pth"
     resume: Optional[str] = None
     resume_training: bool = True
     resume_training_optimizer: bool = True
@@ -204,7 +199,8 @@ class ExponentialMovingAverageConfig:
 class OptimizerConfig:
     type: str
     name: str
-    lr: float = 1e-3  # **
+    # lr: float = 1e-3
+    lr: float = 1e-1
     weight_decay: float = 0.0
     scale_learning_rate_with_batch_size: bool = False
     gradient_accumulation_steps: int = 1
@@ -286,13 +282,11 @@ class ProjectConfig:
 
 
 cs = ConfigStore.instance()
-cs.store(name='custom_hydra_run_dir',
-         node=CustomHydraRunDir, package="hydra.run")
+cs.store(name='custom_hydra_run_dir', node=CustomHydraRunDir, package="hydra.run")
 cs.store(group='run', name='default', node=RunConfig)
 cs.store(group='logging', name='default', node=LoggingConfig)
 cs.store(group='model', name='diffrec', node=PointCloudDiffusionModelConfig)
-cs.store(group='model', name='coloring_model',
-         node=PointCloudColoringModelConfig)
+cs.store(group='model', name='coloring_model', node=PointCloudColoringModelConfig)
 cs.store(group='dataset', name='co3d', node=CO3DConfig)
 # TODO
 # cs.store(group='dataset', name='shapenet_r2n2', node=ShapeNetR2N2Config)

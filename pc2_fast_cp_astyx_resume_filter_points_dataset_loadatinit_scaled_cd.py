@@ -1087,6 +1087,7 @@ def train(
     CHECKPOINT_DIR="checkpoint_pc2",
     CHECKPOINT_DB_FILE="checkpoint_db.json",
     loss_ema_factors=[0.9, 0.95, 0.975, 0.99],
+    cd_ema_factors=[0.69, 0.79, 0.89, 0.99],
     prev_cds=[],  # (epoch, cd)
     prev_losses=[],
 ):
@@ -1114,6 +1115,7 @@ def train(
 
         pc, camera, image_rgb, mask, depths = extract_batch(cfg, batch, device)
 
+        assert cfg.model.condition_source == "unconditional_filter", "only unconditional_filter is supported for now"
         sampled_point, xts, x0s, steps = sample(
             model,
             scheduler,
@@ -1178,10 +1180,7 @@ def train(
                     "Loss", {f"ema/{alpha:.4e}": loss_emas[alpha]}, epoch
                 )
 
-        cd_emas = {
-            **{k: None for k in loss_ema_factors},
-            **{k**cfg.run.vis_freq: None for k in loss_ema_factors},
-        }
+        cd_emas ={k: None for k in cd_ema_factors}
 
         for epoch, cd_loss in prev_cds:
             writer.add_scalars("CD_condition", {f"ema/0": cd_loss}, epoch)
