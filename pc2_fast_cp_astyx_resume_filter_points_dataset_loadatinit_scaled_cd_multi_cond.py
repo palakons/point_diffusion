@@ -1347,6 +1347,7 @@ def train(
         # {"epoch":[],  data:{scene_id: [cd]}}
         new_cds = {"epochs": [], "data": {}}
         new_losses = []
+        last_checkpoint_fname = None
         for epoch in tqdm_range:
             batch_losses = train_one_epoch(
                 dataloader, model, optimizer, scheduler, cfg, criterion, device, pcpm
@@ -1361,6 +1362,8 @@ def train(
                     if loss_emas["ave"][alpha] is None
                     else ((1 - alpha) * losses + alpha * loss_emas["ave"][alpha])
                 )
+                # writer.add_scalars(
+                #     "Loss/average", {f"ema_{alpha:.2e}": losses}, epoch)
                 writer.add_scalars(
                     "Loss/average", {f"ema_{alpha:.2e}": loss_emas["ave"][alpha]}, epoch)
 
@@ -1383,6 +1386,10 @@ def train(
                     },
                 }  # {"epoch":[],  data:{scene_id: [cd]}}
 
+                if last_checkpoint_fname is not None:
+                    # remove last checkpoint
+                    os.remove(last_checkpoint_fname)
+
                 save_checkpoint(
                     model,
                     optimizer,
@@ -1394,6 +1401,7 @@ def train(
                     checkpoint_fname.replace(".pth", f"_{epoch}.pth"),
                     f"{CHECKPOINT_DIR}/{CHECKPOINT_DB_FILE}",
                 )
+                last_checkpoint_fname = checkpoint_fname.replace(".pth", f"_{epoch}.pth")
 
                 cfg.run.max_steps = temp_epochs
             if (epoch + 1) % cfg.run.vis_freq == 0:
@@ -1574,6 +1582,9 @@ def train(
                 checkpoint_fname.replace(".pth", f"_final.pth"),
                 f"{CHECKPOINT_DIR}/{CHECKPOINT_DB_FILE}",
             )
+            if last_checkpoint_fname is not None:
+                # remove last checkpoint
+                os.remove(last_checkpoint_fname)
         return loss_emas, cd_emas
 
 
