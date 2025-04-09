@@ -1401,7 +1401,8 @@ def train(
                     checkpoint_fname.replace(".pth", f"_{epoch}.pth"),
                     f"{CHECKPOINT_DIR}/{CHECKPOINT_DB_FILE}",
                 )
-                last_checkpoint_fname = checkpoint_fname.replace(".pth", f"_{epoch}.pth")
+                last_checkpoint_fname = checkpoint_fname.replace(
+                    ".pth", f"_{epoch}.pth")
 
                 cfg.run.max_steps = temp_epochs
             if (epoch + 1) % cfg.run.vis_freq == 0:
@@ -2043,8 +2044,12 @@ def log_utils(log_type="static", model=None, writer=None, epoch=None):
         )
         data["gpu/mem_utilization_GB"] = gpu_mem_util.used / 2**30
 
-        gpu_fan_speed = pynvml.nvmlDeviceGetFanSpeed(handle)
-        data["gpu/fan_speed"] = gpu_fan_speed
+        try:
+            gpu_fan_speed = pynvml.nvmlDeviceGetFanSpeed(handle)
+            data["gpu/fan_speed"] = gpu_fan_speed
+        except exception as e:
+            # Fan speed not supported on all GPUs
+            data["gpu/fan_speed"] = None
 
         gpu_power = pynvml.nvmlDeviceGetPowerUsage(handle)
         data["gpu/power_consumption"] = gpu_power / 1000  # Convert to watts
