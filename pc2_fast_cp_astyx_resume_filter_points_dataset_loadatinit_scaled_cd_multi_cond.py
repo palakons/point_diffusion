@@ -1389,6 +1389,11 @@ def train(
                 if last_checkpoint_fname is not None:
                     # remove last checkpoint
                     os.remove(last_checkpoint_fname)
+                    print(
+                        "removed last checkpoint", last_checkpoint_fname, "confirmed" if os.path.exists(
+                            last_checkpoint_fname) else "not confirmed"
+                    )
+
 
                 save_checkpoint(
                     model,
@@ -1580,7 +1585,7 @@ def train(
                 combined_cds,
                 {"ave": list(prev_losses["ave"]) +
                  list(new_losses)},  # {ave: [loss]}
-                checkpoint_fname.replace(".pth", f"_final.pth"),
+                checkpoint_fname.replace(".pth", f"_{cfg.run.max_steps}_final.pth"),
                 f"{CHECKPOINT_DIR}/{CHECKPOINT_DB_FILE}",
             )
             if last_checkpoint_fname is not None:
@@ -2047,9 +2052,10 @@ def log_utils(log_type="static", model=None, writer=None, epoch=None):
         try:
             gpu_fan_speed = pynvml.nvmlDeviceGetFanSpeed(handle)
             data["gpu/fan_speed"] = gpu_fan_speed
-        except exception as e:
+        except Exception as e:
             # Fan speed not supported on all GPUs
-            data["gpu/fan_speed"] = None
+            # data["gpu/fan_speed"] = None
+            pass
 
         gpu_power = pynvml.nvmlDeviceGetPowerUsage(handle)
         data["gpu/power_consumption"] = gpu_power / 1000  # Convert to watts

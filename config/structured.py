@@ -124,14 +124,25 @@ class PointCloudDatasetConfig(DatasetConfig):
     # for only running on a subset of data points
     restrict_model_ids: Optional[List] = None
 
+    type: str = 'co3dv2--' #astyx,co3d,man-mini,man-full
+    is_scaled: bool = False
+
+    category: str = 'car'  #for MAN, pick scenes id
+    subset_name: str = 'set_lists' #for MAN: interleaved, 
+
+    #data_mean list of float
+    data_stat: str = 'man-mini'
+
 
 @dataclass
 class CO3DConfig(PointCloudDatasetConfig):
-    type: str = 'co3dv2--'
+    type: str = 'co3dv2--' #astyx,co3d,man-mini,man-full
     is_scaled: bool = False
-    root: str = os.getenv('CO3DV2_DATASET_ROOT')
-    category: str = 'car'
-    subset_name: str = 'set_lists'
+    root: str = "/data/palakons/co3d"
+    # root: str = os.getenv('CO3DV2_DATASET_ROOT')
+    category: str = 'car'  #for MAN, pick scenes id
+    subset_name: str = 'set_lists' #for MAN: interleaved, block, random
+
     mask_images: bool = '${model.use_mask}'
 
 
