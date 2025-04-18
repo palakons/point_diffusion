@@ -1544,7 +1544,7 @@ def train(
                                 train_cd_loss_item)
 
                         if idx_i not in train_cd_emas:
-                            print("idx[i]", idx_i)
+                            print(i,"idx[i]", idx_i)
                             train_cd_emas[idx_i] = {
                                 k: None for k in list(cd_ema_factors) + [0]}
 
@@ -1621,7 +1621,6 @@ def train(
                         {f"train/average": train_cd_emas["ave"][alpha]},
                         epoch,
                     )
-                update_cd_emas(cd_ema_factors, prev_cd_emas, new_cds, epoch, idx_i,writer=None, name="X")
 
                 # now same for val vis -> bruteforce
                 # - sample with condition signals from alleach data samples
@@ -2521,6 +2520,17 @@ def main(cfg: ProjectConfig):
     set_seed(cfg.run.seed)
     tb_log_dir = "tb_log"
     log_dir = tb_log_dir + f"/{cfg.run.name}"
+    rev = 0
+    while os.path.exists(log_dir):
+        rev += 1
+        log_dir = tb_log_dir + f"/{cfg.run.name}_rev{rev:02d}"
+        if rev > 100:
+            # too many revisions, exit
+            raise ValueError(
+                f"too many revisions (>100), exiting, current log_dir {log_dir}"
+            )
+            
+            
     writer = SummaryWriter(log_dir=log_dir)
     print("tensorboard log at", log_dir)
 
