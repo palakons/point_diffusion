@@ -82,6 +82,8 @@ class PointCloudProjectionModelConfig:
 
     condition_source: str = 'image_rgb'  # depth
 
+    finetune_vits: bool = False
+
 
 @dataclass
 class PointCloudDiffusionModelConfig(PointCloudProjectionModelConfig):

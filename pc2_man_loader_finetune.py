@@ -5,6 +5,8 @@ from datetime import datetime
 from pathlib import Path
 import inspect
 from pytorch3d.vis.plotly_vis import get_camera_wireframe
+from pytorch3d.transforms import quaternion_to_matrix
+import open3d as o3d
 
 from pytorch3d.implicitron.dataset.json_index_dataset_map_provider_v2 import (
     JsonIndexDatasetMapProviderV2,
@@ -26,12 +28,12 @@ import numpy as np
 import random
 from torch.utils.tensorboard import SummaryWriter
 from model.point_cloud_model import PointCloudModel
-from model.projection_model import PointCloudProjectionModel
+from model.projection_model_finetune import PointCloudProjectionModel
 import os
 from pytorch3d.implicitron.dataset.data_loader_map_provider import (
     SequenceDataLoaderMapProvider,
 )
-from torch.utils.data import SequentialSampler
+from torch.utils.data import SequentialSampler, Subset
 from pytorch3d.implicitron.dataset.dataset_map_provider import DatasetMap
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 
@@ -43,28 +45,26 @@ import pandas as pd
 
 from torch.utils.data import Dataset, DataLoader
 from pytorch3d.renderer.cameras import PerspectiveCameras
+from truckscenes import TruckScenes
 
 
-class AstyxDataset(Dataset):
+class MANDataset(Dataset):
     def __init__(
         self,
         M,
         N,
-        depth_model,
+        scene_id,
+        depth_model="vits",
         random_offset: bool = False,
-        root_dir: str = "/data/palakons/dataset_astyx_hires2019/",
+        data_file: str = "man-mini",  # man-full
         device="cpu",
         is_scaled=False,
         img_size=618,
+        radar_channel='RADAR_LEFT_FRONT',
+        camera_channel='CAMERA_RIGHT_FRONT',
+        data_mean: torch.Tensor = [0, 0, 0],
+        data_std: torch.Tensor = [1, 1, 1],
     ):
-        # root_dir: path to the directory containing the json files
-        self.root_dir = root_dir
-        self.radar_dir = root_dir + "/radar_6455"
-        self.depth_dir = root_dir + "/depth_front"
-        self.camera_dir = root_dir + "/camera_front"
-        # self.depth_models = ['vitl','vitb','vits']
-        self.calibration_dir = root_dir + "/calibration"
-        self.object_dir = root_dir + "/groundtruth_obj3d"
         self.M = M
         self.N = N
         self.depth_model = depth_model  # ['vitl','vitb','vits']
@@ -72,118 +72,144 @@ class AstyxDataset(Dataset):
         self.device = device
         self.is_scaled = is_scaled
         self.img_size = img_size
+        self.data_file = data_file
+        self.scene_id = scene_id
+        self.radar_channel = radar_channel
+        self.camera_channel = camera_channel
+        # store mean and std
+        self.data_mean = data_mean
+        self.data_std = data_std
 
-        self.ids = []
-        # list filesin the radar_dir
-        for file in os.listdir(self.radar_dir):
-            idx = int(file[:6])
-            if idx not in self.ids:
-                if not os.path.exists(
-                    self.depth_dir + f"/{idx:06d}_{self.depth_model}.jpg"
-                ):
-                    print(
-                        "File not found: ",
-                        self.depth_dir + f"/{idx:06d}_{self.depth_model}.jpg",
-                    )
-                    continue
-
-                if not os.path.exists(self.calibration_dir + f"/{idx:06d}.json"):
-                    print("File not found: ",
-                          self.calibration_dir + f"/{idx:06d}.json")
-                    continue
-                if not os.path.exists(self.camera_dir + f"/{idx:06d}.jpg"):
-                    print("File not found: ",
-                          self.camera_dir + f"/{idx:06d}.jpg")
-                    continue
-                if not os.path.exists(self.object_dir + f"/{idx:06d}.json"):
-                    print("File not found: ",
-                          self.object_dir + f"/{idx:06d}.json")
-                    continue
-                self.ids.append(idx)
-        # randomly sample for M items
-        self.active_ids = random.sample(self.ids, M)
+        if self.data_file == "man-mini":
+            self.data_root = '/data/palakons/new_dataset/MAN/mini/man-truckscenes'
+            trucksc = TruckScenes('v1.0-mini', self.data_root, True)
+        elif self.data_file == "man-full":
+            self.data_root = '/data/palakons/new_dataset/MAN/man-truckscenes'
+            trucksc = TruckScenes('v1.0-trainval', self.data_root, True)
+        else:
+            raise ValueError(f"Unknown data_file: {self.data_file}")
 
         self.data_bank = []
-        for i in range(len(self.active_ids)):
-            self.data_bank.append(self.load_data(self.active_ids[i]))
+        first_frame_token = trucksc.scene[self.scene_id]['first_sample_token']
+        frame_token = first_frame_token
+        i = 0
+        while frame_token != "":
+            i = i+1
+            self.data_bank.append(self.load_data(trucksc, frame_token))
+            print(i, "frame_token", frame_token, len(self.data_bank))
+            if len(self.data_bank) >= self.M:
+                break
+            frame_token = trucksc.get('sample', frame_token)['next']
 
-        # stat for position data
-        # print("self.data_bank[0][1]", self.data_bank[0][1].shape)
-        # self.data_bank[0][1] torch.Size([128, 3])
+        if len(self.data_bank) < self.M:
+            print(
+                f"Warning: only {len(self.data_bank)} samples found in scene {self.scene_id}")
+
         all_radar_positions = torch.stack(
             [d[1] for d in self.data_bank], dim=0)
-        # print("all_radar_positions", all_radar_positions.shape)
-        # # all_radar_positions torch.Size([10, 128, 3])
 
-        # print("mean", all_radar_positions.shape)
-        # print("mean", all_radar_positions.mean(axis=(0,1)))
-        # print("std", all_radar_positions.shape)
-        # print("std", all_radar_positions.std(axis=(0,1)))
-        # store mean and std
-        self.data_mean = all_radar_positions.mean(axis=(0, 1))
-        self.data_std = all_radar_positions.std(axis=(0, 1))
+        depth_image_dir = os.path.join(self.data_root, "depth_images")
+        if not os.path.exists(depth_image_dir):
+            os.makedirs(depth_image_dir)
 
-    def load_data(self, idx):
+    def load_data(self, trucksc, frame_token):
 
-        depth = {}
-        image = plt.imread(
-            self.depth_dir + f"/{idx:06d}_{self.depth_model}.jpg")
+        frame = trucksc.get('sample', frame_token)
+        # print("frame keys", frame_token,frame.keys()) # dict_keys(['token', 'scene_token', 'timestamp', 'prev', 'next', 'data', 'anns'])
+        # print("frame data", frame['data'].keys()) # dict_keys(['RADAR_RIGHT_BACK', 'RADAR_RIGHT_SIDE', 'RADAR_RIGHT_FRONT', 'RADAR_LEFT_FRONT', 'RADAR_LEFT_SIDE', 'RADAR_LEFT_BACK', 'LIDAR_LEFT', 'LIDAR_RIGHT', 'LIDAR_TOP_FRONT', 'LIDAR_TOP_LEFT', 'LIDAR_TOP_RIGHT', 'LIDAR_REAR', 'CAMERA_RIGHT_FRONT', 'CAMERA_LEFT_BACK', 'CAMERA_RIGHT_FRONT', 'CAMERA_RIGHT_BACK'])
+        # print("frame",self.camera_channel, frame['data'][self.camera_channel]) # 7625b794c8a14e918dc23113ee5d10da
+        cam = trucksc.get('sample_data', frame['data'][self.camera_channel])
+        # print("cam", cam.keys()) #     dict_keys(['token', 'sample_token', 'ego_pose_token', 'calibrated_sensor_token', 'timestamp', 'fileformat', 'is_key_frame', 'height', 'width', 'filename', 'prev', 'next', 'sensor_modality', 'channel'])
+        # print("radar keys", frame['data'][self.radar_channel]) #  1e6375db490e4563b55fce389b06a53b
+        radar = trucksc.get('sample_data', frame['data'][self.radar_channel])
+        # print("radar", radar.keys())  #dict_keys(['token', 'sample_token', 'ego_pose_token', 'calibrated_sensor_token', 'timestamp', 'fileformat', 'is_key_frame', 'height', 'width', 'filename', 'prev', 'next', 'sensor_modality', 'channel'])
+        # for key in radar.keys():
+        #     print(f"{key}: {radar[key]} vs {cam[key]}")
+        # token: 1e6375db490e4563b55fce389b06a53b vs 4e11f21f05be46f3b219a50904ebaf8d
+        # sample_token: 32d2bcf46e734dffb14fe2e0a823d059 vs 32d2bcf46e734dffb14fe2e0a823d059
+        # ego_pose_token: 9f5d4bc97327401cabe5726c0deb153e vs 9f5d4bc97327401cabe5726c0deb153e
+        # **calibrated_sensor_token: 5e6c5afaa842478db6066e9de8dec1ef vs ef56b5089358479d8e007355933f40dc
+        # timestamp: 1695473372704727 vs 1695473372700156
+        # fileformat: pcd vs jpg
+        # is_key_frame: True vs True
+        # height: 1 vs 943
+        # width: 800 vs 1980
+        # filename: samples/RADAR_LEFT_FRONT/RADAR_LEFT_FRONT_1695473372704727.pcd vs samples/CAMERA_RIGHT_FRONT/CAMERA_RIGHT_FRONT_1695473372700156.jpg
+        # prev: c03850fc93fe413c92529dd6086cf91a vs cf265bf26e9f482e9e71d38d71432519
+        # next: 1ff031d024cd4c86b51ea2e1568761b0 vs db7b8b0d6427459ca6689bc10299cb7c
+        # sensor_modality: radar vs camera
+        # channel: RADAR_LEFT_FRONT vs CAMERA_RIGHT_FRONT
 
-        # if image is of 3 channels, take only the first one
-        # print("image.shape: ", image.shape)
-        if len(image.shape) == 3:
-            image = image[:, :, 0]
-        if image.max() > 1.0:
-            image = image / 255.0
-        depth = torch.tensor(image, dtype=torch.float32)
-        # print("depth: ", depth.shape)  # depth:  torch.Size([618, 2048])
+        # 1) load depth
+        depth_image_path = os.path.join(self.data_root, "depth_images", cam['filename'].replace(
+            '.jpg', f'_{self.depth_model}.png'))
+
+        if not os.path.exists(depth_image_path):
+            raise ValueError(f"Depth image not found: {depth_image_path}")
+
+        depth_image = plt.imread(depth_image_path)
+        original_image_size = (depth_image.shape[0], depth_image.shape[1])
+        # print("original_image_size", original_image_size) # original_image_size (943, 1980)
+        if len(depth_image.shape) == 3:
+            depth_image = depth_image[:, :, 0]
+        if depth_image.max() > 1.0:
+            depth_image = depth_image / 255.0
+        depth_image = torch.tensor(depth_image, dtype=torch.float32)
 
         square_image_offset = (
-            int((depth.shape[1] - depth.shape[0]) / 2)
+            int((depth_image.shape[1] - depth_image.shape[0]) / 2)
             if not self.random_offset
-            else random.randint(0, depth.shape[1] - depth.shape[0])
+            else random.randint(0, depth_image.shape[1] - depth_image.shape[0])
         )
 
-        # square_image_offset = depth.shape[1] - depth.shape[0]
-        # print("square_image_offset: ", square_image_offset)
-        image_size_hw = (depth.shape[0], depth.shape[1])
-        depth = depth[:,
-                      square_image_offset: square_image_offset + depth.shape[0]]
+        depth_image = depth_image[:,
+                                  square_image_offset: square_image_offset + depth_image.shape[0]]
 
-        # resize image to self.img_size
-
-        depth = torch.nn.functional.interpolate(
-            depth.unsqueeze(0).unsqueeze(0),
+        depth_image = torch.nn.functional.interpolate(
+            depth_image.unsqueeze(0).unsqueeze(0),
             size=(self.img_size, self.img_size),
             mode="bilinear",
             align_corners=False,
         ).squeeze(0).squeeze(0)
 
-        # load radar data, .txt
-        df = pd.read_csv(
-            self.radar_dir + f"/{idx:06d}.txt", sep=" ", skip_blank_lines=True
-        )
-        df = df.iloc[:, :3]
-        # convert to tensor
-        radar_data = torch.tensor(df.values)
+        # 2) load radar
+        # load pcd
+        radar_pcd_path = os.path.join(self.data_root, radar['filename'])
+        cloud = o3d.io.read_point_cloud(radar_pcd_path)
+        # print("cloud ", cloud) # cloud  PointCloud with 800 points.
+        # print('cloud points', np.asarray(cloud.points))
+        # print("coloud colors", np.asarray(cloud.colors))
+        # print("cloud normals", np.asarray(cloud.normals))
+        # coloud colors []
+        # cloud normals []
+
+        radar_data = torch.tensor(cloud.points)
         npoints_original = radar_data.shape[0]
 
-        # load calibration data, .json
-        with open(self.calibration_dir + f"/{idx:06d}.json") as f:
-            calibrations = json.load(f)
-            for c in calibrations["sensors"]:
-                if c["sensor_uid"] == "camera_front":
-                    new_camera_base = calib_to_camera_base(
-                        c["calib_data"], [image_size_hw[0]] *
-                        2, square_image_offset, self.img_size
-                    )
+        # 3) load calibration
 
-        assert (
-            new_camera_base is not None
-        ), "new_camera_base is None (not found in calibration data)"
+        # print calibration
+        cam_calib = trucksc.get('calibrated_sensor',
+                                cam['calibrated_sensor_token'])
+        # print("cam_calib", cam_calib.keys()) # cam_calib dict_keys(['token', 'sensor_token', 'translation', 'rotation', 'camera_intrinsic'])
+        radar_calib = trucksc.get(
+            'calibrated_sensor', radar['calibrated_sensor_token'])
+        # print("radar_calib", radar_calib.keys()) #radar_calib dict_keys(['token', 'sensor_token', 'translation', 'rotation', 'camera_intrinsic'])
+        # for key in ['translation', 'rotation', 'camera_intrinsic']:
+        #     print(f"{key}: {radar_calib[key]} vs {cam_calib[key]}")
 
-        # load camera data, .jpg
-        camera_front = plt.imread(self.camera_dir + f"/{idx:06d}.jpg").transpose(
+        # translation: [5.2589504, 1.2266158, 2.0126382] vs [5.226811, -1.310934, 2.092867]
+        # rotation: [0.9852383302074951, -0.0004248721511361222, 0.018700997418231523, -0.1701632300738485] vs [0.46356873659542747, -0.46682641092971633, 0.5298264899369438, -0.5352205331177945]
+        # camera_intrinsic: [] vs [[640.0, 0.0, 960.0], [0.0, 640.0, 520.0], [0.0, 0.0, 1.0]]
+
+        cam_calib_obj = calib_to_camera_base_MAN(cam_calib, radar_calib, [original_image_size[0]] *
+                                                 2, square_image_offset, self.img_size
+                                                 )
+
+        # 4) load camera
+        image_rgb_path = os.path.join(self.data_root, cam['filename'])
+
+        camera_front = plt.imread(image_rgb_path).transpose(
             2, 0, 1
         )
         if camera_front.max() > 1.0:
@@ -207,15 +233,14 @@ class AstyxDataset(Dataset):
         world_points = radar_data.clone().detach().float()
         # cam_coord = new_camera_base.get_world_to_view_transform().transform_points(
         #     torch.tensor(world_points, dtype=torch.float32))  # N x3
-        image_coord = new_camera_base.transform_points(world_points)
+        # print("shape",world_points.shape) #shape torch.Size([800, 3])
+
+        image_coord = cam_calib_obj.transform_points(
+            torch.tensor(world_points))
         # torch.tensor(world_points, dtype=torch.float32))  # N x3
         points_uv = image_coord[:, :2]  # N x2
 
-        # print("shapes: ", points_uv.shape)
-        # print("min axis 0", points_uv.min(axis=0))
-        # print("max axis 0", points_uv.max(axis=0))
-        # print("filtering from to", square_image_offset,
-        #   camera_front.shape[1]+square_image_offset)
+        # 5) filter points
         mask = (
             (points_uv[:, 1] >= 0)
             & (points_uv[:, 1] < camera_front.shape[1])
@@ -223,27 +248,13 @@ class AstyxDataset(Dataset):
             & (points_uv[:, 0] < camera_front.shape[1])
             # & (points_uv[:, 2] > 0)  # Ensure points are in front of the camera
         )
-        # print("radar_data: ", radar_data.shape)
         filtered_radar_data = radar_data[mask]
         npoints_filtered = filtered_radar_data.shape[0]
-        # print("filtered_radar_data: ", filtered_radar_data.shape)
 
-        # image_coord_in = new_camera_base.transform_points(
-        #     torch.tensor(radar_data[mask], dtype=torch.float32))  # N x3
-        # image_coord_out = new_camera_base.transform_points(
-        #     torch.tensor(radar_data[~mask], dtype=torch.float32))  # N x3
-
-        # print("in", filtered_radar_data.shape, image_coord_in.shape)
-        # print("min max in", image_coord_in.min(
-        #     axis=0), image_coord_in.max(axis=0))
-        # print("out", radar_data[~mask].shape, image_coord_out.shape)
-
-        # print("radar_data: ", radar_data.shape)#radar_data:  torch.Size([2246, 3])
-        # sample radar data points to N points
+        # 6) randomly filter point or sample to have N points
         filtered_radar_data = filtered_radar_data[
             torch.randperm(filtered_radar_data.size(0))[: self.N]
         ]
-
         while filtered_radar_data.shape[0] < self.N:
             filtered_radar_data = torch.cat(
                 [
@@ -255,30 +266,19 @@ class AstyxDataset(Dataset):
                     ],
                 ]
             )
-        # print("radar_data: ", radar_data.shape)#radar_data:  torch.Size([N, 3])
 
-        # load object data, .json
-        with open(self.object_dir + f"/{idx:06d}.json") as f:
-            objects = json.load(f)
-
-        # print("shapes: ", depth.shape, filtered_radar_data.shape, camera_front.shape,len(objects),len(idx),npoints)
-        print(
-            f"idx {idx} npoints_original {npoints_original} npoints_filtered {npoints_filtered} square_image_offset {square_image_offset}"
-        )
         return (
-            depth,
+            depth_image,
             filtered_radar_data,
-            new_camera_base,
+            cam_calib_obj,
             camera_front,
-            objects,
-            idx,
+            frame_token,
             npoints_original,
-            npoints_filtered,
-            square_image_offset,
+            npoints_filtered
         )
 
     def __len__(self):
-        return len(self.active_ids)
+        return len(self.data_bank)
 
     def __getitem__(self, idx):
         if not self.is_scaled:
@@ -286,15 +286,13 @@ class AstyxDataset(Dataset):
             return self.data_bank[idx]
 
         (
-            depth,
+            depth_image,
             filtered_radar_data,
-            new_camera_base,
+            cam_calib_obj,
             camera_front,
-            objects,
-            idx,
+            frame_token,
             npoints_original,
-            npoints_filtered,
-            square_image_offset,
+            npoints_filtered
         ) = self.data_bank[idx]
 
         # print("mean", self.data_mean)
@@ -310,37 +308,32 @@ class AstyxDataset(Dataset):
         # mean tensor([38.5517, -0.2240,  1.0346], dtype=torch.float64)                                                             std tensor([20.8821,  3.5820,  1.9252], dtype=torch.float64)                                                             filtered_radar_data torch.Size([128, 3])                                                                  filtered_radar_data tensor([73.2768, -1.1732,  3.0596], dtype=torch.float64)                                                             newd torch.Size([128, 3])                                                                                                                        filtered_radar_data tensor([ 1.6629, -0.2650,  1.0518], dtype=torch.float64)
 
         return (
-            depth,
+            depth_image,
             (filtered_radar_data - self.data_mean) / self.data_std,
-            new_camera_base,
+            cam_calib_obj,
             camera_front,
-            objects,
-            idx,
+            frame_token,
             npoints_original,
-            npoints_filtered,
-            square_image_offset,
+            npoints_filtered
         )
 
 
-def custom_collate_fn(batch):
+def custom_collate_fn_man(batch):
     (
         depths,
         radar_data,
         camera_base_list,
         camera_fronts,
-        objects,
-        idxs,
-        npoints,
-        npoints_filtered,
-        square_image_offset,
+        frame_token,
+        npoints_original,
+        npoints_filtered
     ) = zip(*batch)
 
-    npoints_after = torch.as_tensor(npoints)
+    npoints_after = torch.as_tensor(npoints_original)
     npoints_filtered_after = torch.as_tensor(npoints_filtered)
-    idxs_after = torch.as_tensor(idxs)
-    square_image_offset_after = torch.as_tensor(square_image_offset)
 
-    objects_after = list(objects)
+    frame_token_after = list(frame_token)
+
     camera_fronts_after = torch.stack(camera_fronts)
     radar_data_after = torch.stack(radar_data)
     depths_after = torch.stack(depths)
@@ -379,85 +372,36 @@ def custom_collate_fn(batch):
         depths_after,
         radar_data_after,
         camera_bases,
-        camera_fronts_after,
-        objects_after,
-        idxs_after,
+        camera_fronts_after, frame_token_after,
         npoints_after,
         npoints_filtered_after,
-        square_image_offset_after,
     )
 
 
-def custom_collate_fn_org(batch):
-    (
-        depths,
-        radar_data,
-        camera_base_list,
-        camera_fronts,
-        objects,
-        idxs,
-        npoints,
-        npoints_filtered,
-        square_image_offset,
-    ) = zip(*batch)
+def calib_to_camera_base_MAN(cam_calib, radar_calib, image_size_hw: tuple, offset: int = 0, image_size: int = 618):
 
-    npoints_after = torch.tensor(npoints)
-    npoints_filtered_after = torch.tensor(npoints_filtered)
-    idxs_after = torch.tensor(idxs)
-    square_image_offset_after = torch.tensor(square_image_offset)
-    objects_after = list(objects)
-    camera_fronts_after = torch.stack(camera_fronts)
-    radar_data_after = torch.stack(radar_data)
-    depths_after = torch.stack(depths)
+    MAN_image_height = 943
 
-    focal_length = []
-    principal_point = []
-    R = []
-    T = []
-    image_sizes_hw = []
-    for camera_base in camera_base_list:
-        focal_length.append(camera_base.focal_length)
-
-        principal_point.append(camera_base.principal_point)
-        R.append(camera_base.R)
-        T.append(camera_base.T)
-        image_sizes_hw.append(camera_base.image_size)
-
-    focal_lengths = torch.concat(focal_length)
-    principal_points = torch.concat(principal_point)
-    Rs = torch.concat(R)
-    Ts = torch.concat(T)
-    image_sizes_hw = torch.concat(image_sizes_hw)
-
-    # print("image_sizes_hw: ", image_sizes_hw)
-
-    camera_bases = PerspectiveCameras(
-        focal_length=focal_lengths,
-        principal_point=principal_points,
-        R=Rs,
-        T=Ts,
-        in_ndc=False,
-        image_size=image_sizes_hw,
-    )
-
-    return (
-        depths_after,
-        radar_data_after,
-        camera_bases,
-        camera_fronts_after,
-        objects_after,
-        idxs_after,
-        npoints_after,
-        npoints_filtered_after,
-        square_image_offset_after,
-    )
-
-
-def calib_to_camera_base(calibration_data, image_size_hw: tuple, offset: int = 0, image_size: int = 618):
-
-    s = image_size/618
+    s = image_size/MAN_image_height
     # Convert intrinsic matrix K to tensor
-    K = torch.tensor(calibration_data["K"])
+
+    world_to_radar_RT = torch.eye(4)
+    world_to_radar_RT[:3, :3] = quaternion_to_matrix(
+        torch.tensor([radar_calib['rotation']]))[0]
+    world_to_radar_RT[:3, 3] = torch.tensor(radar_calib['translation'])
+
+    # print("world_to_radar_RT", world_to_radar_RT)
+
+    world_to_cam_RT = torch.eye(4)
+    world_to_cam_RT[:3, :3] = quaternion_to_matrix(
+        torch.tensor([cam_calib['rotation']]))[0]
+    world_to_cam_RT[:3, 3] = torch.tensor(cam_calib['translation'])
+    # left multiple system: transfromed coordinate = RT * original coordinate
+    radar_to_cam_RT = world_to_cam_RT @ torch.linalg.inv(world_to_radar_RT)
+    R = radar_to_cam_RT[:3, :3].unsqueeze(0)
+    T = radar_to_cam_RT[:3, 3].unsqueeze(0)
+
+    K = torch.tensor(cam_calib['camera_intrinsic'])
 
     K[0, 0] = K[0, 0] * s
     K[1, 1] = K[1, 1] * s
@@ -470,15 +414,6 @@ def calib_to_camera_base(calibration_data, image_size_hw: tuple, offset: int = 0
     # Extract focal length and principal point from K
     focal_length = torch.tensor([[K[0, 0], K[1, 1]]])
     principal_point = torch.tensor([[K[0, 2] - offset, K[1, 2]]])
-
-    # Convert extrinsic matrix T_to_ref_COS to tensor
-    T_to_ref_COS = torch.tensor(calibration_data["T_to_ref_COS"])
-
-    # Extract rotation (R) and translation (T) components
-    R = T_to_ref_COS[:3, :3].unsqueeze(0)  # 3x3 rotation matrix
-    RT_inv = torch.inverse(T_to_ref_COS)
-    T = RT_inv[:3, 3].unsqueeze(0)  # 3x1 translation vector
-    # T = T_to_ref_COS[:3, 3].unsqueeze(0)   # 3x1 translation vector
 
     # Create a PerspectiveCameras object
     return PerspectiveCameras(
@@ -548,39 +483,35 @@ class PointCloudLoss(nn.Module):
 
 def extract_batch(cfg: ProjectConfig, batch, device):
 
-    if cfg.dataset.type == "astyx":
+    if cfg.dataset.type in ["man-mini", "man-full"]:
+
         (
             depths,
             radar_data,
             camera,
             image_rgb,
-            objects,
-            idx,
+            frame_token,
             npoints,
             npoints_filtered,
-            offsets,
         ) = batch
+
         depths = depths.to(device)
-        camera = camera.to(device)
-        mask = None
-        image_rgb = image_rgb.to(device)
         points = radar_data.float().to(device)
         pc = Pointclouds(points=points)
-    elif cfg.dataset.type == "co3dv2":
-        batch = batch.to(device)
-        pc = batch.sequence_point_cloud
-        camera = batch.camera
-        image_rgb = batch.image_rgb
-        mask = batch.fg_probability
-        depths = None
-        idx = None
+        camera = camera.to(device)
+        image_rgb = image_rgb.to(device)
+        mask = None
+        idx = frame_token
 
+    else:
+        raise ValueError(f"Unknown dataset type: {cfg.dataset.type}")
     return pc, camera, image_rgb, mask, depths, idx
 
 
 # Training function
 def train_one_epoch(
-    dataloader,
+    dataloader_train,
+    dataloader_val,
     model,
     optimizer,
     scheduler,
@@ -590,13 +521,18 @@ def train_one_epoch(
     pcpm: PointCloudProjectionModel,
 ):
     assert pcpm is not None, "pcpm must be provided"
+
+    # type of dataset <class 'torch.utils.data.dataset.Subset'>
+    # print("type of dataset", type(dataloader.dataset))
+    data_mean = dataloader_train.dataset.dataset.data_mean.to(device).float()
+    data_std = dataloader_train.dataset.dataset.data_std.to(device).float()
+
     model.train()
+    if cfg.model.finetune_vits:
+        pcpm.feature_model.model.train()
 
-    data_mean = dataloader.dataset.data_mean.to(device).float()
-    data_std = dataloader.dataset.data_std.to(device).float()
-
-    batch_losses = []
-    for batch in dataloader:
+    batch_train_losses = []
+    for batch in dataloader_train:
 
         pc, camera, image_rgb, mask, depths, idx = extract_batch(
             cfg, batch, device)
@@ -640,8 +576,58 @@ def train_one_epoch(
         loss = criterion(noise_pred, noise)
         loss.backward()
         optimizer.step()
-        batch_losses.append(loss.item())  # float
-    return batch_losses
+        batch_train_losses.append(loss.item())  # float
+
+    model.eval()
+    if cfg.model.finetune_vits:
+        pcpm.feature_model.model.eval()
+    batch_val_losses = []
+    # print("len(dataloader_val)", len(dataloader_val))
+    with torch.no_grad():
+        for batch in dataloader_val:
+
+            pc, camera, image_rgb, mask, depths, idx = extract_batch(
+                cfg, batch, device)
+
+            x_0 = pcpm.point_cloud_to_tensor(pc, normalize=True, scale=True)
+
+            B, N, D = x_0.shape
+            noise = torch.randn_like(x_0)
+            timesteps = torch.randint(
+                0,
+                scheduler.config.num_train_timesteps,
+                (B,),
+                device=device,
+                dtype=torch.long,
+            )
+            x_t = scheduler.add_noise(x_0, noise, timesteps)  # noisy_x
+            # print("type x_t", type(x_t))
+            # print("dtype x_t", x_t.dtype)
+
+            x_t_input = apply_conditioning_to_xt(
+                cfg,
+                (x_t * data_std + data_mean) if cfg.dataset.is_scaled else x_t,
+                camera,
+                image_rgb,
+                depths,
+                mask,
+                timesteps,
+                pcpm,
+            )
+
+            if cfg.dataset.is_scaled:
+                # scale back the first 3 dimensions
+                x_t_input[:, :, :3] = x_t[:, :, :3]
+
+            noise_pred = model(x_t_input, timesteps)
+
+            if not noise_pred.shape == noise.shape:
+                raise ValueError(
+                    f"{noise_pred.shape} and {noise.shape} not equal")
+
+            loss = criterion(noise_pred, noise)
+            batch_val_losses.append(loss.item())  # float
+    return batch_train_losses, batch_val_losses
 
 
 def get_camera_wires_trans(cameras, scale: float = 1):
@@ -1168,23 +1154,25 @@ def to_dict(cfg):
 
 def save_checkpoint(
     # (epoch, cd)
-    model,
+    model,vits_model,
     optimizer,
     cfg,
-    cd_list,
-    loss_list,
+    train_cd_list,
+    train_loss_list,
+    val_cd_list,
+    val_loss_list,
     checkpoint_fname,
     db_fname,
 ):
-
-    print("saving loss", loss_list)
-    print("saving cd", cd_list)
     checkpoint = {
+        "vits_model": {"model":vits_model.state_dict()},
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "args": cfg,
-        "cds": cd_list,
-        "losses": loss_list,
+        "train_cds": train_cd_list,
+        "train_losses": train_loss_list,
+        "val_cds": val_cd_list,
+        "val_losses": val_loss_list,
     }
     torch.save(checkpoint, checkpoint_fname)
 
@@ -1194,7 +1182,7 @@ def save_checkpoint(
         json.dump(data, f)
         f.write("\n")
 
-    print("checkpoint saved at", checkpoint_fname)
+    # print("checkpoint saved at", checkpoint_fname)
     # print("saved at", db_fname)
 
 
@@ -1211,9 +1199,83 @@ def aggregate_ema(value_list, ema_factor):
     return ema_list
 
 
+def process_emas_prev_values(cfg, writer, loss_ema_factors, cd_ema_factors, prev_train_losses, prev_train_cds, prev_val_losses, prev_val_cds):
+    # process ema factors
+    
+    train_loss_emas = process_ema_prev_values(cfg,
+                                              writer, list(
+                                                  loss_ema_factors) + [0], None, prev_train_losses, "train"
+                                              )  # {"ave": [loss]}
+    train_cd_emas = process_ema_prev_values(cfg,
+                                            writer, list(cd_ema_factors) +
+                                            [0], prev_train_cds["epochs"], prev_train_cds["data"], "train"
+                                            )  # {"epoch":[],  data:{scene_id: [cd]}}
+
+    val_loss_emas = process_ema_prev_values(cfg,
+                                            writer, list(
+                                                loss_ema_factors) + [0], None, prev_val_losses, "val"
+                                            )  # {"ave": [loss]}
+    val_cd_emas = process_ema_prev_values(cfg,
+                                          writer, list(cd_ema_factors) +
+                                          [0], prev_val_cds["epochs"], prev_val_cds["data"], "val"
+                                          )  # {"epoch":[],  data:{scene_id: [cd]}}
+
+    return train_loss_emas, train_cd_emas, val_loss_emas, val_cd_emas
+
+
+def combine_loss_cd_history(prev_losses, new_losses, prev_cds, new_cds):
+    combined_losses = {
+        "ave": list(prev_losses["ave"]) + list(new_losses)
+    }
+    combined_cds = {
+        "epochs": list(prev_cds["epochs"]) + list(new_cds["epochs"]),
+        "data": {
+            scene_id: (
+                list(prev_cds["data"][scene_id])
+                if len(prev_cds["epochs"]) > 0
+                else []
+            )
+            + list(new_cds["data"][scene_id])
+            for scene_id in new_cds["data"]
+        },
+    }  # {"epoch":[],  data:{scene_id: [cd]}}
+    return combined_losses, combined_cds
+
+
+def update_loss_emas(loss_ema_factors, prev_loss_emas, new_loss, epoch, writer=None, name="X"):
+
+    for alpha in list(loss_ema_factors) + [0]:
+        prev_loss_emas["ave"][alpha] = (
+            new_loss
+            if prev_loss_emas["ave"][alpha] is None
+            else ((1 - alpha) * new_loss + alpha * prev_loss_emas["ave"][alpha])
+        )
+        if writer is not None:
+            writer.add_scalars(
+                f"Loss_ema_{alpha:.2e}", {f"{name}/average": prev_loss_emas["ave"][alpha]}, epoch)
+    return prev_loss_emas
+
+def update_cd_emas(cd_ema_factors, prev_cd_emas, new_cds, epoch, idx_i,writer=None, name="X"):
+    for alpha in list(cd_ema_factors) + [0]:
+        prev_cd_emas[idx_i][alpha] = (
+            new_cds
+            if prev_cd_emas[idx_i][alpha] is None
+            else (
+                (1 - alpha) * new_cds
+                + alpha * prev_cd_emas[idx_i][alpha]
+            )
+        )
+        writer.add_scalars(
+            f"CD_ema_{alpha:.2e}",
+            {f"{name}/scene_{idx_i[:3]}":
+                prev_cd_emas[idx_i][alpha]},
+            epoch,
+        )
+
 def train(
     model,
-    dataloader,
+    dataloader_train,
+    dataloader_val,
     optimizer,
     scheduler,
     cfg: ProjectConfig,
@@ -1227,15 +1289,19 @@ def train(
     loss_ema_factors=[0.9, 0.95, 0.975, 0.99],
     cd_ema_factors=[0.69, 0.79, 0.89, 0.99],
     # {"epoch":[],  data:{scene_id: [cd]}}
-    prev_cds={"epochs": [], "data": {}},
-    prev_losses={"ave": []},  # {ave: [loss]}
+    prev_train_cds={"epochs": [], "data": {}},
+    prev_train_losses={"ave": []},  # {ave: [loss]}
+    prev_val_cds={"epochs": [], "data": {}},
+    prev_val_losses={"ave": []},  # {ave: [loss]}
+
 ):
     assert pcpm is not None, "pcpm must be provided"
 
     assert (
-        len(prev_losses["ave"]) == start_epoch
-    ), f"prev_cds and start_epoch should have same length"
-    model.train()
+        len(prev_train_losses["ave"]) == start_epoch and len(
+            prev_val_losses["ave"]) == start_epoch
+    ), f"prev_train_losses and start_epoch should have same length"
+
     tqdm_range = trange(start_epoch, cfg.run.max_steps, desc="Epoch")
     # add run name and host name to checkpoint
     proc_id = os.getpid()
@@ -1245,23 +1311,29 @@ def train(
         os.makedirs(os.path.dirname(checkpoint_fname))
     print("checkpoint to be saved at", checkpoint_fname)
 
-    loss_emas = process_ema_prev_values(cfg,
-                                        writer, list(
-                                            loss_ema_factors) + [0], None, prev_losses, "Loss"
-                                        )  # {"ave": [loss]}
-    cd_emas = process_ema_prev_values(cfg,
-                                      writer, list(cd_ema_factors) +
-                                      [0], prev_cds["epochs"], prev_cds["data"], "CD"
-                                      )  # {"epoch":[],  data:{scene_id: [cd]}}
+    train_loss_emas, train_cd_emas, val_loss_emas, val_cd_emas = process_emas_prev_values(
+        cfg, writer, loss_ema_factors, cd_ema_factors, prev_train_losses, prev_train_cds, prev_val_losses, prev_val_cds)
 
-    if start_epoch == cfg.run.max_steps:  # no training, checkpoint available
+    # train_loss_emas = process_ema_prev_values(cfg,
+    #                                     writer, list(
+    #                                         loss_ema_factors) + [0], None, prev_train_losses, "Loss"
+    #                                     )  # {"ave": [loss]}
+    # train_cd_emas = process_ema_prev_values(cfg,
+    #                                   writer, list(cd_ema_factors) +
+    #                                   [0], prev_train_cds["epochs"], prev_train_cds["data"], "CD"
+    #                                   )  # {"epoch":[],  data:{scene_id: [cd]}}
+
+    if start_epoch == cfg.run.max_steps and False:  # no training, checkpoint available
         print(
             "checkpoint already available at",
             checkpoint_fname,
             "goes directly to inference",
         )
         epoch = start_epoch
-        batch = next(iter(dataloader))
+
+        # calculate batch CD
+
+        batch = next(iter(dataloader_train))
 
         dir_name = f"plots/{cfg.run.name}"
 
@@ -1285,18 +1357,18 @@ def train(
                 num_inference_steps=None,
                 device=device,
                 pcpm=pcpm,
-                data_mean=dataloader.dataset.data_mean,
-                data_std=dataloader.dataset.data_std,
+                data_mean=dataloader_train.dataset.dataset.data_mean,
+                data_std=dataloader_train.dataset.dataset.data_std,
             )
 
             pc_condition = pcpm.point_cloud_to_tensor(
                 pc[i: i + 1], normalize=True, scale=True
             )
 
-            cd_loss, _ = calculate_chamfer_distance(
+            train_cd_loss, _ = calculate_chamfer_distance(
                 cfg.dataset.is_scaled,
-                dataloader.dataset.data_mean,
-                dataloader.dataset.data_std,
+                dataloader_train.dataset.dataset.data_mean,
+                dataloader_train.dataset.dataset.data_std,
                 sampled_point,
                 pc_condition,
                 device,
@@ -1317,9 +1389,9 @@ def train(
                 image_rgb=image_rgb[i: i + 1].detach().cpu(),
                 # mask=mask[:1].detach().cpu() if mask is not None else None,
                 depths=depths,
-                cd=cd_loss.item(),
-                data_mean=dataloader.dataset.data_mean,
-                data_std=dataloader.dataset.data_std,
+                cd=train_cd_loss.item(),
+                data_mean=dataloader_train.dataset.dataset.data_mean,
+                data_std=dataloader_train.dataset.dataset.data_std,
                 plt_title=f"gt{i}_idx{idx[i]}",
             )
 
@@ -1338,78 +1410,86 @@ def train(
                 plt_title=f"gt{i}_idx{idx[i]}",
             )
 
-        return loss_emas, cd_emas
+        return train_loss_emas, train_cd_emas, val_loss_emas, val_cd_emas
 
     else:
         print("start from epoch", start_epoch, "to", cfg.run.max_steps)
 
         already_image_mask = False
         # {"epoch":[],  data:{scene_id: [cd]}}
-        new_cds = {"epochs": [], "data": {}}
-        new_losses = []
+        new_train_cds, new_val_cds = {
+            "epochs": [], "data": {}}, {"epochs": [], "data": {}}
+        new_train_losses, new_val_losses = [], []
         last_checkpoint_fname = None
         for epoch in tqdm_range:
-            batch_losses = train_one_epoch(
-                dataloader, model, optimizer, scheduler, cfg, criterion, device, pcpm
+            log_utils(log_type="dynamic", model=model,
+                      writer=writer, epoch=epoch)
+            batch_train_losses, batch_val_losses = train_one_epoch(
+                dataloader_train, dataloader_val, model, optimizer, scheduler, cfg, criterion, device, pcpm
             )
-            losses = sum(batch_losses) / len(batch_losses)
-            new_losses.append(losses)
-            tqdm_range.set_description(f"loss: {losses:.4f}")
+            train_losses = sum(batch_train_losses) / len(batch_train_losses)
+            val_losses = sum(batch_val_losses) / len(batch_val_losses)
 
-            for alpha in list(loss_ema_factors) + [0]:
-                loss_emas["ave"][alpha] = (
-                    losses
-                    if loss_emas["ave"][alpha] is None
-                    else ((1 - alpha) * losses + alpha * loss_emas["ave"][alpha])
-                )
-                # writer.add_scalars(
-                #     "Loss/average", {f"ema_{alpha:.2e}": losses}, epoch)
-                writer.add_scalars(
-                    "Loss/average", {f"ema_{alpha:.2e}": loss_emas["ave"][alpha]}, epoch)
+            new_train_losses.append(train_losses)
+            new_val_losses.append(val_losses)
+
+            tqdm_range.set_description(f"loss: {train_losses:.4f}")
+
+            train_loss_emas = update_loss_emas(
+                loss_ema_factors, train_loss_emas, train_losses, epoch, writer=writer, name="train")
+            val_loss_emas = update_loss_emas(
+                loss_ema_factors, val_loss_emas, val_losses, epoch, writer=writer, name="val")
+
+            # for alpha in list(loss_ema_factors) + [0]:
+            #     train_loss_emas["ave"][alpha] = (
+            #         train_losses
+            #         if loss_emas["ave"][alpha] is None
+            #         else ((1 - alpha) * train_losses + alpha * loss_emas["ave"][alpha])
+            #     )
+            #     # writer.add_scalars(
+            #     #     "Loss/average", {f"ema_{alpha:.2e}": losses}, epoch)
+            #     writer.add_scalars(
+            #         "Loss/average", {f"ema_{alpha:.2e}": loss_emas["ave"][alpha]}, epoch)
 
             if (epoch + 1) % cfg.run.checkpoint_freq == 0:
                 temp_epochs = cfg.run.max_steps
                 cfg.run.max_steps = epoch + 1
 
-                # combine prev_cds and new_cds
+                # combine prev_train_cds and new_cds
 
-                for scene_id in new_cds["data"]:
-                    if scene_id not in prev_cds["data"]:
-                        print("scene_id", scene_id,"is only in new_cds")
-                        print("scenes in prev_cds", prev_cds["data"].keys())
-                        print("scenes in new_cds", new_cds["data"].keys())
-                        break
+                # combined_train_cds = {
+                #     "epochs": list(prev_train_cds["epochs"]) + list(new_train_cds["epochs"]),
+                #     "data": {
+                #         scene_id: (
+                #             list(prev_train_cds["data"][scene_id])
+                #             if len(prev_train_cds["epochs"]) > 0
+                #             else []
+                #         )
+                #         + list(new_train_cds["data"][scene_id])
+                #         for scene_id in new_train_cds["data"]
+                #     },
+                # }  # {"epoch":[],  data:{scene_id: [cd]}}
+                # combined_train_losses = {
+                #     "ave": list(prev_train_losses["ave"]) + list(new_train_losses)
+                # }
+                combined_train_losses, combined_train_cds = combine_loss_cd_history(
+                    prev_train_losses, new_train_losses, prev_train_cds, new_train_cds)
 
-                combined_cds = {
-                    "epochs": list(prev_cds["epochs"]) + list(new_cds["epochs"]),
-                    "data": {
-                        scene_id: (
-                            list(prev_cds["data"][scene_id] if scene_id in prev_cds["data"] else [])
-                            if len(prev_cds["epochs"]) > 0
-                            else []
-                        )
-                        + list(new_cds["data"][scene_id])
-                        for scene_id in new_cds["data"]
-                    },
-                }  # {"epoch":[],  data:{scene_id: [cd]}}
+                combined_val_losses, combined_val_cds = combine_loss_cd_history(
+                    prev_val_losses, new_val_losses, prev_val_cds, new_val_cds)
 
                 if last_checkpoint_fname is not None:
                     # remove last checkpoint
                     os.remove(last_checkpoint_fname)
-                    print(
-                        "removed last checkpoint", last_checkpoint_fname, "confirmed" if os.path.exists(
-                            last_checkpoint_fname) else "not confirmed"
-                    )
-
 
                 save_checkpoint(
                     model,
+                    pcpm.feature_model.model,
                     optimizer,
                     cfg,
-                    combined_cds,
-                    {
-                        "ave": list(prev_losses["ave"]) + list(new_losses)
-                    },  # {ave: [loss]}
+                    combined_train_cds, combined_train_losses,  # {ave: [loss]}
+                    combined_val_cds,
+                    combined_val_losses,
                     checkpoint_fname.replace(".pth", f"_{epoch}.pth"),
                     f"{CHECKPOINT_DIR}/{CHECKPOINT_DB_FILE}",
                 )
@@ -1417,23 +1497,20 @@ def train(
                     ".pth", f"_{epoch}.pth")
 
                 cfg.run.max_steps = temp_epochs
+
             if (epoch + 1) % cfg.run.vis_freq == 0:
-
-                cd_list = []
                 dir_name = f"plots/{cfg.run.name}"
-
                 if not os.path.exists(dir_name):
                     print("creating dir", dir_name)
                     os.makedirs(dir_name)
 
-                for batch in dataloader:
-
+                train_cd_list = []
+                new_train_cds["epochs"].append(epoch)
+                for batch in dataloader_train:
                     pc, camera, image_rgb, mask, depths, idx = extract_batch(
                         cfg, batch, device
                     )
-
-                    for i in range(len(pc)):
-
+                    for i in range(len(pc)):  # each data point in batch
                         sampled_point, xts, x0s, steps = sample(
                             model,
                             scheduler,
@@ -1446,50 +1523,183 @@ def train(
                             num_inference_steps=None,
                             device=device,
                             pcpm=pcpm,
-                            data_mean=dataloader.dataset.data_mean,
-                            data_std=dataloader.dataset.data_std,
+                            data_mean=dataloader_train.dataset.dataset.data_mean,
+                            data_std=dataloader_train.dataset.dataset.data_std,
                         )
 
                         pc_condition = pcpm.point_cloud_to_tensor(
                             pc[i: i + 1], normalize=True, scale=True
                         )
 
-                        cd_loss, _ = calculate_chamfer_distance(
+                        train_cd_loss, _ = calculate_chamfer_distance(
                             cfg.dataset.is_scaled,
-                            dataloader.dataset.data_mean,
-                            dataloader.dataset.data_std,
+                            dataloader_train.dataset.dataset.data_mean,
+                            dataloader_train.dataset.dataset.data_std,
                             sampled_point,
                             pc_condition,
                             device,
                         )
-                        cd_loss_item = cd_loss.item()
-                        cd_list.append(cd_loss_item)
+                        train_cd_loss_item = train_cd_loss.item()
+                        train_cd_list.append(train_cd_loss_item)
                         # new_cds.append((epoch, cd_loss_item))  # {"epochs": [], "data": {}}
-                        idx_i = idx[i].item()
+                        idx_i = idx[i]  # token
 
-                        new_cds["epochs"].append(epoch)
-                        if idx_i not in new_cds["data"]:
-                            new_cds["data"][idx_i] = [cd_loss_item]
+                        if idx_i not in new_train_cds["data"]:
+                            new_train_cds["data"][idx_i] = [train_cd_loss_item]
                         else:
-                            new_cds["data"][idx_i].append(cd_loss_item)
+                            new_train_cds["data"][idx_i].append(
+                                train_cd_loss_item)
 
-                        if idx_i not in cd_emas:
+                        if idx_i not in train_cd_emas:
+                            print(i,"idx[i]", idx_i)
+                            train_cd_emas[idx_i] = {
+                                k: None for k in list(cd_ema_factors) + [0]}
+
+                        # for alpha in list(cd_ema_factors) + [0]:
+                        #     train_cd_emas[idx_i][alpha] = (
+                        #         train_cd_loss_item
+                        #         if train_cd_emas[idx_i][alpha] is None
+                        #         else (
+                        #             (1 - alpha) * train_cd_loss_item
+                        #             + alpha * train_cd_emas[idx_i][alpha]
+                        #         )
+                        #     )
+                        #     writer.add_scalars(
+                        #         f"CD_ema_{alpha:.2e}",
+                        #         {f"train/scene_{idx_i[:3]}":
+                        #             train_cd_emas[idx_i][alpha]},
+                        #         epoch,
+                        #     )
+                        update_cd_emas(cd_ema_factors, train_cd_emas, train_cd_loss_item, epoch, idx_i,writer=writer, name="train")
+                        plot_sample_condition(
+                            pc_condition.cpu(),
+                            xts.cpu(),
+                            x0s.cpu(),
+                            steps,
+                            cfg,
+                            epoch,
+                            fname=f"plots/{cfg.run.name}/sample_ep_{epoch:05d}_gt{i}_train-idx-{idx_i[:3]}.png",
+                            # None,
+                            point_size=0.1,
+                            cam_wires_trans=get_camera_wires_trans(camera[i])
+                            .detach()
+                            .cpu(),
+                            image_rgb=image_rgb[i:i+1].detach().cpu(),
+                            # mask=mask[:1].detach().cpu() if mask is not None else None,
+                            depths=depths,
+                            cd=train_cd_loss.item(),
+                            data_mean=dataloader_train.dataset.dataset.data_mean,
+                            data_std=dataloader_train.dataset.dataset.data_std,
+                        )
+
+                        plot_image_depth_projected(
+                            pc_condition.cpu(),
+                            cfg,
+                            f"plots/{cfg.run.name}/images-depths_gt{i}_idx{idx_i[:3]}.png",
+                            0.1,
+                            camera=camera[i],
+                            image_rgb=image_rgb[i:i+1].detach().cpu(),
+                            # depth_image=mask[:1].detach().cpu( ) if mask is not None else None,
+                            depth_image=(
+                                depths[i:i+1].detach().cpu()
+                                if depths is not None
+                                else None
+                            ),
+                            data_mean=dataloader_train.dataset.dataset.data_mean,
+                            data_std=dataloader_train.dataset.dataset.data_std,
+                        )
+
+                train_cd_ave = sum(train_cd_list)/len(train_cd_list)
+                if "ave" not in train_cd_emas:
+                    train_cd_emas["ave"] = {
+                        k: None for k in list(cd_ema_factors) + [0]}
+                    
+                for alpha in list(cd_ema_factors) + [0]:
+                    train_cd_emas["ave"][alpha] = (
+                        train_cd_ave
+                        if train_cd_emas["ave"][alpha] is None
+                        else (
+                            (1 - alpha) * train_cd_ave
+                            + alpha * train_cd_emas["ave"][alpha]
+                        )
+                    )
+                    writer.add_scalars(
+                        f"CD_ema_{alpha:.2e}",
+                        {f"train/average": train_cd_emas["ave"][alpha]},
+                        epoch,
+                    )
+
+                # now same for val vis -> bruteforce
+                # - sample with condition signals from alleach data samples
+                # - cal cd for all data samples
+                # - add cd into the cd list  (to be archive)
+                # - plot_sample_condition / later
+                # - plot_image_depth_projected / later
+
+                val_cd_list = []
+                new_val_cds["epochs"].append(epoch)
+                for batch in dataloader_val:
+                    pc, camera, image_rgb, mask, depths, idx = extract_batch(
+                        cfg, batch, device
+                    )
+                    for i in range(len(pc)):  # each data point in batch
+                        sampled_point, xts, x0s, steps = sample(
+                            model,
+                            scheduler,
+                            cfg,
+                            camera=camera[i],
+                            image_rgb=image_rgb[i: i + 1],
+                            depths=depths[i: i +
+                                          1] if depths is not None else None,
+                            mask=mask[i: i + 1] if mask is not None else None,
+                            num_inference_steps=None,
+                            device=device,
+                            pcpm=pcpm,
+                            data_mean=dataloader_val.dataset.dataset.data_mean,
+                            data_std=dataloader_val.dataset.dataset.data_std,
+                        )
+
+                        pc_condition = pcpm.point_cloud_to_tensor(
+                            pc[i: i + 1], normalize=True, scale=True
+                        )
+
+                        val_cd_loss, _ = calculate_chamfer_distance(
+                            cfg.dataset.is_scaled,
+                            dataloader_val.dataset.dataset.data_mean,
+                            dataloader_val.dataset.dataset.data_std,
+                            sampled_point,
+                            pc_condition,
+                            device,
+                        )
+                        val_cd_loss_item = val_cd_loss.item()
+                        val_cd_list.append(val_cd_loss_item)
+                        # new_cds.append((epoch, cd_loss_item))  # {"epochs": [], "data": {}}
+                        idx_i = idx[i]  # token
+
+                        if idx_i not in new_val_cds["data"]:
+                            new_val_cds["data"][idx_i] = [val_cd_loss_item]
+                        else:
+                            new_val_cds["data"][idx_i].append(
+                                val_cd_loss_item)
+
+                        if idx_i not in val_cd_emas:
                             print("idx[i]", idx_i)
-                            cd_emas[idx_i] = {
+                            val_cd_emas[idx_i] = {
                                 k: None for k in list(cd_ema_factors) + [0]}
 
                         for alpha in list(cd_ema_factors) + [0]:
-                            cd_emas[idx_i][alpha] = (
-                                cd_loss_item
-                                if cd_emas[idx_i][alpha] is None
+                            val_cd_emas[idx_i][alpha] = (
+                                val_cd_loss_item
+                                if val_cd_emas[idx_i][alpha] is None
                                 else (
-                                    (1 - alpha) * cd_loss_item
-                                    + alpha * cd_emas[idx_i][alpha]
+                                    (1 - alpha) * val_cd_loss_item
+                                    + alpha * val_cd_emas[idx_i][alpha]
                                 )
                             )
                             writer.add_scalars(
-                                f"CD/scene_{idx_i:03d}",
-                                {f"ema_{alpha:.2e}": cd_emas[idx_i][alpha]},
+                                f"CD_ema_{alpha:.2e}",
+                                {f"val/scene_{idx_i[:3]}":
+                                    val_cd_emas[idx_i][alpha]},
                                 epoch,
                             )
                         plot_sample_condition(
@@ -1499,7 +1709,7 @@ def train(
                             steps,
                             cfg,
                             epoch,
-                            fname=f"plots/{cfg.run.name}/sample_ep_{epoch:05d}_gt{i}_idx{idx_i}.png",
+                            fname=f"plots/{cfg.run.name}/sample_ep_{epoch:05d}_gt{i}_val-idx-{idx_i[:3]}.png",
                             # None,
                             point_size=0.1,
                             cam_wires_trans=get_camera_wires_trans(camera[i])
@@ -1508,97 +1718,67 @@ def train(
                             image_rgb=image_rgb[i:i+1].detach().cpu(),
                             # mask=mask[:1].detach().cpu() if mask is not None else None,
                             depths=depths,
-                            cd=cd_loss.item(),
-                            data_mean=dataloader.dataset.data_mean,
-                            data_std=dataloader.dataset.data_std,
+                            cd=val_cd_loss.item(),
+                            data_mean=dataloader_val.dataset.dataset.data_mean,
+                            data_std=dataloader_val.dataset.dataset.data_std,
                         )
-                        if not already_image_mask:
-                            if not os.path.exists(f"plots/{cfg.run.name}"):
-                                os.makedirs(f"plots/{cfg.run.name}")
-                            plot_image_depth_projected(
-                                pc_condition.cpu(),
-                                cfg,
-                                f"plots/{cfg.run.name}/images-depths_gt{i}_idx{idx_i}.png",
-                                0.1,
-                                camera=camera[i],
-                                image_rgb=image_rgb[i:i+1].detach().cpu(),
-                                # depth_image=mask[:1].detach().cpu( ) if mask is not None else None,
-                                depth_image=(
-                                    depths[i:i+1].detach().cpu()
-                                    if depths is not None
-                                    else None
-                                ),
-                                data_mean=dataloader.dataset.data_mean,
-                                data_std=dataloader.dataset.data_std,
-                            )
-                            if False:
-                                plot_image_depth(
-                                    pc_condition.cpu(),
-                                    cfg,
-                                    None,
-                                    0.1,
-                                    cam_wires_trans=get_camera_wires_trans(
-                                        camera[i])
-                                    .detach()
-                                    .cpu(),
-                                    image_rgb=image_rgb[i:i+1].detach().cpu(),
-                                    # depth_image=mask[:1].detach().cpu( ) if mask is not None else None,
-                                    depth_image=(
-                                        depths[i:i+1].detach().cpu()
-                                        if depths is not None
-                                        else None
-                                    ),
-                                )
 
-                cd_ave = sum(cd_list)/len(cd_list)
-                if "ave" not in cd_emas:
-                    cd_emas["ave"] = {
+                        plot_image_depth_projected(
+                            pc_condition.cpu(),
+                            cfg,
+                            f"plots/{cfg.run.name}/images-depths_gt{i}_val-idx{idx_i[:3]}.png",
+                            0.1,
+                            camera=camera[i],
+                            image_rgb=image_rgb[i:i+1].detach().cpu(),
+                            # depth_image=mask[:1].detach().cpu( ) if mask is not None else None,
+                            depth_image=(
+                                depths[i:i+1].detach().cpu()
+                                if depths is not None
+                                else None
+                            ),
+                            data_mean=dataloader_val.dataset.dataset.data_mean,
+                            data_std=dataloader_val.dataset.dataset.data_std,
+                        )
+
+                val_cd_ave = sum(val_cd_list)/len(val_cd_list)
+                if "ave" not in val_cd_emas:
+                    val_cd_emas["ave"] = {
                         k: None for k in list(cd_ema_factors) + [0]}
                 for alpha in list(cd_ema_factors) + [0]:
-                    cd_emas["ave"][alpha] = (
-                        cd_ave
-                        if cd_emas["ave"][alpha] is None
+                    val_cd_emas["ave"][alpha] = (
+                        val_cd_ave
+                        if val_cd_emas["ave"][alpha] is None
                         else (
-                            (1 - alpha) * cd_ave
-                            + alpha * cd_emas["ave"][alpha]
+                            (1 - alpha) * val_cd_ave
+                            + alpha * val_cd_emas["ave"][alpha]
                         )
                     )
                     writer.add_scalars(
-                        f"CD/average",
-                        {f"ema_{alpha:.2e}": cd_emas["ave"][alpha]},
+                        f"CD_ema_{alpha:.2e}",
+                        {f"val/average": val_cd_emas["ave"][alpha]},
                         epoch,
                     )
 
-                log_utils(log_type="dynamic", model=model,
-                          writer=writer, epoch=epoch)
-
-        combined_cds = {
-            "epochs": list(prev_cds["epochs"]) + list(new_cds["epochs"]),
-            "data": {
-                scene_id: (
-                    list(prev_cds["data"][scene_id])
-                    if len(prev_cds["epochs"]) > 0
-                    else []
-                )
-                + list(new_cds["data"][scene_id])
-                for scene_id in new_cds["data"]
-            },
-        }  # {"epoch":[],  data:{scene_id: [cd]}}
-        if True:
+        if True:  # save checkpoint
+            combined_train_losses, combined_train_cds = combine_loss_cd_history(
+                prev_train_losses, new_train_losses, prev_train_cds, new_train_cds)
+            combined_val_losses, combined_val_cds = combine_loss_cd_history(
+                prev_val_losses, new_val_losses, prev_val_cds, new_val_cds)
             save_checkpoint(
                 model,
+                    pcpm.feature_model.model,
                 optimizer,
                 cfg,
-                combined_cds,
-                {"ave": list(prev_losses["ave"]) +
-                 list(new_losses)},  # {ave: [loss]}
-                checkpoint_fname.replace(".pth", f"_{cfg.run.max_steps}_final.pth"),
+                combined_train_cds, combined_train_losses,
+                combined_val_cds,
+                combined_val_losses,
+                checkpoint_fname.replace(".pth", f"_final.pth"),
                 f"{CHECKPOINT_DIR}/{CHECKPOINT_DB_FILE}",
             )
             if last_checkpoint_fname is not None:
                 # remove last checkpoint
                 os.remove(last_checkpoint_fname)
-        return loss_emas, cd_emas
+        return train_loss_emas, train_cd_emas, val_loss_emas, val_cd_emas
 
 
 def apply_conditioning_to_xt(
@@ -1672,6 +1852,9 @@ def sample(
     assert pcpm is not None, "pcpm must be provided"
 
     model.eval()
+    if cfg.model.finetune_vits:
+        pcpm.feature_model.model.eval()
+
     num_inference_steps = num_inference_steps or scheduler.config.num_train_timesteps
     scheduler.set_timesteps(num_inference_steps)
 
@@ -1792,28 +1975,79 @@ class PVCNNDiffusionModel3D(nn.Module):
         return noise_pred
 
 
-def get_astyxdataset(cfg: ProjectConfig, device="cpu"):
-    # cfg1.dataloader.batch_size
-    print("batch_size", cfg.dataloader.batch_size)
-    train_dataset = AstyxDataset(
+def get_mandataset(cfg: ProjectConfig, device="cpu",):
+    if cfg.dataset.data_stat == "man-mini":
+        man_mini_mean = torch.tensor(
+            [4.47067401253445, 0.38167170059234695, -0.0988231429457053])
+        man_mini_std = torch.tensor(
+            [2.414130576426128, 3.7607050719415933, 1.2927505466158267])
+    else:
+        raise ValueError("now accepth only man-mini data_stat")
+
+    scene_id = int(cfg.dataset.category)
+    man_dataset = MANDataset(
         cfg.dataloader.num_scenes,
         cfg.dataset.max_points,
-        "vits",
+        scene_id,
+
+        depth_model="vits",
+        random_offset=False,
+        data_file=cfg.dataset.type,
         device=device,
         is_scaled=cfg.dataset.is_scaled,
         img_size=cfg.dataset.image_size,
+        data_mean=man_mini_mean,
+        data_std=man_mini_std,
     )
+
+    indices = list(range(len(man_dataset)))
+    if cfg.dataset.subset_name == 'interleaved':
+        train_indices = indices[::4] + indices[1::4]
+        val_indices = indices[2::4]
+        test_indices = indices[3::4]
+    elif cfg.dataset.subset_name == 'random':
+        random.shuffle(indices)
+        train_indices = indices[:int(len(indices) * 0.5)]
+        val_indices = indices[int(len(indices) * 0.5):int(len(indices) * 0.75)]
+        test_indices = indices[int(len(indices) * 0.75):]
+    elif cfg.dataset.subset_name == 'block':
+        train_indices = indices[:int(len(indices) * 0.5)]
+        val_indices = indices[int(len(indices) * 0.5):int(len(indices) * 0.75)]
+        test_indices = indices[int(len(indices) * 0.75):]
+    else:
+        raise ValueError(
+            f"Unknown subset name: {cfg.dataset.subset_name}. Must be 'interleaved', 'random', or 'block'."
+        )
+    print("lens", len(train_indices), len(val_indices), len(test_indices))
+    assert len(
+        val_indices) > 0, f"val_indices should be > 0, current num_scenes is {len(indices)}"
+    dataset_train = Subset(man_dataset, train_indices)
+    dataset_val = Subset(man_dataset, val_indices)
+    dataset_test = Subset(man_dataset, test_indices)
+    print("lens", len(dataset_train), len(dataset_val), len(dataset_test))
+
     dataloader_train, dataloader_val, dataloader_vis = (
         DataLoader(
-            train_dataset,
+            dataset_train,
             batch_size=cfg.dataloader.batch_size,
             num_workers=cfg.dataloader.num_workers,
-            collate_fn=custom_collate_fn,
+            collate_fn=custom_collate_fn_man,
             shuffle=cfg.dataloader.shuffle,
         ),
-        None,
-        None,
-    )
+        DataLoader(
+            dataset_val,
+            batch_size=cfg.dataloader.batch_size,
+            num_workers=cfg.dataloader.num_workers,
+            collate_fn=custom_collate_fn_man,
+            shuffle=cfg.dataloader.shuffle,
+        ),
+        DataLoader(
+            dataset_test,
+            batch_size=cfg.dataloader.batch_size,
+            num_workers=cfg.dataloader.num_workers,
+            collate_fn=custom_collate_fn_man,
+            shuffle=cfg.dataloader.shuffle,
+        ))
     return dataloader_train, dataloader_val, dataloader_vis
 
 
@@ -2113,14 +2347,17 @@ def match_args_json(cfg1, cfg2):
             and cfg1["run"]["num_inference_steps"] == cfg2["run"]["num_inference_steps"]
             and cfg1["dataset"]["image_size"] == cfg2["dataset"]["image_size"]
             and cfg1["dataset"]["is_scaled"] == cfg2["dataset"]["is_scaled"]
+            and cfg1["dataset"]["data_stat"] == cfg2["dataset"]["data_stat"]
+            and cfg1["dataset"]["subset_name"] == cfg2["dataset"]["subset_name"]
+            and cfg1["dataset"]["category"] == cfg2["dataset"]["category"]
+            and cfg1["dataset"]["type"] == cfg2["dataset"]["type"]
+            and cfg1["dataset"]["max_points"] == cfg2["dataset"]["max_points"]
+
             and cfg1["model"]["beta_schedule"] == cfg2["model"]["beta_schedule"]
             and cfg1["model"]["point_cloud_model_embed_dim"]
             == cfg2["model"]["point_cloud_model_embed_dim"]
             and cfg1["model"]["point_cloud_model"]
             == cfg2["model"]["point_cloud_model"]
-            and cfg1["dataset"]["category"] == cfg2["dataset"]["category"]
-            and cfg1["dataset"]["type"] == cfg2["dataset"]["type"]
-            and cfg1["dataset"]["max_points"] == cfg2["dataset"]["max_points"]
             and cfg1["optimizer"]["lr"] == cfg2["optimizer"]["lr"]
             and cfg1["dataloader"]["batch_size"] == cfg2["dataloader"]["batch_size"]
             and cfg1["dataloader"]["num_scenes"] == cfg2["dataloader"]["num_scenes"]
@@ -2135,6 +2372,7 @@ def match_args_json(cfg1, cfg2):
             and cfg1["model"]["condition_source"] == cfg2["model"]["condition_source"]
             and cfg1["model"]["use_mask"] == cfg2["model"]["use_mask"]
             and cfg1["model"]["use_distance_transform"] == cfg2["model"]["use_distance_transform"]
+            and cfg1["model"]["finetune_vits"] == cfg2["model"]["finetune_vits"]
             # and cfg1.run.num_inference_steps == cfg2.run.num_inference_steps
             # and cfg1.dataset.image_size == cfg2.dataset.image_size
             # and cfg1.model.beta_schedule == cfg2.model.beta_schedule
@@ -2174,7 +2412,8 @@ def get_checkpoint_fname_json(cfg: ProjectConfig, db_fname, CHECKPOINT_DIR):
             dat = json.loads(line)
             # print("checking checkpoint", dat["fname"])
             if not os.path.exists(dat["fname"]):
-                print(dat["fname"].split("/")[-1], "not found")
+                # print(dat["fname"].split("/")[-1], "not found")
+                print("x", end="")
                 continue
             print(".", end="")
             if match_args_json(dat["args"], to_dict(cfg)):
@@ -2200,16 +2439,12 @@ def get_checkpoint_fname_json(cfg: ProjectConfig, db_fname, CHECKPOINT_DIR):
 
 
 def get_dataset(cfg: ProjectConfig, device="cpu"):
-
-    if cfg.dataset.type == "astyx":
-        dataloader_train, _, _ = get_astyxdataset(cfg, device)
-    elif cfg.dataset.type == "co3dv2":
-        dataloader_train, _, _ = get_pc2dataset(cfg)
+    if cfg.dataset.type in ["man-mini", "man-full"]:
+        return get_mandataset(cfg)
     else:
         raise ValueError(
-            f"dataset type {cfg.dataset.type} not supported, must be 'astyx' or 'co3dv2'"
+            f"dataset type {cfg.dataset.type} not supported"
         )
-    return dataloader_train
 
 
 def calculate_chamfer_distance(is_scaled, mean, std, gt, pred, device):
@@ -2228,6 +2463,7 @@ def calculate_chamfer_distance(is_scaled, mean, std, gt, pred, device):
 def process_ema_prev_values(cfg: ProjectConfig, writer, ema_factors, epochs, prev_values: dict, name):
     print("process_ema_prev_values", name)
 
+    data_type = "Loss" if epochs is None else "CD"
     emas = {idx: {k: None for k in ema_factors} for idx in prev_values}
     if "ave" not in emas:
         emas["ave"] = {k: None for k in ema_factors}
@@ -2240,21 +2476,31 @@ def process_ema_prev_values(cfg: ProjectConfig, writer, ema_factors, epochs, pre
         for alpha in tqdm(ema_factors, desc=f"ema factors for {scene_id}", leave=False):
             ema_list = aggregate_ema(losses, alpha)
             emas[scene_id][alpha] = ema_list[-1]
-            ep_use = epochs[:: cfg.dataloader.num_scenes] if epochs is not None else range(
+            ep_use = epochs if epochs is not None else range(
                 len(ema_list))
             tt = tqdm(zip(ep_use, ema_list
                           ), desc=f"ema list for {alpha}", leave=False, total=min(len(ema_list), len(ep_use)))
             for epoch, ema in tt:
-                tt.set_description(f"{alpha}: {ema:.4f}")
-                writer.add_scalars(
-                    (
-                        f"{name}/scene_{scene_id:03d}"
-                        if scene_id != "ave"
-                        else f"{name}/average"
-                    ),
-                    {f"ema_{alpha:.2e}": ema},
-                    epoch,
-                )
+                tt.set_description(f"{name}-{alpha}: {ema:.4f}")
+                # writer.add_scalars(
+                #     (
+                #         f"{name}/scene_{scene_id[:3]}"
+                #         if scene_id != "ave"
+                #         else f"{name}/average"
+                #     ),
+                #     {f"ema_{alpha:.2e}": ema},
+                #     epoch,
+                # )
+                if scene_id != "ave":
+                    writer.add_scalars(f"{data_type}_ema_{alpha:.2e}",
+                        {name+
+                        (
+                            f"/scene_{scene_id[:3]}"
+                            if scene_id != "ave"
+                            else f"/average_bad"
+                        ): ema},
+                        epoch,
+                    )
 
         all_scenes.append(losses)
     # convert to tensor and average scroos scenes
@@ -2271,8 +2517,8 @@ def process_ema_prev_values(cfg: ProjectConfig, writer, ema_factors, epochs, pre
         for epoch, ema in zip(
             epochs if epochs is not None else range(len(ema_list)), ema_list
         ):
-            writer.add_scalars(f"{name}/average",
-                               {f"ema_{alpha:.2e}": ema}, epoch)
+            writer.add_scalars(f"{data_type}_ema_{alpha:.2e}",
+                               {f"{name}/average": ema}, epoch)
     return emas
 
 
@@ -2286,11 +2532,55 @@ def main(cfg: ProjectConfig):
     set_seed(cfg.run.seed)
     tb_log_dir = "tb_log"
     log_dir = tb_log_dir + f"/{cfg.run.name}"
+    rev = 0
+    while os.path.exists(log_dir):
+        rev += 1
+        log_dir = tb_log_dir + f"/{cfg.run.name}_rev{rev:02d}"
+        if rev > 100:
+            # too many revisions, exit
+            raise ValueError(
+                f"too many revisions (>100), exiting, current log_dir {log_dir}"
+            )
+            
+            
     writer = SummaryWriter(log_dir=log_dir)
     print("tensorboard log at", log_dir)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print("device", device)
+
+
+    dataloader_train, dataloader_val, dataloader_test = get_dataset(
+        cfg, device=device)
+
+    train_frame_tokens = ",".join([a[4] for a in dataloader_train.dataset])
+    val_frame_tokens = ",".join([a[4] for a in dataloader_val.dataset])
+    test_frame_tokens = ",".join([a[4] for a in dataloader_test.dataset])
+
+    writer.add_text("train/ids", train_frame_tokens)
+    writer.add_text("val/ids", val_frame_tokens)
+    writer.add_text("test/ids", test_frame_tokens)
+
+    #get previous checkpoint
+    start_epoch = 0
+    current_cp_fname = None
+    current_cp = None
+    prev_train_cds, prev_train_losses = {"epochs": [], "data": {}}, {"ave": []}
+    prev_val_cds, prev_val_losses = {"epochs": [], "data": {}}, {"ave": []}
+
+    if cfg.checkpoint.resume_training:
+        if os.path.exists(f"{CHECKPOINT_DIR}/{CHECKPOINT_DB_FILE}"):
+            current_cp_fname = get_checkpoint_fname_json(
+                cfg, CHECKPOINT_DB_FILE, CHECKPOINT_DIR
+            )
+
+            if current_cp_fname is not None:
+                current_cp = torch.load(current_cp_fname)
+                print("loading checkpoint", current_cp_fname)
+            else:
+                print("no checkpoint found")
+    else:
+        print("CFG dictates not resuming training from checkpoint")
 
     pcpm = PointCloudProjectionModel(
         image_size=cfg.model.image_size,
@@ -2306,30 +2596,10 @@ def main(cfg: ProjectConfig):
         colors_mean=cfg.model.colors_mean,
         colors_std=cfg.model.colors_std,
         scale_factor=cfg.model.scale_factor,
+        finetune_vits  = cfg.model.finetune_vits,
+        vits_checkpoint= current_cp["vits_model"] if current_cp is not None else None,
+
     ).to(device)
-
-    dataloader_train = get_dataset(cfg, device=device)
-
-    writer.add_text("data/ids", str(dataloader_train.dataset.active_ids))
-
-    if False:
-
-        batch = next(iter(dataloader_train))
-
-        # depths, radar_data, camera, image_rgb, objects, idx, npoints, npoints_filtered, offsets = batch
-
-        pc, camera, image_rgb, mask, depths = extract_batch(cfg, batch, device)
-        fname = f"/home/palakons/from_scratch/plot_at_load.png"
-        plot_image_depth_projected(
-            radar_data[:1],
-            None,
-            fname,
-            point_size=1,
-            camera=camera.to(device)[0],
-            image_rgb=image_rgb[:1],
-            depth_image=depths[:1],
-        )
-
     model = get_model(cfg, device=device, pcpm=pcpm)
 
     if cfg.optimizer.name == "Adam":
@@ -2356,49 +2626,61 @@ def main(cfg: ProjectConfig):
         num_train_timesteps=cfg.run.num_inference_steps,
         beta_schedule=cfg.model.beta_schedule,
         prediction_type="epsilon",  # or "sample" or "v_prediction"
-        clip_sample=False,
+        clip_sample=False,  # important for point clouds
         beta_start=cfg.model.beta_start,
         beta_end=cfg.model.beta_end,
     )
-    start_epoch = 0
 
-    current_cp_fname = None
-
-    if cfg.checkpoint.resume_training:
-        if os.path.exists(f"{CHECKPOINT_DIR}/{CHECKPOINT_DB_FILE}"):
-            current_cp_fname = get_checkpoint_fname_json(
-                cfg, CHECKPOINT_DB_FILE, CHECKPOINT_DIR
-            )
-    else:
-        print("CFG dictates not resuming training from checkpoint")
-
-    prev_cds, prev_losses = {"epochs": [], "data": {}}, {"ave": []}
-    if current_cp_fname is not None:
-        current_cp = torch.load(current_cp_fname)
-        print("loading checkpoint", current_cp_fname)
+    #load the checkpoint to models
+    
+    if current_cp is not None:
         model.load_state_dict(current_cp["model"])
         optimizer.load_state_dict(current_cp["optimizer"])
         start_epoch = current_cp["args"].run.max_steps
         print("start_epoch", start_epoch)
 
-        if "cds" in current_cp:
-            prev_cds = current_cp["cds"]
-            prev_losses = current_cp["losses"]
-            assert (
-                len(prev_losses["ave"]) == start_epoch
-            ), f"prev_losses length {len(prev_losses['ave'])} must be equal to start_epoch {start_epoch}"
-    else:
-        print("no checkpoint found")
+        prev_train_cds = current_cp["train_cds"]
+        prev_train_losses = current_cp["train_losses"]
+        prev_val_cds = current_cp["val_cds"]
+        prev_val_losses = current_cp["val_losses"]
+        # print("prev_train_losses key, {prev_train_losses.keys()} ", prev_train_losses.keys() )
+        # print("prev_train_cds key, {prev_train_cds.keys()} ", prev_train_cds.keys())
+        # print("prev_val_losses key, {prev_val_losses.keys()} ", prev_val_losses.keys())
+        # print("prev_val_cds key, {prev_val_cds.keys()} ", prev_val_cds.keys())
+
+        # prev_train_losses key, {prev_train_losses.keys()}  dict_keys(['ave'])
+        # prev_train_cds key, {prev_train_cds.keys()}  dict_keys(['epochs', 'data'])
+        # prev_val_losses key, {prev_val_losses.keys()}  dict_keys(['ave'])
+        # prev_val_cds key, {prev_val_cds.keys()}  dict_keys(['epochs', 'data'])
+
+        assert (
+            len(prev_train_losses["ave"]) == start_epoch and len(
+                prev_val_losses["ave"]) == start_epoch
+        ), f'checkpoint train losses and cds not same length as start epoch, prev_train_losses {len(prev_train_losses["ave"]) } start_epoch {start_epoch } prev_val_losses { len(prev_val_losses["ave"]) }'
+
+
 
     log_utils(log_type="static", model=model, writer=writer, epoch=None)
 
     # assert cfg.loss.loss_type == "mse", "only mse supported"
     criterion = get_loss(cfg)
     # Train the model
-    loss_emas, cd_emas = train(
+    # print("type",type(dataloader_train))
+    # print("type2",type(dataloader_train.dataset))
+    # print("type3",type(dataloader_train.dataset.dataset))
+    # print("datastat mean",dataloader_train.dataset.dataset.data_mean)
+    # print("datastat std",dataloader_train.dataset.dataset.data_std)
+    # type <class 'torch.utils.data.dataloader.DataLoader'>
+    # type2 <class 'torch.utils.data.dataset.Subset'>
+    # type3 <class '__main__.MANDataset'>
+    # datastat mean tensor([ 4.4707,  0.3817, -0.0988])
+    # datastat std tensor([2.4141, 3.7607, 1.2928])
+
+    train_loss_emas, train_cd_emas, val_loss_emas, val_cd_emas = train(
         model,
         # dataloader,
         dataloader_train,
+        dataloader_val,
         optimizer,
         scheduler,
         cfg,
@@ -2408,42 +2690,46 @@ def main(cfg: ProjectConfig):
         writer=writer,
         pcpm=pcpm,
         loss_ema_factors=[0.9, 0.95, 0.975, 0.99],
-        prev_cds=prev_cds,
-        prev_losses=prev_losses,
         CHECKPOINT_DB_FILE=CHECKPOINT_DB_FILE,
+        prev_train_cds=prev_train_cds,
+        prev_train_losses=prev_train_losses,
+        prev_val_cds=prev_val_cds,
+        prev_val_losses=prev_val_losses,
     )
 
     metric_dict = {
-        **{f"Loss_ave/ema_{k:.2e}": loss_emas["ave"][k] for k in loss_emas["ave"]},
-        **{f"CD_ave/ema_{k:.2e}": cd_emas["ave"][k] for k in cd_emas["ave"]},
+        **{f"MDict_Train_Loss_ave/ema_{k:.2e}": train_loss_emas["ave"][k] for k in train_loss_emas["ave"]},
+        **{f"MDict_Train_CD_ave/ema_{k:.2e}": train_cd_emas["ave"][k] for k in train_cd_emas["ave"]},
+        **{f"MDict_Val_Loss_ave/ema_{k:.2e}": val_loss_emas["ave"][k] for k in val_loss_emas["ave"]},
+        **{f"MDict_Val_CD_ave/ema_{k:.2e}": val_cd_emas["ave"][k] for k in val_cd_emas["ave"]},
     }
 
-    # Sample from the model
+    if False:  # Evo plots
 
-    batch = next(iter(dataloader_train))
+        # Sample from the model
 
-    pc, camera, image_rgb, mask, depths, idx = extract_batch(
-        cfg, batch, device)
+        batch = next(iter(dataloader_train))
 
-    samples = {}
-    for i in [1, 5, 10, 50, 100, scheduler.config.num_train_timesteps]:
+        pc, camera, image_rgb, mask, depths, idx = extract_batch(
+            cfg, batch, device)
 
-        samples[f"step{i}"] = sample(
-            model,
-            scheduler,
-            cfg,
-            camera=camera[0],
-            image_rgb=image_rgb[:1],
-            depths=depths[:1] if depths is not None else None,
-            mask=mask[:1] if mask is not None else None,
-            num_inference_steps=i,
-            device=device,
-            pcpm=pcpm,
-            data_mean=dataloader_train.dataset.data_mean,
-            data_std=dataloader_train.dataset.data_std,
-        )
+        samples = {}
+        for i in [1, 5, 10, 50, 100, scheduler.config.num_train_timesteps]:
 
-    if True:  # Evo plots
+            samples[f"step{i}"] = sample(
+                model,
+                scheduler,
+                cfg,
+                camera=camera[0],
+                image_rgb=image_rgb[:1],
+                depths=depths[:1] if depths is not None else None,
+                mask=mask[:1] if mask is not None else None,
+                num_inference_steps=i,
+                device=device,
+                pcpm=pcpm,
+                data_mean=dataloader_train.dataset.dataset.data_mean,
+                data_std=dataloader_train.dataset.dataset.data_std
+            )
         # make the plot that will be logged to tb
         gt_cond_pc = pcpm.point_cloud_to_tensor(
             pc[:1], normalize=True, scale=True)
@@ -2458,9 +2744,7 @@ def main(cfg: ProjectConfig):
             samples_updated = samples[key][0]
 
             cd_loss, _ = calculate_chamfer_distance(
-                cfg.dataset.is_scaled,
-                dataloader_train.dataset.data_mean,
-                dataloader_train.dataset.data_std,
+                cfg.dataset.is_scaled, dataloader_train.dataset.dataset.data_mean, dataloader_train.dataset.dataset.data_std,
                 gt_cond_pc,
                 samples_updated,
                 device,
@@ -2477,9 +2761,7 @@ def main(cfg: ProjectConfig):
             for x in samples[key][1]:
 
                 cd_loss, _ = calculate_chamfer_distance(
-                    cfg.dataset.is_scaled,
-                    dataloader_train.dataset.data_mean,
-                    dataloader_train.dataset.data_std,
+                    cfg.dataset.is_scaled, dataloader_train.dataset.dataset.data_mean, dataloader_train.dataset.dataset.data_std,
                     gt_cond_pc,
                     x.unsqueeze(0),
                     device,
@@ -2506,23 +2788,27 @@ def main(cfg: ProjectConfig):
         writer.add_figure(f"Evolution", plt.gcf(), cfg.run.max_steps)
         plt.close()
 
-    print("done evo plots")
+        print("done evo plots")
 
     hparam_dict = {
         "seed": cfg.run.seed,  #
         "epochs": cfg.run.max_steps,
         "num_inference_steps": cfg.run.num_inference_steps,  #
         "image_size": cfg.dataset.image_size,  #
-        "beta_schedule": cfg.model.beta_schedule,  #
-        "point_cloud_model_embed_dim": cfg.model.point_cloud_model_embed_dim,
-        "point_cloud_model": cfg.model.point_cloud_model,  #
+        "dataset_data_stat": cfg.dataset.data_stat,
+        "dataset_subset": cfg.dataset.subset_name,
         "dataset_cat": cfg.dataset.category,
         "dataset_source": cfg.dataset.type,
         "max_points": cfg.dataset.max_points,  #
-        "lr": cfg.optimizer.lr,  #
         "batch_size": cfg.dataloader.batch_size,
         "num_scenes": cfg.dataloader.num_scenes,
+        "shuffle": cfg.dataloader.shuffle,
+        "beta_schedule": cfg.model.beta_schedule,  #
+        "condition_source": cfg.model.condition_source,  #
+        "point_cloud_model_embed_dim": cfg.model.point_cloud_model_embed_dim,
+        "point_cloud_model": cfg.model.point_cloud_model,  #
         "loss_type": cfg.loss.loss_type,  #
+        "lr": cfg.optimizer.lr,  #
         "optimizer": cfg.optimizer.name,  #
         "optimizer_decay": cfg.optimizer.weight_decay,
         "optimizer_beta_0": cfg.optimizer.kwargs.betas[0],
