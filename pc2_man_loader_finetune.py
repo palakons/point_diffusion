@@ -2341,6 +2341,12 @@ def log_utils(log_type="static", model=None, writer=None, epoch=None):
 
 
 def match_args_json(cfg1, cfg2):
+    if "finetune_vits" in cfg1["model"] and "finetune_vits" in cfg2["model"] and cfg1["model"]["finetune_vits"] != cfg2["model"]["finetune_vits"]:
+        return False
+    if "finetune_vits" in cfg1["model"] and "finetune_vits" not in cfg2["model"] and cfg1["model"]["finetune_vits"]:
+        return False
+    if "finetune_vits" not in cfg1["model"] and "finetune_vits" in cfg2["model"] and cfg2["model"]["finetune_vits"]:
+        return False
     try:
         return (
             cfg1["run"]["seed"] == cfg2["run"]["seed"]
@@ -2372,7 +2378,8 @@ def match_args_json(cfg1, cfg2):
             and cfg1["model"]["condition_source"] == cfg2["model"]["condition_source"]
             and cfg1["model"]["use_mask"] == cfg2["model"]["use_mask"]
             and cfg1["model"]["use_distance_transform"] == cfg2["model"]["use_distance_transform"]
-            and cfg1["model"]["finetune_vits"] == cfg2["model"]["finetune_vits"]
+            # and ((cfg1["model"]["finetune_vits"] == cfg2["model"]["finetune_vits"]) if "finetune_vits" in cfg1["model"]   else True)
+            
             # and cfg1.run.num_inference_steps == cfg2.run.num_inference_steps
             # and cfg1.dataset.image_size == cfg2.dataset.image_size
             # and cfg1.model.beta_schedule == cfg2.model.beta_schedule
