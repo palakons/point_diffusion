@@ -277,14 +277,16 @@ def list_points(trucksc, scene, root, sensors, header_attr):
             # except Exception as e:
             #     print("error", e)
             #     break
-            data_line = {**header_attr, **{"scene": scene['first_sample_token'], 'sensor': sensor, 'order': order,
+            data_line_base = {**header_attr, **{"scene": scene['first_sample_token'], 'sensor': sensor, 'order': order,
                          'token': my_radar['token'],  'is_key_frame': my_radar['is_key_frame']}}
             # read pcd file
             pcd_file = os.path.join(root, my_radar['filename'])
             pcd = o3d.io.read_point_cloud(pcd_file)
             for i in range(len(pcd.points)):
+                # print("pcd.points[i]", pcd.points[i])   
                 data_line = {
-                    **{'x': pcd.points[i][0], 'y': pcd.points[i][1], 'z': pcd.points[i][2]}, **data_line}
+                    **{'x': pcd.points[i][0], 'y': pcd.points[i][1], 'z': pcd.points[i][2]}, **data_line_base}
+                # print("data_line", data_line)
                 data.append(data_line)
             order = order+1
             next_radar_token = my_radar['next']
@@ -293,7 +295,6 @@ def list_points(trucksc, scene, root, sensors, header_attr):
 
 
 def points_to_csv(datasets, csv_fname):  # for mean std
-    data_list = []
     sensors = ['RADAR_LEFT_FRONT', 'RADAR_LEFT_BACK', 'RADAR_LEFT_SIDE',
                'RADAR_RIGHT_FRONT', 'RADAR_RIGHT_BACK', 'RADAR_RIGHT_SIDE']
     for d_key, root in datasets.items():
@@ -302,29 +303,30 @@ def points_to_csv(datasets, csv_fname):  # for mean std
             d_key, root, True)
         tt = tqdm(trucksc.scene, desc="Scenes", leave=False)
         for scene in tt:
-            print("Scene:", scene['token'])
-            # Get the first frame of the sequence
             sc_data = list_points(trucksc,
                                   scene, root, sensors, {"dataset": d_key})
-
-            data_list += sc_data
-
-            time_st = time.time()
-            df = pd.DataFrame(data_list)
-            # save to csv
-            time_st2 = time.time()
-            df.to_csv(csv_fname, index=False)
-            # save to csv
-            # tt.set_description(
-            # f"{len(sc_data)} points , time to save {time.time()-time_st2:.2f} s, time to convert {time_st2-time_st:.2f} s")
-
-
+            df = pd.DataFrame(sc_data)
+            small_file_name = csv_fname[:-4] + f"_{d_key}_{scene['token']}.csv"
+            df.to_csv(small_file_name, index=False)
+    #combine all csv files, just use shellscript
+    os.system(f"cat {csv_fname[:-4]}_*.csv > {csv_fname}")
+    # remove all small csv files
+    os.system(f"rm {csv_fname[:-4]}_*.csv")
+    # remove all lines with "x,y,z,dataset,scene,sensor,order,token,is_key_frame"
+    os.system(f"sed -i '/x,y,z,dataset,scene,sensor,order,token,is_key_frame/d' {csv_fname}")
+    # add header to csv file
+    os.system(f"sed -i '1i x,y,z,dataset,scene,sensor,order,token,is_key_frame' {csv_fname}")
+# points_to_csv({
+#     # "v1.0-mini":  "/ist-nas/users/palakonk/singularity_data/palakons/new_dataset/MAN/mini/man-truckscenes",
+#     "v1.0-trainval": "/ist-nas/users/palakonk/singularity_data/palakons/new_dataset/MAN/man-truckscenes"
+# },
+#     "/ist-nas/users/palakonk/singularity/home/palakons/from_scratch/allpoints_full.csv")
 points_to_csv({
-    # "v1.0-mini":  "/ist-nas/users/palakonk/singularity_data/palakons/new_dataset/MAN/mini/man-truckscenes",
-    "v1.0-trainval": "/ist-nas/users/palakonk/singularity_data/palakons/new_dataset/MAN/man-truckscenes"
+    "v1.0-mini":  "/ist-nas/users/palakonk/singularity_data/palakons/new_dataset/MAN/mini/man-truckscenes",
+    # "v1.0-trainval": "/ist-nas/users/palakonk/singularity_data/palakons/new_dataset/MAN/man-truckscenes"
 },
-    "/ist-nas/users/palakonk/singularity/home/palakons/from_scratch/allpoints_full.csv")
-
+    "/ist-nas/users/palakonk/singularity/home/palakons/from_scratch/allpoints_mini_3.csv")
+exit()
 
 # combine csv "/ist-nas/users/palakonk/singularity/home/palakons/from_scratch/allpoints_full.csv" and "/ist-nas/users/palakonk/singularity/home/palakons/from_scratch/allpoints_mini.csv" into one csv file
 df_full = pd.read_csv(

@@ -114,6 +114,7 @@ class MANDataset(Dataset):
 
         self.data_mean = actual_data_mean
         self.data_std = asctual_data_std
+
         print("loded ", len(self.data_bank), "samples")
         print("data_mean", self.data_mean)
         print("data_std", self.data_std)
@@ -1951,7 +1952,6 @@ def train(
                             cd=train_cd_loss.item(),
                             data_mean=dataloader_train.dataset.dataset.data_mean,
                             data_std=dataloader_train.dataset.dataset.data_std,
-                            plot_ext=plot_ext,
                         )
 
                         plot_image_depth_projected(
@@ -2821,301 +2821,44 @@ def process_ema_prev_values(cfg: ProjectConfig, writer, ema_factors, epochs, pre
 @hydra.main(config_path="config", config_name="config", version_base="1.1")
 def main(cfg: ProjectConfig):
     # print(cfg)
-    CHECKPOINT_DIR = "checkpoint_pc2"
-    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-    CHECKPOINT_DB_FILE = "checkpoint_db_track_loss.json"
+    record = []
+    for num_point in [50,100,500]:
+        cfg.dataset.max_points = num_point
+        for num_frame   in [5,20,40]:
+            for scene_id in range(10):
+                man_dataset = MANDataset(
+                    # cfg.dataloader.num_scenes,
+                    num_frame,
+                    # cfg.dataset.max_points,
+                    num_point,
+                    scene_id,
 
-    set_seed(cfg.run.seed)
-    tb_log_dir = "tb_log"
-    run_dir_name = f"{cfg.run.name}"
-    log_dir = tb_log_dir + os.sep+run_dir_name
-    rev = 0
-    while os.path.exists(log_dir):
-        print("exists", run_dir_name)
-        rev += 1
-        run_dir_name = f"{cfg.run.name}_rev{rev:02d}"
-        log_dir = tb_log_dir + os.sep+run_dir_name
-        if rev > 100:
-            # too many revisions, exit
-            raise ValueError(
-                f"too many revisions (>100), exiting, current log_dir {log_dir}"
-            )
-
-    writer = SummaryWriter(log_dir=log_dir)
-    print("tensorboard log at", log_dir)
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print("device", device)
-
-    dataloader_train, dataloader_val, dataloader_test = get_dataset(
-        cfg, device=device)
-
-    train_frame_tokens = ",".join([a[4] for a in dataloader_train.dataset])
-    val_frame_tokens = ",".join([a[4] for a in dataloader_val.dataset])
-    test_frame_tokens = ",".join([a[4] for a in dataloader_test.dataset])
-
-    writer.add_text("train/ids", train_frame_tokens)
-    writer.add_text("val/ids", val_frame_tokens)
-    writer.add_text("test/ids", test_frame_tokens)
-
-    # get previous checkpoint
-    start_epoch = 0
-    current_cp_fname = None
-    current_cp = None
-    prev_train_cds, prev_train_losses = {"epochs": [], "data": {}}, {"ave": []}
-    prev_val_cds, prev_val_losses = {"epochs": [], "data": {}}, {"ave": []}
-
-    if cfg.checkpoint.resume_training:
-        if os.path.exists(f"{CHECKPOINT_DIR}/{CHECKPOINT_DB_FILE}"):
-            current_cp_fname = get_checkpoint_fname_json(
-                cfg, CHECKPOINT_DB_FILE, CHECKPOINT_DIR
-            )
-
-            if current_cp_fname is not None:
-                current_cp = torch.load(current_cp_fname)
-                print("loading checkpoint", current_cp_fname)
-            else:
-                print("no checkpoint found")
-    else:
-        print("CFG dictates not resuming training from checkpoint")
-
-    pcpm = PointCloudProjectionModel(
-        image_size=cfg.model.image_size,
-        image_feature_model=cfg.model.image_feature_model,
-        use_local_colors=cfg.model.use_local_colors,
-        use_local_features=cfg.model.use_local_features,
-        use_global_features=cfg.model.use_global_features,
-        use_mask=cfg.model.use_mask,
-        use_distance_transform=cfg.model.use_distance_transform,
-        predict_shape=cfg.model.predict_shape,
-        predict_color=cfg.model.predict_color,
-        color_channels=cfg.model.color_channels,
-        colors_mean=cfg.model.colors_mean,
-        colors_std=cfg.model.colors_std,
-        scale_factor=cfg.model.scale_factor,
-        finetune_vits=cfg.model.finetune_vits,
-        vits_checkpoint=current_cp["vits_model"] if (
-            current_cp is not None and "vits_model" in current_cp) else None,
-
-    ).to(device)
-    model = get_model(cfg, device=device, pcpm=pcpm)
-
-    if cfg.optimizer.name == "Adam":
-        optimizer = torch.optim.Adam(
-            model.parameters(),
-            lr=cfg.optimizer.lr,
-            weight_decay=cfg.optimizer.weight_decay,
-            betas=cfg.optimizer.kwargs.betas,
-        )
-    elif cfg.optimizer.name == "AdamW":
-        optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=cfg.optimizer.lr,
-            weight_decay=cfg.optimizer.weight_decay,
-            betas=cfg.optimizer.kwargs.betas,
-        )
-    else:
-        raise ValueError(
-            f"optimizer {cfg.optimizer.name} not supported, pick Adam or AdamW"
-        )
-    # linear, scaled_linear, or squaredcos_cap_v2.
-    assert cfg.run.diffusion_scheduler == "ddpm", "only ddpm supported"
-    scheduler = DDPMScheduler(
-        num_train_timesteps=cfg.run.num_inference_steps,
-        beta_schedule=cfg.model.beta_schedule,
-        prediction_type="epsilon",  # or "sample" or "v_prediction"
-        clip_sample=False,  # important for point clouds
-        beta_start=cfg.model.beta_start,
-        beta_end=cfg.model.beta_end,
-    )
-
-    # load the checkpoint to models
-
-    if current_cp is not None:
-        model.load_state_dict(current_cp["model"])
-        optimizer.load_state_dict(current_cp["optimizer"])
-        start_epoch = current_cp["args"].run.max_steps
-        print("start_epoch", start_epoch)
-
-        prev_train_cds = current_cp["train_cds"]
-        prev_train_losses = current_cp["train_losses"]
-        prev_val_cds = current_cp["val_cds"]
-        prev_val_losses = current_cp["val_losses"]
-        # print("prev_train_losses key, {prev_train_losses.keys()} ", prev_train_losses.keys() )
-        # print("prev_train_cds key, {prev_train_cds.keys()} ", prev_train_cds.keys())
-        # print("prev_val_losses key, {prev_val_losses.keys()} ", prev_val_losses.keys())
-        # print("prev_val_cds key, {prev_val_cds.keys()} ", prev_val_cds.keys())
-
-        # prev_train_losses key, {prev_train_losses.keys()}  dict_keys(['ave'])
-        # prev_train_cds key, {prev_train_cds.keys()}  dict_keys(['epochs', 'data'])
-        # prev_val_losses key, {prev_val_losses.keys()}  dict_keys(['ave'])
-        # prev_val_cds key, {prev_val_cds.keys()}  dict_keys(['epochs', 'data'])
-
-        assert (
-            len(prev_train_losses["ave"]) == start_epoch and len(
-                prev_val_losses["ave"]) == start_epoch
-        ), f'checkpoint train losses and cds not same length as start epoch, prev_train_losses {len(prev_train_losses["ave"]) } start_epoch {start_epoch } prev_val_losses { len(prev_val_losses["ave"]) }'
-
-    log_utils(log_type="static", model=model, writer=writer, epoch=None)
-
-    # assert cfg.loss.loss_type == "mse", "only mse supported"
-    criterion = get_loss(cfg)
-    # Train the model
-    # print("type",type(dataloader_train))
-    # print("type2",type(dataloader_train.dataset))
-    # print("type3",type(dataloader_train.dataset.dataset))
-    # print("datastat mean",dataloader_train.dataset.dataset.data_mean)
-    # print("datastat std",dataloader_train.dataset.dataset.data_std)
-    # type <class 'torch.utils.data.dataloader.DataLoader'>
-    # type2 <class 'torch.utils.data.dataset.Subset'>
-    # type3 <class '__main__.MANDataset'>
-    # datastat mean tensor([ 4.4707,  0.3817, -0.0988])
-    # datastat std tensor([2.4141, 3.7607, 1.2928])
-
-    train_loss_emas, train_cd_emas, val_loss_emas, val_cd_emas = train(
-        model,
-        # dataloader,
-        dataloader_train,
-        dataloader_val,
-        optimizer,
-        scheduler,
-        cfg,
-        device=device,
-        start_epoch=start_epoch,
-        criterion=criterion,
-        writer=writer,
-        pcpm=pcpm,
-        loss_ema_factors=[],  # [0.9, 0.95, 0.975, 0.99],
-        cd_ema_factors=[],
-        CHECKPOINT_DB_FILE=CHECKPOINT_DB_FILE,
-        prev_train_cds=prev_train_cds,
-        prev_train_losses=prev_train_losses,
-        prev_val_cds=prev_val_cds,
-        prev_val_losses=prev_val_losses,
-        run_dir_name=run_dir_name,
-    )
-
-    metric_dict = {
-        **{f"MDict_Train_Loss_ave/ema_{k:.2e}": train_loss_emas["ave"][k] for k in train_loss_emas["ave"]},
-        **{f"MDict_Train_CD_ave/ema_{k:.2e}": train_cd_emas["ave"][k] for k in train_cd_emas["ave"]},
-        **{f"MDict_Val_Loss_ave/ema_{k:.2e}": val_loss_emas["ave"][k] for k in val_loss_emas["ave"]},
-        **{f"MDict_Val_CD_ave/ema_{k:.2e}": val_cd_emas["ave"][k] for k in val_cd_emas["ave"]},
-    }
-
-    if False:  # Evo plots
-
-        # Sample from the model
-
-        batch = next(iter(dataloader_train))
-
-        pc, camera, image_rgb, mask, depths, idx = extract_batch(
-            cfg, batch, device)
-
-        samples = {}
-        for i in [1, 5, 10, 50, 100, scheduler.config.num_train_timesteps]:
-
-            samples[f"step{i}"] = sample(
-                model,
-                scheduler,
-                cfg,
-                camera=camera[0],
-                image_rgb=image_rgb[:1],
-                depths=depths[:1] if depths is not None else None,
-                mask=mask[:1] if mask is not None else None,
-                num_inference_steps=i,
-                device=device,
-                pcpm=pcpm,
-                data_mean=dataloader_train.dataset.dataset.data_mean,
-                data_std=dataloader_train.dataset.dataset.data_std
-            )
-        # make the plot that will be logged to tb
-        gt_cond_pc = pcpm.point_cloud_to_tensor(
-            pc[:1], normalize=True, scale=True)
-        # print("samples_updated", samples_updated.shape)
-        # print("gt_cond_pc", gt_cond_pc.shape)
-        # samples_updated torch.Size([1, 128, 3])
-        # gt_cond_pc torch.Size([2, 128, 3])
-
-        plt.figure(figsize=(10, 10))
-
-        for key, value in samples.items():
-            samples_updated = samples[key][0]
-
-            cd_loss, _ = calculate_chamfer_distance(
-                cfg.dataset.is_scaled, dataloader_train.dataset.dataset.data_mean, dataloader_train.dataset.dataset.data_std,
-                gt_cond_pc,
-                samples_updated,
-                device,
-            )
-
-            print(
-                key,
-                "\t",
-                f"CD: {cd_loss:.2f}",
-            )
-
-            error = []
-            assert len(samples[key][1]) > 1, "need more than 1 sample to plot"
-            for x in samples[key][1]:
-
-                cd_loss, _ = calculate_chamfer_distance(
-                    cfg.dataset.is_scaled, dataloader_train.dataset.dataset.data_mean, dataloader_train.dataset.dataset.data_std,
-                    gt_cond_pc,
-                    x.unsqueeze(0),
-                    device,
+                    depth_model="vits",
+                    random_offset=False,
+                    data_file="man-mini",
+                    device="cpu",
+                    is_scaled=True,
+                    img_size=618,
+                    radar_channel='RADAR_LEFT_FRONT',
+                    camera_channel='CAMERA_RIGHT_FRONT',
+                    
                 )
-
-                error.append(cd_loss.item())
-            # ax = plt.plot(error, label=key)
-            plt.plot(
-                [i / (len(error) - 1) for i in range(len(error))],
-                error,
-                label=key,
-                marker=None,
-            )
-            # print()
-        plt.legend()
-        plt.title(
-            f"Diffusion model: {cfg.run.max_steps } epochs, {cfg.run.num_inference_steps } timesteps, {cfg.model.beta_schedule } schedule",
-        )
-        plt.xlabel("Evolution steps ratio")
-        plt.ylabel("Chamfer distance")
-        # ylog
-        plt.yscale("log")
-
-        writer.add_figure(f"Evolution", plt.gcf(), cfg.run.max_steps)
-        plt.close()
-
-        print("done evo plots")
-
-    hparam_dict = {
-        "seed": cfg.run.seed,  #
-        "epochs": cfg.run.max_steps,
-        "num_inference_steps": cfg.run.num_inference_steps,  #
-        "image_size": cfg.dataset.image_size,  #
-        "dataset_data_stat": cfg.dataset.data_stat,
-        "dataset_subset": cfg.dataset.subset_name,
-        "dataset_cat": cfg.dataset.category,
-        "dataset_source": cfg.dataset.type,
-        "max_points": cfg.dataset.max_points,  #
-        "batch_size": cfg.dataloader.batch_size,
-        "num_scenes": cfg.dataloader.num_scenes,
-        "shuffle": cfg.dataloader.shuffle,
-        "beta_schedule": cfg.model.beta_schedule,  #
-        "condition_source": cfg.model.condition_source,  #
-        "point_cloud_model_embed_dim": cfg.model.point_cloud_model_embed_dim,
-        "point_cloud_model": cfg.model.point_cloud_model,  #
-        "loss_type": cfg.loss.loss_type,  #
-        "lr": cfg.optimizer.lr,  #
-        "optimizer": cfg.optimizer.name,  #
-        "optimizer_decay": cfg.optimizer.weight_decay,
-        "optimizer_beta_0": cfg.optimizer.kwargs.betas[0],
-        "optimizer_beta_1": cfg.optimizer.kwargs.betas[1],
-    }
-
-    writer.add_hparams(hparam_dict, metric_dict)
-    writer.close()
-
+                data_mean = man_dataset.data_mean
+                data_std = man_dataset.data_std
+                record.append({
+                    "scene_id": scene_id,
+                    "num_frame": num_frame,
+                    "num_point": num_point,
+                    "data_mean_x": data_mean[0].item(),
+                    "data_mean_y": data_mean[1].item(),
+                    "data_mean_z": data_mean[2].item(),
+                    "data_std_x": data_std[0].item(),
+                    "data_std_y": data_std[1].item(),
+                    "data_std_z": data_std[2].item(),
+                })
+                #save to csv
+                df = pd.DataFrame(record)
+                df.to_csv("data_mean_std.csv", index=False)
 
 if __name__ == "__main__":
     main()
