@@ -1576,7 +1576,7 @@ def train(
             "epochs": list(prev_cds["epochs"]) + list(new_cds["epochs"]),
             "data": {
                 scene_id: (
-                    list(prev_cds["data"][scene_id])
+                    list(prev_cds["data"][scene_id] if scene_id in prev_cds["data"] else [])
                     if len(prev_cds["epochs"]) > 0
                     else []
                 )

@@ -2,7 +2,7 @@ from pytorch3d.structures import Pointclouds
 import hydra
 import glob
 from torch.cuda.amp import autocast, GradScaler
-import time
+
 from datetime import datetime
 from pathlib import Path
 import inspect
@@ -29,7 +29,7 @@ from tqdm import tqdm, trange
 import numpy as np
 import random
 from torch.utils.tensorboard import SummaryWriter
-from model.point_cloud_model import PointCloudModel
+# from model.point_cloud_model import PointCloudModel
 from model.projection_model_finetune import PointCloudProjectionModel
 import os
 from pytorch3d.implicitron.dataset.data_loader_map_provider import (
@@ -108,7 +108,6 @@ class MANDataset(Dataset):
 
         all_radar_positions = torch.stack(
             [d[1] for d in self.data_bank], dim=0)
-        print("all_radar_positions", all_radar_positions.shape)  #1x 16 x3 
 
         actual_data_mean = all_radar_positions.mean(axis=(0, 1))
         asctual_data_std = all_radar_positions.std(axis=(0, 1))
@@ -118,7 +117,7 @@ class MANDataset(Dataset):
         print("loded ", len(self.data_bank), "samples")
         print("data_mean", self.data_mean)
         print("data_std", self.data_std)
-        
+
         depth_image_dir = os.path.join(self.data_root, "depth_images")
         if not os.path.exists(depth_image_dir):
             os.makedirs(depth_image_dir)
@@ -272,8 +271,6 @@ class MANDataset(Dataset):
         filtered_radar_data = filtered_radar_data[
             torch.randperm(filtered_radar_data.size(0))[: self.N]
         ]
-        print("filtered_radar_data", filtered_radar_data.shape)
-        print("filtered_radar_data", filtered_radar_data)
         while filtered_radar_data.shape[0] < self.N:
             filtered_radar_data = torch.cat(
                 [
@@ -601,6 +598,44 @@ def folow_SDK_conversion(trucksc, first_frame_token, test_points, camera: Perspe
     ).transform_points(test_points)-test_points_lib)**2))
 
 
+def calib_to_camera_base(calibration_data, image_size_hw: tuple, offset: int = 0, image_size: int = 618):
+
+    s = image_size/618
+    # Convert intrinsic matrix K to tensor
+    K = torch.tensor(calibration_data["K"])
+
+    K[0, 0] = K[0, 0] * s
+    K[1, 1] = K[1, 1] * s
+
+    K[0, 2] = K[0, 2] * s
+    K[1, 2] = K[1, 2] * s
+
+    offset = offset * s
+
+    # Extract focal length and principal point from K
+    focal_length = torch.tensor([[K[0, 0], K[1, 1]]])
+    principal_point = torch.tensor([[K[0, 2] - offset, K[1, 2]]])
+
+    # Convert extrinsic matrix T_to_ref_COS to tensor
+    T_to_ref_COS = torch.tensor(calibration_data["T_to_ref_COS"])
+
+    # Extract rotation (R) and translation (T) components
+    R = T_to_ref_COS[:3, :3].unsqueeze(0)  # 3x3 rotation matrix
+    RT_inv = torch.inverse(T_to_ref_COS)
+    T = RT_inv[:3, 3].unsqueeze(0)  # 3x1 translation vector
+    # T = T_to_ref_COS[:3, 3].unsqueeze(0)   # 3x1 translation vector
+
+    # Create a PerspectiveCameras object
+    return PerspectiveCameras(
+        focal_length=focal_length,
+        principal_point=principal_point,
+        R=R,
+        T=T,
+        in_ndc=False,
+        image_size=[image_size_hw],
+    )
+
+
 def calib_to_camera_base_MAN(cam_calib, cam_pose, radar_calib, radar_pose, image_size_hw: tuple, offset: int = 0, image_size: int = 618, step=4):
 
     # === Build individual transforms as 4x4 homogeneous matrices ===
@@ -843,7 +878,25 @@ class PointCloudLoss(nn.Module):
 
 def extract_batch(cfg: ProjectConfig, batch, device):
 
-    if cfg.dataset.type in ["man-mini", "man-full"]:
+    if cfg.dataset.type == "astyx":
+        (
+            depths,
+            radar_data,
+            camera,
+            image_rgb,
+            objects,
+            idx,
+            npoints,
+            npoints_filtered,
+            offsets,
+        ) = batch
+        depths = depths.to(device)
+        camera = camera.to(device)
+        mask = None
+        image_rgb = image_rgb.to(device)
+        points = radar_data.float().to(device)
+        pc = Pointclouds(points=points)
+    elif cfg.dataset.type in ["man-mini", "man-full"]:
 
         (
             depths,
@@ -896,12 +949,9 @@ def train_one_epoch(
 
     batch_train_losses = []
     for batch in dataloader_train:
-        start_time = time.time()
 
         pc, camera, image_rgb, mask, depths, idx, npoints,            npoints_filtered = extract_batch(
             cfg, batch, device)
-        
-        extract_time = time.time()
 
         x_0 = pcpm.point_cloud_to_tensor(pc, normalize=True, scale=True)
 
@@ -917,8 +967,6 @@ def train_one_epoch(
         x_t = scheduler.add_noise(x_0, noise, timesteps)  # noisy_x
         # print("type x_t", type(x_t))
         # print("dtype x_t", x_t.dtype)
-        
-        setupt_time = time.time()
 
         x_t_input = apply_conditioning_to_xt(
             cfg,
@@ -931,7 +979,6 @@ def train_one_epoch(
             pcpm,
         )
 
-        condition_time = time.time()
         if cfg.dataset.is_scaled:
             # scale back the first 3 dimensions
             x_t_input[:, :, :3] = x_t[:, :, :3]
@@ -952,10 +999,6 @@ def train_one_epoch(
         scaler.step(optimizer)
         scaler.update()
         batch_train_losses.append(loss.item())  # float
-        ml_time = time.time()
-
-        # print(f"train_time total {time.time()-start_time:.2f} extract_time {extract_time-start_time:.2f} setupt_time {setupt_time-extract_time:.2f} condition_time {condition_time-setupt_time:.2f} ml_time {ml_time-condition_time:.2f}")
-        # print(f"percentage of time spent in each step: extract_time {100*(extract_time-start_time)/(ml_time-start_time):.2f} setupt_time {100*(setupt_time-extract_time)/(ml_time-start_time):.2f} condition_time {100*(condition_time-setupt_time)/(ml_time-start_time):.2f} ml_time {100*(ml_time-condition_time)/(ml_time-start_time):.2f}")
 
     model.eval()
     pcpm.feature_model.model.eval()
@@ -1472,7 +1515,7 @@ def plot_sample_condition(
         if not os.path.exists(dir_name):
             print("creating dir", dir_name)
             os.makedirs(dir_name)
-        fname = f"{dir_name}/sample_ep_{epoch:06d}.png"
+        fname = f"{dir_name}/sample_ep_{epoch:05d}.png"
     # print("plot_sample_condition fname", fname)
 
     gt = gt.numpy()[0]
@@ -1767,7 +1810,7 @@ def train(
                 cfg,
                 epoch,
                 # None,
-                f"plots/{cfg.run.name}/sample_ep_{epoch:06d}_gt{i}_idx{idx[i]}.png",
+                f"plots/{cfg.run.name}/sample_ep_{epoch:05d}_gt{i}_idx{idx[i]}.png",
                 0.1,
                 cam_wires_trans=get_camera_wires_trans(
                     camera[i]).detach().cpu(),
@@ -1811,18 +1854,13 @@ def train(
             'v1.0-mini', '/data/palakons/new_dataset/MAN/mini/man-truckscenes', True)
 
         scaler = GradScaler()
-        time_end = time.time()
-
         for epoch in tqdm_range:
-            time_start = time.time()
-            # log_utils(log_type="dynamic", model=model, writer=writer, epoch=epoch)  #takes lot of time
-            time_log = time.time() 
+            log_utils(log_type="dynamic", model=model,
+                      writer=writer, epoch=epoch)
 
             batch_train_losses, batch_val_losses = train_one_epoch(
                 dataloader_train, dataloader_val, model, optimizer, scheduler, cfg, criterion, device, pcpm, scaler
             )
-            time_train = time.time()
-            
             train_losses = sum(batch_train_losses) / len(batch_train_losses)
             if len(batch_val_losses) == 0:
                 val_losses = 0
@@ -1832,16 +1870,13 @@ def train(
             new_train_losses.append(train_losses)
             new_val_losses.append(val_losses)
 
+            tqdm_range.set_description(f"loss: {train_losses:.4f}")
 
             train_loss_emas = update_loss_emas(
                 loss_ema_factors, train_loss_emas, train_losses, epoch, writer=writer, name="train")
             val_loss_emas = update_loss_emas(
                 loss_ema_factors, val_loss_emas, val_losses, epoch, writer=writer, name="val")
 
-            time_update_loss_emas = time.time() 
-            tqdm_range.set_description(f"loss: {train_losses:.2f}")
-            # print(f"time_log {time_log-time_start:.2f} train { time_train-time_log:.2f} update_loss_emas {time_update_loss_emas-time_train:.2f} end to end {time_end-time_start:.2f}")
-                
             # for alpha in list(loss_ema_factors) + [0]:
             #     train_loss_emas["ave"][alpha] = (
             #         train_losses
@@ -1852,9 +1887,8 @@ def train(
             #     #     "Loss/average", {f"ema_{alpha:.2e}": losses}, epoch)
             #     writer.add_scalars(
             #         "Loss/average", {f"ema_{alpha:.2e}": loss_emas["ave"][alpha]}, epoch)
-            time_end = time.time()
 
-            if (epoch + 1) % cfg.run.vis_freq == 0:
+            if (epoch + 1) % cfg.run.vis_freq == 0 or epoch == 0:
                 dir_name = f"plots/{run_dir_name}"
                 if not os.path.exists(dir_name):
                     print("creating dir", dir_name)
@@ -1959,8 +1993,8 @@ def train(
                             steps,
                             cfg,
                             epoch,
-                            # fname=f"plots/{run_dir_name}/sample_ep_{epoch:06d}_gt{i}_train-idx-{idx_i}.{plot_ext}",
-                            fname=f"plots/{run_dir_name}/sample_ep_{epoch:06d}_gt{i}_train-idx-{idx_i[:3]}.{plot_ext}",
+                            # fname=f"plots/{run_dir_name}/sample_ep_{epoch:05d}_gt{i}_train-idx-{idx_i}.{plot_ext}",
+                            fname=f"plots/{run_dir_name}/sample_ep_{epoch:05d}_gt{i}_train-idx-{idx_i[:3]}.{plot_ext}",
                             # None,
                             point_size=0.1,
                             cam_wires_trans=get_camera_wires_trans(camera[i])
@@ -1974,18 +2008,7 @@ def train(
                             data_std=dataloader_train.dataset.dataset.data_std,
                             plot_ext=plot_ext,
                         )
-                        #
-                        save_to_json(
-                            pc_condition.cpu(),
-                            xts.cpu(),
-                            steps,
-                            cfg,
-                            epoch,
-                            fname=f"plots/{run_dir_name}/sample_ep_{epoch:06d}_gt{i}_train-idx-{idx_i[:3]}.json",
-                            cam_wires_trans=get_camera_wires_trans(camera[i]).detach().cpu(),
-                            cd=train_cd_loss.item(),
-                            data_mean=dataloader_train.dataset.dataset.data_mean,
-                            data_std=dataloader_train.dataset.dataset.data_std)
+
                         plot_image_depth_projected(
                             pc_condition.cpu(),
                             cfg,
@@ -2105,8 +2128,8 @@ def train(
                             steps,
                             cfg,
                             epoch,
-                            fname=f"plots/{run_dir_name}/sample_ep_{epoch:06d}_gt{i}_val-idx-{idx_i[:3]}.{plot_ext}",
-                            # fname=f"plots/{run_dir_name}/sample_ep_{epoch:06d}_gt{i}_val-idx-{idx_i[:3]}.png",
+                            fname=f"plots/{run_dir_name}/sample_ep_{epoch:05d}_gt{i}_val-idx-{idx_i[:3]}.{plot_ext}",
+                            # fname=f"plots/{run_dir_name}/sample_ep_{epoch:05d}_gt{i}_val-idx-{idx_i[:3]}.png",
                             # None,
                             point_size=0.1,
                             cam_wires_trans=get_camera_wires_trans(camera[i])
@@ -2120,18 +2143,6 @@ def train(
                             data_std=dataloader_val.dataset.dataset.data_std,
                             plot_ext=plot_ext,
                         )
-                        save_to_json(
-                            pc_condition.cpu(),
-                            xts.cpu(),
-                            steps,
-                            cfg,
-                            epoch,
-                            fname=f"plots/{run_dir_name}/sample_ep_{epoch:06d}_gt{i}_val-idx-{idx_i[:3]}.json",
-                            cam_wires_trans=get_camera_wires_trans(camera[i]).detach().cpu(),
-                            cd=train_cd_loss.item(),
-                            data_mean=dataloader_train.dataset.dataset.data_mean,
-                            data_std=dataloader_train.dataset.dataset.data_std)
-
 
                         plot_image_depth_projected(
                             pc_condition.cpu(),
@@ -2284,64 +2295,6 @@ def apply_conditioning_to_xt(
 # Sampling function
 
 
-def save_to_json(gt,xts,steps, cfg: ProjectConfig, epoch, fname, 
-    cam_wires_trans=None,
-    cd=None,
-    data_mean=torch.tensor([0, 0, 0]),
-    data_std=torch.tensor([1, 1, 1])):
-    """Save the point cloud to a json file.
-    gt: 1 x 128 x 3
-    xts: len(steps) x 128 x 3
-    steps: [...]
-    cfg: ProjectConfig
-    epoch: int
-    fname: str
-    cam_wires: aarray 
-    cd: float
-    data_mean: torch.tensor
-    data_std: torch.tensor
-    """
-    # print("gt", gt.shape)
-    # print("xts", xts.shape)
-    # print("steps", steps.shape)
-    # print("cam_wires", cam_wires_trans)
-    # print("cam_wires", cam_wires_trans.shape)
-    # print("data_mean", data_mean.shape)
-    # print("data_std", data_std.shape)
-    # gt torch.Size([1, 128, 3])
-    # xts torch.Size([11, 128, 3])
-    # steps torch.Size([11])
-    # cam_wires tensor([[[ 2.4198, -1.1009, -0.5943],
-    #         [ 2.6253, -2.0796, -0.5853],
-    #         [ 2.6355, -2.0797, -0.8351],
-    #         [ 2.6253, -2.0796, -0.5853],
-    #         [ 2.8307, -3.0582, -0.5763],
-    #         [ 2.7691, -3.0574,  0.9224],
-    #         [ 2.3581, -1.1001,  0.9044],
-    #         [ 2.4198, -1.1009, -0.5943],
-    #         [ 0.6388, -2.4905,  0.0838],
-    #         [ 2.8307, -3.0582, -0.5763],
-    #         [ 2.7691, -3.0574,  0.9224],
-    #         [ 0.6388, -2.4905,  0.0838],
-    #         [ 2.3581, -1.1001,  0.9044],
-    #         [ 0.6388, -2.4905,  0.0838],
-    #         [ 3.5722, -1.8735,  0.2042]]])
-    # cam_wires torch.Size([1, 15, 3])
-    # data_mean torch.Size([3])
-    # data_std torch.Size([3])
-    output_json = {
-        "epoch": epoch,
-        "gt": gt.cpu().numpy().tolist(),
-        "xts": xts.cpu().numpy().tolist(),
-        "steps": steps.cpu().numpy().tolist(),
-        "cam_trans_wires": cam_wires_trans.cpu().numpy().tolist(),
-        "cd": cd,
-        "data_mean": data_mean.cpu().numpy().tolist(),
-        "data_std": data_std.cpu().numpy().tolist(),
-        "cfg": to_dict(cfg)}
-    #save as json
-    with open(fname, "w") as f:
-        json.dump(output_json, f, indent=4)
 @torch.no_grad()
 def sample(
     model,
@@ -2833,9 +2786,379 @@ def get_checkpoint_fname_json(cfg: ProjectConfig, db_fname, CHECKPOINT_DIR):
     return current_cp_fname
 
 
+def custom_collate_fn(batch):
+    (
+        depths,
+        radar_data,
+        camera_base_list,
+        camera_fronts,
+        objects,
+        idxs,
+        npoints,
+        npoints_filtered,
+        square_image_offset,
+    ) = zip(*batch)
+
+    npoints_after = torch.as_tensor(npoints)
+    npoints_filtered_after = torch.as_tensor(npoints_filtered)
+    idxs_after = torch.as_tensor(idxs)
+    square_image_offset_after = torch.as_tensor(square_image_offset)
+
+    objects_after = list(objects)
+    camera_fronts_after = torch.stack(camera_fronts)
+    radar_data_after = torch.stack(radar_data)
+    depths_after = torch.stack(depths)
+
+    focal_length = []
+    principal_point = []
+    R = []
+    T = []
+    image_sizes_hw = []
+    for camera_base in camera_base_list:
+        focal_length.append(camera_base.focal_length)
+
+        principal_point.append(camera_base.principal_point)
+        R.append(camera_base.R)
+        T.append(camera_base.T)
+        image_sizes_hw.append(camera_base.image_size)
+
+    focal_lengths = torch.concat(focal_length)
+    principal_points = torch.concat(principal_point)
+    Rs = torch.concat(R)
+    Ts = torch.concat(T)
+    image_sizes_hw = torch.concat(image_sizes_hw)
+
+    # print("image_sizes_hw: ", image_sizes_hw)
+
+    camera_bases = PerspectiveCameras(
+        focal_length=focal_lengths,
+        principal_point=principal_points,
+        R=Rs,
+        T=Ts,
+        in_ndc=False,
+        image_size=image_sizes_hw,
+    )
+
+    return (
+        depths_after,
+        radar_data_after,
+        camera_bases,
+        camera_fronts_after,
+        objects_after,
+        idxs_after,
+        npoints_after,
+        npoints_filtered_after,
+        square_image_offset_after,
+    )
+
+
+class AstyxDataset(Dataset):
+    def __init__(
+        self,
+        M,
+        N,
+        depth_model,
+        random_offset: bool = False,
+        root_dir: str = "/data/palakons/dataset_astyx_hires2019/",
+        device="cpu",
+        is_scaled=False,
+        img_size=618,
+    ):
+        # root_dir: path to the directory containing the json files
+        self.root_dir = root_dir
+        self.radar_dir = root_dir + "/radar_6455"
+        self.depth_dir = root_dir + "/depth_front"
+        self.camera_dir = root_dir + "/camera_front"
+        # self.depth_models = ['vitl','vitb','vits']
+        self.calibration_dir = root_dir + "/calibration"
+        self.object_dir = root_dir + "/groundtruth_obj3d"
+        self.M = M
+        self.N = N
+        self.depth_model = depth_model  # ['vitl','vitb','vits']
+        self.random_offset = random_offset
+        self.device = device
+        self.is_scaled = is_scaled
+        self.img_size = img_size
+
+        self.ids = []
+        # list filesin the radar_dir
+        for file in os.listdir(self.radar_dir):
+            idx = int(file[:6])
+            if idx not in self.ids:
+                if not os.path.exists(
+                    self.depth_dir + f"/{idx:06d}_{self.depth_model}.jpg"
+                ):
+                    print(
+                        "File not found: ",
+                        self.depth_dir + f"/{idx:06d}_{self.depth_model}.jpg",
+                    )
+                    continue
+
+                if not os.path.exists(self.calibration_dir + f"/{idx:06d}.json"):
+                    print("File not found: ",
+                          self.calibration_dir + f"/{idx:06d}.json")
+                    continue
+                if not os.path.exists(self.camera_dir + f"/{idx:06d}.jpg"):
+                    print("File not found: ",
+                          self.camera_dir + f"/{idx:06d}.jpg")
+                    continue
+                if not os.path.exists(self.object_dir + f"/{idx:06d}.json"):
+                    print("File not found: ",
+                          self.object_dir + f"/{idx:06d}.json")
+                    continue
+                self.ids.append(idx)
+        # randomly sample for M items
+        self.active_ids = random.sample(self.ids, M)
+
+        self.data_bank = []
+        for i in range(len(self.active_ids)):
+            self.data_bank.append(self.load_data(self.active_ids[i]))
+
+        # stat for position data
+        # print("self.data_bank[0][1]", self.data_bank[0][1].shape)
+        # self.data_bank[0][1] torch.Size([128, 3])
+        all_radar_positions = torch.stack(
+            [d[1] for d in self.data_bank], dim=0)
+        # print("all_radar_positions", all_radar_positions.shape)
+        # # all_radar_positions torch.Size([10, 128, 3])
+
+        # print("mean", all_radar_positions.shape)
+        # print("mean", all_radar_positions.mean(axis=(0,1)))
+        # print("std", all_radar_positions.shape)
+        # print("std", all_radar_positions.std(axis=(0,1)))
+        # store mean and std
+        self.data_mean = all_radar_positions.mean(axis=(0, 1))
+        self.data_std = all_radar_positions.std(axis=(0, 1))
+
+    def load_data(self, idx):
+
+        depth = {}
+        image = plt.imread(
+            self.depth_dir + f"/{idx:06d}_{self.depth_model}.jpg")
+
+        # if image is of 3 channels, take only the first one
+        # print("image.shape: ", image.shape)
+        if len(image.shape) == 3:
+            image = image[:, :, 0]
+        if image.max() > 1.0:
+            image = image / 255.0
+        depth = torch.tensor(image, dtype=torch.float32)
+        # print("depth: ", depth.shape)  # depth:  torch.Size([618, 2048])
+
+        square_image_offset = (
+            int((depth.shape[1] - depth.shape[0]) / 2)
+            if not self.random_offset
+            else random.randint(0, depth.shape[1] - depth.shape[0])
+        )
+
+        # square_image_offset = depth.shape[1] - depth.shape[0]
+        # print("square_image_offset: ", square_image_offset)
+        image_size_hw = (depth.shape[0], depth.shape[1])
+        depth = depth[:,
+                      square_image_offset: square_image_offset + depth.shape[0]]
+
+        # resize image to self.img_size
+
+        depth = torch.nn.functional.interpolate(
+            depth.unsqueeze(0).unsqueeze(0),
+            size=(self.img_size, self.img_size),
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(0).squeeze(0)
+
+        # load radar data, .txt
+        df = pd.read_csv(
+            self.radar_dir + f"/{idx:06d}.txt", sep=" ", skip_blank_lines=True
+        )
+        df = df.iloc[:, :3]
+        # convert to tensor
+        radar_data = torch.tensor(df.values)
+        npoints_original = radar_data.shape[0]
+
+        # load calibration data, .json
+        with open(self.calibration_dir + f"/{idx:06d}.json") as f:
+            calibrations = json.load(f)
+            for c in calibrations["sensors"]:
+                if c["sensor_uid"] == "camera_front":
+                    new_camera_base = calib_to_camera_base(
+                        c["calib_data"], [image_size_hw[0]] *
+                        2, square_image_offset, self.img_size
+                    )
+
+        assert (
+            new_camera_base is not None
+        ), "new_camera_base is None (not found in calibration data)"
+
+        # load camera data, .jpg
+        camera_front = plt.imread(self.camera_dir + f"/{idx:06d}.jpg").transpose(
+            2, 0, 1
+        )
+        if camera_front.max() > 1.0:
+            camera_front = camera_front / 255.0
+        camera_front = torch.tensor(camera_front, dtype=torch.float32)
+        # print("camera_front: ", camera_front.shape) #camera_front:  torch.Size([3, 618, 2048])
+        camera_front = camera_front[
+            :, :, square_image_offset: square_image_offset + camera_front.shape[1]
+        ]
+
+        # resize image to self.img_size
+        camera_front = torch.nn.functional.interpolate(
+            camera_front.unsqueeze(0),
+            size=(self.img_size, self.img_size),
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(0)
+
+        # filter points: keeps only points within the image
+        # world_points = radar_data
+        world_points = radar_data.clone().detach().float()
+        # cam_coord = new_camera_base.get_world_to_view_transform().transform_points(
+        #     torch.tensor(world_points, dtype=torch.float32))  # N x3
+        image_coord = new_camera_base.transform_points(world_points)
+        # torch.tensor(world_points, dtype=torch.float32))  # N x3
+        points_uv = image_coord[:, :2]  # N x2
+
+        # print("shapes: ", points_uv.shape)
+        # print("min axis 0", points_uv.min(axis=0))
+        # print("max axis 0", points_uv.max(axis=0))
+        # print("filtering from to", square_image_offset,
+        #   camera_front.shape[1]+square_image_offset)
+        mask = (
+            (points_uv[:, 1] >= 0)
+            & (points_uv[:, 1] < camera_front.shape[1])
+            & (points_uv[:, 0] >= 0)
+            & (points_uv[:, 0] < camera_front.shape[1])
+            # & (points_uv[:, 2] > 0)  # Ensure points are in front of the camera
+        )
+        # print("radar_data: ", radar_data.shape)
+        filtered_radar_data = radar_data[mask]
+        npoints_filtered = filtered_radar_data.shape[0]
+        # print("filtered_radar_data: ", filtered_radar_data.shape)
+
+        # image_coord_in = new_camera_base.transform_points(
+        #     torch.tensor(radar_data[mask], dtype=torch.float32))  # N x3
+        # image_coord_out = new_camera_base.transform_points(
+        #     torch.tensor(radar_data[~mask], dtype=torch.float32))  # N x3
+
+        # print("in", filtered_radar_data.shape, image_coord_in.shape)
+        # print("min max in", image_coord_in.min(
+        #     axis=0), image_coord_in.max(axis=0))
+        # print("out", radar_data[~mask].shape, image_coord_out.shape)
+
+        # print("radar_data: ", radar_data.shape)#radar_data:  torch.Size([2246, 3])
+        # sample radar data points to N points
+        filtered_radar_data = filtered_radar_data[
+            torch.randperm(filtered_radar_data.size(0))[: self.N]
+        ]
+
+        while filtered_radar_data.shape[0] < self.N:
+            filtered_radar_data = torch.cat(
+                [
+                    filtered_radar_data,
+                    filtered_radar_data[
+                        torch.randperm(filtered_radar_data.size(0))[
+                            : self.N - filtered_radar_data.shape[0]
+                        ]
+                    ],
+                ]
+            )
+        # print("radar_data: ", radar_data.shape)#radar_data:  torch.Size([N, 3])
+
+        # load object data, .json
+        with open(self.object_dir + f"/{idx:06d}.json") as f:
+            objects = json.load(f)
+
+        # print("shapes: ", depth.shape, filtered_radar_data.shape, camera_front.shape,len(objects),len(idx),npoints)
+        print(
+            f"idx {idx} npoints_original {npoints_original} npoints_filtered {npoints_filtered} square_image_offset {square_image_offset}"
+        )
+        return (
+            depth,
+            filtered_radar_data,
+            new_camera_base,
+            camera_front,
+            objects,
+            idx,
+            npoints_original,
+            npoints_filtered,
+            square_image_offset,
+        )
+
+    def __len__(self):
+        return len(self.active_ids)
+
+    def __getitem__(self, idx):
+        if not self.is_scaled:
+
+            return self.data_bank[idx]
+
+        (
+            depth,
+            filtered_radar_data,
+            new_camera_base,
+            camera_front,
+            objects,
+            idx,
+            npoints_original,
+            npoints_filtered,
+            square_image_offset,
+        ) = self.data_bank[idx]
+
+        # print("mean", self.data_mean)
+        # print("std", self.data_std)
+        # print("filtered_radar_data", filtered_radar_data.shape)
+        # print("filtered_radar_data", filtered_radar_data[0])
+
+        # newd =(filtered_radar_data-self.data_mean)/self.data_std
+
+        # print("newd", newd.shape)
+
+        # print("filtered_radar_data", newd[0])
+        # mean tensor([38.5517, -0.2240,  1.0346], dtype=torch.float64)                                                             std tensor([20.8821,  3.5820,  1.9252], dtype=torch.float64)                                                             filtered_radar_data torch.Size([128, 3])                                                                  filtered_radar_data tensor([73.2768, -1.1732,  3.0596], dtype=torch.float64)                                                             newd torch.Size([128, 3])                                                                                                                        filtered_radar_data tensor([ 1.6629, -0.2650,  1.0518], dtype=torch.float64)
+
+        return (
+            depth,
+            (filtered_radar_data - self.data_mean) / self.data_std,
+            new_camera_base,
+            camera_front,
+            objects,
+            idx,
+            npoints_original,
+            npoints_filtered,
+            square_image_offset,
+        )
+
+
+def get_astyxdataset(cfg: ProjectConfig, device="cpu"):
+    # cfg1.dataloader.batch_size
+    print("batch_size", cfg.dataloader.batch_size)
+    train_dataset = AstyxDataset(
+        cfg.dataloader.num_scenes,
+        cfg.dataset.max_points,
+        "vits",
+        device=device,
+        is_scaled=cfg.dataset.is_scaled,
+        img_size=cfg.dataset.image_size,
+    )
+    dataloader_train, dataloader_val, dataloader_vis = (
+        DataLoader(
+            train_dataset,
+            batch_size=cfg.dataloader.batch_size,
+            num_workers=cfg.dataloader.num_workers,
+            collate_fn=custom_collate_fn,
+            shuffle=cfg.dataloader.shuffle,
+        ),
+        None,
+        None,
+    )
+    return dataloader_train, dataloader_val, dataloader_vis
+
+
 def get_dataset(cfg: ProjectConfig, device="cpu"):
     if cfg.dataset.type in ["man-mini", "man-full"]:
         return get_mandataset(cfg)
+    elif cfg.dataset.type == "astyx":
+        return get_astyxdataset(cfg, device)
     else:
         raise ValueError(
             f"dataset type {cfg.dataset.type} not supported"
@@ -2921,6 +3244,277 @@ def process_ema_prev_values(cfg: ProjectConfig, writer, ema_factors, epochs, pre
     return emas
 
 
+def evo_plot(dataloader, model, scheduler, pcpm, cfg, device, fname):
+
+    # Sample from the model
+
+    data = []
+
+    for batch_i, batch in enumerate(dataloader):
+
+        pc, camera, image_rgb, mask, depths, idx, npoints,            npoints_filtered = extract_batch(
+            cfg, batch, device)
+
+        for pc_i in range(len(pc)):  # each data point in batch
+
+            # make the plot that will be logged to tb
+            gt_cond_pc = pcpm.point_cloud_to_tensor(
+                pc[pc_i:pc_i+1], normalize=True, scale=True)
+
+            plot_image_depth_projected(
+                gt_cond_pc.cpu(),
+                cfg,
+                fname.replace(
+                    ".png", f"_image_depth_{batch_i}_{idx[pc_i][:3]}.png"),
+                # f"plots/{run_dir_name}/images-depths_gt{i}_idx{idx_i[:3]}.{plot_ext}",
+                # 0.1,
+                10,
+                camera=camera[pc_i],
+                image_rgb=image_rgb[pc_i:pc_i+1].detach().cpu(),
+                # depth_image=mask[:1].detach().cpu( ) if mask is not None else None,
+                depth_image=(
+                    depths[pc_i:pc_i+1].detach().cpu()
+                    if depths is not None
+                    else None
+                ),
+                data_mean=dataloader.dataset.dataset.data_mean,
+                data_std=dataloader.dataset.dataset.data_std,
+            )
+            # print("samples_updated", samples_updated.shape)
+            # print("gt_cond_pc", gt_cond_pc.shape)
+            # samples_updated torch.Size([1, 128, 3])
+            # gt_cond_pc torch.Size([2, 128, 3])
+            samples = {}
+            for ddpm_steps in [50, 100, 250,   500, 1000]:
+                # for ddpm_steps in [250,   500, 1000]:
+                # for ddpm_steps in [1, 5, 10, 50, 100, scheduler.config.num_train_timesteps]:
+                # for ddpm_steps in set([5,  100]):
+                # output_prev, xs, x0t, steps
+                samples[f"step_{ddpm_steps}"] = sample(
+                    model,
+                    scheduler,
+                    cfg,
+                    camera=camera[pc_i],
+                    image_rgb=image_rgb[pc_i:pc_i+1],
+                    depths=depths[pc_i:pc_i+1] if depths is not None else None,
+                    mask=mask[pc_i:pc_i+1] if mask is not None else None,
+                    num_inference_steps=ddpm_steps,
+                    device=device,
+                    pcpm=pcpm,
+                    data_mean=dataloader.dataset.dataset.data_mean,
+                    data_std=dataloader.dataset.dataset.data_std
+                )
+
+            plt.figure(figsize=(10, 10))
+
+            for key, value in samples.items():
+                # output_prev, xs, x0t, steps
+                samples_updated = samples[key][0]
+
+                cd_loss, _ = calculate_chamfer_distance(
+                    cfg.dataset.is_scaled, dataloader.dataset.dataset.data_mean, dataloader.dataset.dataset.data_std,
+                    gt_cond_pc,
+                    samples_updated,
+                    device,
+                )
+
+                print(f"batch {batch_i} frame idx {idx[pc_i][:3]} DDPM steps {key} cd_loss",
+                      key,
+                      "\t",
+                      f"CD: {cd_loss:.2f}",
+                      )
+
+                error = []
+                assert len(samples[key][1]
+                           ) > 1, "need more than 1 sample to plot"
+                # output_prev, xs, x0t, steps
+                # print(samples[key][1], samples[key][3])
+                # print("len samples[key][1]", len(samples[key][1]))
+                # print("len samples[key][3]", len(samples[key][3]))
+                # exit()
+
+                print(key, "steps", samples[key][3])
+                for x_i, (x, step) in enumerate(zip(samples[key][1], samples[key][3])):
+
+                    cd_loss, _ = calculate_chamfer_distance(
+                        cfg.dataset.is_scaled, dataloader.dataset.dataset.data_mean, dataloader.dataset.dataset.data_std,
+                        gt_cond_pc,
+                        x.unsqueeze(0),
+                        device,
+                    )
+                    beta_end = fname.split(".")[0].split("_")[-1]
+                    train_val = fname.split(".")[0].split("_")[-2]
+                    data.append({"cd_loss": cd_loss.item(), "step": step.item(),
+                                 "batch": batch_i, "frame_idx": idx[pc_i][:3], "total_inference_step": key, "sample_i": pc_i, "recorded_inference_i": x_i, "total_recorded_inference_step": len(samples[key][1]), "original_fname": fname, "beta_end": beta_end, "train_val": train_val})
+                    # save to csv
+                    # print("cd_loss", cd_loss.item())
+                    df = pd.DataFrame(data)
+                    df.to_csv(fname.replace(
+                        ".png", f".csv"), index=False)
+
+                    error.append(cd_loss.item())
+
+                    # here
+                    samples_updated = samples[key][0]
+                    xts = samples[key][1]
+                    x0s = samples[key][2]
+                    steps = samples[key][3]
+                    epoch = cfg.run.max_steps
+
+                    plot_sample_condition(
+                        gt_cond_pc.cpu(),
+                        xts.cpu(),
+                        x0s.cpu(),
+                        steps,
+                        cfg,
+                        epoch,
+                        # fname=f"plots/{run_dir_name}/sample_ep_{epoch:05d}_gt{i}_train-idx-{idx_i}.{plot_ext}",
+                        fname=fname.replace(
+                            ".png", f"_sampled_points_{batch_i}_{idx[pc_i][:3]}_step_{step}_of_{key}.png"),
+                        # None,
+                        point_size=0.1,
+                        cam_wires_trans=get_camera_wires_trans(camera[pc_i])
+                        .detach()
+                        .cpu(),
+                        image_rgb=image_rgb[pc_i:pc_i+1].detach().cpu(),
+                        # mask=mask[:1].detach().cpu() if mask is not None else None,
+                        depths=depths,
+                        cd=cd_loss.item(),
+                        data_mean=dataloader.dataset.dataset.data_mean,
+                        data_std=dataloader.dataset.dataset.data_std,
+                        plot_ext="png",
+                    )
+                    # until here
+                # ax = plt.plot(error, label=key)
+                plt.plot(
+                    [i / (len(error) - 1) for i in range(len(error))],
+                    error,
+                    label=key,
+                    marker=None,
+                )
+                # print()
+            plt.legend()
+            plt.title(
+                f"Diffusion model: {cfg.run.max_steps } epochs, batch {batch_i}, frame idx {idx[pc_i][:3]}, {cfg.run.num_inference_steps } timesteps, {cfg.model.beta_schedule } schedule",
+            )
+            plt.xlabel("Evolution steps ratio")
+            plt.ylabel("Chamfer distance")
+            # ylog
+            plt.yscale("log")
+
+            plt.savefig(fname.replace(
+                ".png", f"_{batch_i}_{idx[pc_i][:3]}.png"))
+            plt.close()
+
+            print("done evo plots", f"_{batch_i}_{idx[pc_i][:3]}")
+
+
+def calc_stat2(point_astyx, point_man, fname):
+    # plot histogram on 3 rows,x,y,z
+
+    data_mean_astyx = point_astyx.mean(axis=(0, 1))
+    data_std_astyx = point_astyx.std(axis=(0, 1))
+    data_mean_man = point_man.mean(axis=(0, 1))
+    data_std_man = point_man.std(axis=(0, 1))
+
+    fig, axs = plt.subplots(3, 1, figsize=(16, 9))
+    for i, name in enumerate(["x", "y", "z"]):
+        axs[i].hist(point_astyx[:, :, i].flatten(), bins=100,
+                    alpha=0.5, label=f'{name}_astyx')
+        axs[i].hist(point_man[:, :, i].flatten(), bins=100,
+                    alpha=0.5, label=f"{name}_man")
+        axs[i].axvline(data_mean_astyx[i], color='r', linestyle='dashed',
+                       linewidth=1, label=f"mean_astyx {name}: {data_mean_astyx[i]:.2f}")
+        axs[i].axvline(data_std_astyx[i], color='g', linestyle='dashed',
+                       linewidth=1, label=f"std_astyx {name}: {data_std_astyx[i]:.2f}")
+
+        axs[i].axvline(data_mean_man[i], color='b', linestyle='dashed',
+                       linewidth=1, label=f"mean_man {name}: {data_mean_man[i]:.2f}")
+        axs[i].axvline(data_std_man[i], color='y', linestyle='dashed',
+                       linewidth=1, label=f"std_man {name}: {data_std_man[i]:.2f}")
+        axs[i].legend()
+        # axs[i].set_title(f"Histogram of points {name}")
+        # axs[i].set_xlabel("Value")
+        axs[i].set_ylabel("Frequency")
+    plt.savefig(fname)
+    plt.title("Histogram of points")
+    plt.tight_layout()
+    plt.close()
+
+
+def calc_stat(points, fname):
+    data_mean = points.mean(axis=(0, 1))
+    data_std = points.std(axis=(0, 1))
+
+    print("data_mean", data_mean)
+    print("data_std", data_std)
+
+    # plot histogram
+    plt.figure(figsize=(10, 10))
+    plt.hist(points[:, :, 0].flatten(), bins=100, alpha=0.5, label='x')
+    plt.hist(points[:, :, 1].flatten(), bins=100, alpha=0.5, label='y')
+    plt.hist(points[:, :, 2].flatten(), bins=100, alpha=0.5, label='z')
+    plt.legend()
+    plt.title("Histogram of points"+fname)
+    plt.xlabel("Value")
+    plt.ylabel("Frequency")
+    plt.savefig(fname)
+    plt.close()
+
+
+def cd_floor_one(points, ds, device):
+    min_cd = 1000000
+    for i in range(points.shape[0]):
+        for j in range(i+1, points.shape[0]):
+            if i == j:
+                continue
+
+            cd_loss, _ = calculate_chamfer_distance(
+                True,
+                ds.data_mean.float(),
+                ds.data_std.float(),
+                points[i:i+1].float(),
+                points[j:j+1].float(),
+                device,
+            )
+            print("cd_loss", cd_loss, "i,j", i, j)
+            if cd_loss < min_cd:
+                min_cd = cd_loss.item()
+                min_i = i
+                min_j = j
+    return min_cd, min_i, min_j
+
+
+def cd_ave_one(points, ds, device):
+    cds = []
+    for i in range(points.shape[0]):
+        for j in range(i+1, points.shape[0]):
+
+            cd_loss, _ = calculate_chamfer_distance(
+                True,
+                ds.data_mean.float(),
+                ds.data_std.float(),
+                points[i:i+1].float(),
+                points[j:j+1].float(),
+                device,
+            )
+            cds.append(cd_loss.item())
+        ave_cd = np.mean(cds)
+    return ave_cd
+
+
+def cd_floor(point_astyx, point_man, ds_astyx, ds_man, device):
+    astyx_stat = cd_floor_one(point_astyx, ds_astyx, device)
+    man_stat = cd_floor_one(point_man, ds_man, device)
+    print("astyx_stat,min_cd, min_i, min_j", astyx_stat)
+    print("man_stat,min_cd, min_i, min_j", man_stat)
+
+    ave_cd_astyx = cd_ave_one(point_astyx, ds_astyx, device)
+    ave_cd_man = cd_ave_one(point_man, ds_man, device)
+    print("ave_cd_astyx", ave_cd_astyx)
+    print("ave_cd_man", ave_cd_man)
+
+
 @hydra.main(config_path="config", config_name="config", version_base="1.1")
 def main(cfg: ProjectConfig):
     # print(cfg)
@@ -2929,58 +3523,10 @@ def main(cfg: ProjectConfig):
     CHECKPOINT_DB_FILE = "checkpoint_db_track_loss.json"
 
     set_seed(cfg.run.seed)
-    tb_log_dir = "tb_log"
     run_dir_name = f"{cfg.run.name}"
-    log_dir = tb_log_dir + os.sep+run_dir_name
-    rev = 0
-    while os.path.exists(log_dir):
-        print("exists", run_dir_name)
-        rev += 1
-        run_dir_name = f"{cfg.run.name}_rev{rev:02d}"
-        log_dir = tb_log_dir + os.sep+run_dir_name
-        if rev > 100:
-            # too many revisions, exit
-            raise ValueError(
-                f"too many revisions (>100), exiting, current log_dir {log_dir}"
-            )
-
-    writer = SummaryWriter(log_dir=log_dir)
-    print("tensorboard log at", log_dir)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print("device", device)
-
-    dataloader_train, dataloader_val, dataloader_test = get_dataset(
-        cfg, device=device)
-
-    train_frame_tokens = ",".join([a[4] for a in dataloader_train.dataset])
-    val_frame_tokens = ",".join([a[4] for a in dataloader_val.dataset])
-    test_frame_tokens = ",".join([a[4] for a in dataloader_test.dataset])
-
-    writer.add_text("train/ids", train_frame_tokens)
-    writer.add_text("val/ids", val_frame_tokens)
-    writer.add_text("test/ids", test_frame_tokens)
-
-    # get previous checkpoint
-    start_epoch = 0
-    current_cp_fname = None
-    current_cp = None
-    prev_train_cds, prev_train_losses = {"epochs": [], "data": {}}, {"ave": []}
-    prev_val_cds, prev_val_losses = {"epochs": [], "data": {}}, {"ave": []}
-
-    if cfg.checkpoint.resume_training:
-        if os.path.exists(f"{CHECKPOINT_DIR}/{CHECKPOINT_DB_FILE}"):
-            current_cp_fname = get_checkpoint_fname_json(
-                cfg, CHECKPOINT_DB_FILE, CHECKPOINT_DIR
-            )
-
-            if current_cp_fname is not None:
-                current_cp = torch.load(current_cp_fname)
-                print("loading checkpoint", current_cp_fname)
-            else:
-                print("no checkpoint found")
-    else:
-        print("CFG dictates not resuming training from checkpoint")
 
     pcpm = PointCloudProjectionModel(
         image_size=cfg.model.image_size,
@@ -2996,228 +3542,40 @@ def main(cfg: ProjectConfig):
         colors_mean=cfg.model.colors_mean,
         colors_std=cfg.model.colors_std,
         scale_factor=cfg.model.scale_factor,
-        finetune_vits=cfg.model.finetune_vits,
-        vits_checkpoint=current_cp["vits_model"] if (
-            current_cp is not None and "vits_model" in current_cp) else None,
-
     ).to(device)
-    model = get_model(cfg, device=device, pcpm=pcpm)
 
-    if cfg.optimizer.name == "Adam":
-        optimizer = torch.optim.Adam(
-            model.parameters(),
-            lr=cfg.optimizer.lr,
-            weight_decay=cfg.optimizer.weight_decay,
-            betas=cfg.optimizer.kwargs.betas,
-        )
-    elif cfg.optimizer.name == "AdamW":
-        optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=cfg.optimizer.lr,
-            weight_decay=cfg.optimizer.weight_decay,
-            betas=cfg.optimizer.kwargs.betas,
-        )
-    else:
-        raise ValueError(
-            f"optimizer {cfg.optimizer.name} not supported, pick Adam or AdamW"
-        )
-    # linear, scaled_linear, or squaredcos_cap_v2.
-    assert cfg.run.diffusion_scheduler == "ddpm", "only ddpm supported"
-    scheduler = DDPMScheduler(
-        num_train_timesteps=cfg.run.num_inference_steps,
-        beta_schedule=cfg.model.beta_schedule,
-        prediction_type="epsilon",  # or "sample" or "v_prediction"
-        clip_sample=False,  # important for point clouds
-        beta_start=cfg.model.beta_start,
-        beta_end=cfg.model.beta_end,
-    )
+    cfg.dataset.type = "astyx"
+    cfg.dataloader.num_scenes = 4
+    dataloader_train_astyx, _, _ = get_dataset(
+        cfg, device=device)
 
-    # load the checkpoint to models
-
-    if current_cp is not None:
-        model.load_state_dict(current_cp["model"])
-        optimizer.load_state_dict(current_cp["optimizer"])
-        start_epoch = current_cp["args"].run.max_steps
-        print("start_epoch", start_epoch)
-
-        prev_train_cds = current_cp["train_cds"]
-        prev_train_losses = current_cp["train_losses"]
-        prev_val_cds = current_cp["val_cds"]
-        prev_val_losses = current_cp["val_losses"]
-        # print("prev_train_losses key, {prev_train_losses.keys()} ", prev_train_losses.keys() )
-        # print("prev_train_cds key, {prev_train_cds.keys()} ", prev_train_cds.keys())
-        # print("prev_val_losses key, {prev_val_losses.keys()} ", prev_val_losses.keys())
-        # print("prev_val_cds key, {prev_val_cds.keys()} ", prev_val_cds.keys())
-
-        # prev_train_losses key, {prev_train_losses.keys()}  dict_keys(['ave'])
-        # prev_train_cds key, {prev_train_cds.keys()}  dict_keys(['epochs', 'data'])
-        # prev_val_losses key, {prev_val_losses.keys()}  dict_keys(['ave'])
-        # prev_val_cds key, {prev_val_cds.keys()}  dict_keys(['epochs', 'data'])
-
-        assert (
-            len(prev_train_losses["ave"]) == start_epoch and len(
-                prev_val_losses["ave"]) == start_epoch
-        ), f'checkpoint train losses and cds not same length as start epoch, prev_train_losses {len(prev_train_losses["ave"]) } start_epoch {start_epoch } prev_val_losses { len(prev_val_losses["ave"]) }'
-
-    log_utils(log_type="static", model=model, writer=writer, epoch=None)
-
-    # assert cfg.loss.loss_type == "mse", "only mse supported"
-    criterion = get_loss(cfg)
-    # Train the model
-    # print("type",type(dataloader_train))
-    # print("type2",type(dataloader_train.dataset))
-    # print("type3",type(dataloader_train.dataset.dataset))
-    # print("datastat mean",dataloader_train.dataset.dataset.data_mean)
-    # print("datastat std",dataloader_train.dataset.dataset.data_std)
-    # type <class 'torch.utils.data.dataloader.DataLoader'>
-    # type2 <class 'torch.utils.data.dataset.Subset'>
-    # type3 <class '__main__.MANDataset'>
-    # datastat mean tensor([ 4.4707,  0.3817, -0.0988])
-    # datastat std tensor([2.4141, 3.7607, 1.2928])
-
-    train_loss_emas, train_cd_emas, val_loss_emas, val_cd_emas = train(
-        model,
-        # dataloader,
-        dataloader_train,
-        dataloader_val,
-        optimizer,
-        scheduler,
-        cfg,
-        device=device,
-        start_epoch=start_epoch,
-        criterion=criterion,
-        writer=writer,
-        pcpm=pcpm,
-        loss_ema_factors=[],  # [0.9, 0.95, 0.975, 0.99],
-        cd_ema_factors=[],
-        CHECKPOINT_DB_FILE=CHECKPOINT_DB_FILE,
-        prev_train_cds=prev_train_cds,
-        prev_train_losses=prev_train_losses,
-        prev_val_cds=prev_val_cds,
-        prev_val_losses=prev_val_losses,
-        run_dir_name=run_dir_name,
-    )
-
-    metric_dict = {
-        **{f"MDict_Train_Loss_ave/ema_{k:.2e}": train_loss_emas["ave"][k] for k in train_loss_emas["ave"]},
-        **{f"MDict_Train_CD_ave/ema_{k:.2e}": train_cd_emas["ave"][k] for k in train_cd_emas["ave"]},
-        **{f"MDict_Val_Loss_ave/ema_{k:.2e}": val_loss_emas["ave"][k] for k in val_loss_emas["ave"]},
-        **{f"MDict_Val_CD_ave/ema_{k:.2e}": val_cd_emas["ave"][k] for k in val_cd_emas["ave"]},
-    }
-
-    if False:  # Evo plots
-
-        # Sample from the model
-
-        batch = next(iter(dataloader_train))
-
-        pc, camera, image_rgb, mask, depths, idx = extract_batch(
+    for batch in dataloader_train_astyx:
+        pc, camera, image_rgb, mask, depths, idx, npoints,            npoints_filtered = extract_batch(
             cfg, batch, device)
+        points_astyx = pcpm.point_cloud_to_tensor(
+            pc, normalize=True, scale=True)
+        # points shape torch.Size([4, 128, 3])
 
-        samples = {}
-        for i in [1, 5, 10, 50, 100, scheduler.config.num_train_timesteps]:
+    cfg.dataset.type = "man-mini"
+    cfg.dataloader.num_scenes = 8
+    dataloader_train_man_mini, _, _ = get_dataset(
+        cfg, device=device)
+    for batch in dataloader_train_man_mini:
+        pc, camera, image_rgb, mask, depths, idx, npoints,            npoints_filtered = extract_batch(
+            cfg, batch, device)
+        points_man = pcpm.point_cloud_to_tensor(pc, normalize=True, scale=True)
+        # points shape torch.Size([4, 128, 3])
+        print("points shape", points_man.shape)
+        calc_stat(points_man, "plots/points_hist_MAN.png")
+        print("dataset mean_factor",
+              dataloader_train_man_mini.dataset.dataset.data_mean)
+        print("dataset std_factor",
+              dataloader_train_man_mini.dataset.dataset.data_std)
 
-            samples[f"step{i}"] = sample(
-                model,
-                scheduler,
-                cfg,
-                camera=camera[0],
-                image_rgb=image_rgb[:1],
-                depths=depths[:1] if depths is not None else None,
-                mask=mask[:1] if mask is not None else None,
-                num_inference_steps=i,
-                device=device,
-                pcpm=pcpm,
-                data_mean=dataloader_train.dataset.dataset.data_mean,
-                data_std=dataloader_train.dataset.dataset.data_std
-            )
-        # make the plot that will be logged to tb
-        gt_cond_pc = pcpm.point_cloud_to_tensor(
-            pc[:1], normalize=True, scale=True)
-        # print("samples_updated", samples_updated.shape)
-        # print("gt_cond_pc", gt_cond_pc.shape)
-        # samples_updated torch.Size([1, 128, 3])
-        # gt_cond_pc torch.Size([2, 128, 3])
+    calc_stat2(points_astyx, points_man, "plots/points_hist.png")
 
-        plt.figure(figsize=(10, 10))
-
-        for key, value in samples.items():
-            samples_updated = samples[key][0]
-
-            cd_loss, _ = calculate_chamfer_distance(
-                cfg.dataset.is_scaled, dataloader_train.dataset.dataset.data_mean, dataloader_train.dataset.dataset.data_std,
-                gt_cond_pc,
-                samples_updated,
-                device,
-            )
-
-            print(
-                key,
-                "\t",
-                f"CD: {cd_loss:.2f}",
-            )
-
-            error = []
-            assert len(samples[key][1]) > 1, "need more than 1 sample to plot"
-            for x in samples[key][1]:
-
-                cd_loss, _ = calculate_chamfer_distance(
-                    cfg.dataset.is_scaled, dataloader_train.dataset.dataset.data_mean, dataloader_train.dataset.dataset.data_std,
-                    gt_cond_pc,
-                    x.unsqueeze(0),
-                    device,
-                )
-
-                error.append(cd_loss.item())
-            # ax = plt.plot(error, label=key)
-            plt.plot(
-                [i / (len(error) - 1) for i in range(len(error))],
-                error,
-                label=key,
-                marker=None,
-            )
-            # print()
-        plt.legend()
-        plt.title(
-            f"Diffusion model: {cfg.run.max_steps } epochs, {cfg.run.num_inference_steps } timesteps, {cfg.model.beta_schedule } schedule",
-        )
-        plt.xlabel("Evolution steps ratio")
-        plt.ylabel("Chamfer distance")
-        # ylog
-        plt.yscale("log")
-
-        writer.add_figure(f"Evolution", plt.gcf(), cfg.run.max_steps)
-        plt.close()
-
-        print("done evo plots")
-
-    hparam_dict = {
-        "seed": cfg.run.seed,  #
-        "epochs": cfg.run.max_steps,
-        "num_inference_steps": cfg.run.num_inference_steps,  #
-        "image_size": cfg.dataset.image_size,  #
-        "dataset_data_stat": cfg.dataset.data_stat,
-        "dataset_subset": cfg.dataset.subset_name,
-        "dataset_cat": cfg.dataset.category,
-        "dataset_source": cfg.dataset.type,
-        "max_points": cfg.dataset.max_points,  #
-        "batch_size": cfg.dataloader.batch_size,
-        "num_scenes": cfg.dataloader.num_scenes,
-        "shuffle": cfg.dataloader.shuffle,
-        "beta_schedule": cfg.model.beta_schedule,  #
-        "condition_source": cfg.model.condition_source,  #
-        "point_cloud_model_embed_dim": cfg.model.point_cloud_model_embed_dim,
-        "point_cloud_model": cfg.model.point_cloud_model,  #
-        "loss_type": cfg.loss.loss_type,  #
-        "lr": cfg.optimizer.lr,  #
-        "optimizer": cfg.optimizer.name,  #
-        "optimizer_decay": cfg.optimizer.weight_decay,
-        "optimizer_beta_0": cfg.optimizer.kwargs.betas[0],
-        "optimizer_beta_1": cfg.optimizer.kwargs.betas[1],
-    }
-
-    writer.add_hparams(hparam_dict, metric_dict)
-    writer.close()
+    cd_floor(points_astyx, points_man, dataloader_train_astyx.dataset,
+             dataloader_train_man_mini.dataset.dataset, device)
 
 
 if __name__ == "__main__":
