@@ -8,6 +8,7 @@
     alert("WebGL not supported.");
     return;
   }
+  data_server = "http://10.204.100.101:5000/";
 
   // Adjust layout for narrow controls on the right
   const mainContainer = document.createElement('div');
@@ -62,7 +63,7 @@
   dpmSlider.classList.add('form-range', 'mb-3');
   epochValue.classList.add('badge', 'bg-primary', 'ms-2');
   dpmValue.classList.add('badge', 'bg-primary', 'ms-2');
-  
+
   cdValue.classList.add('badge', 'bg-primary', 'ms-2');
   dpmCdValue.classList.add('badge', 'bg-primary', 'ms-2');
   frameIdInput.classList.add('form-control', 'mb-3');
@@ -70,7 +71,7 @@
   // // Add Bootstrap grid layout
 
   function constructFileName(epoch, set, frameId) {
-    
+
     // Zero-pad epoch to 6 digits
     const paddedEpoch = epoch.toString().padStart(6, '0');
     return `sample_ep_${paddedEpoch}_gt0_${set}-idx-${frameId}.json`;
@@ -101,10 +102,10 @@
 
   dpmSlider.addEventListener('input', () => {
     dpmValue.textContent = dpmSlider.value;
-    
+
     // Find the nearest value in sortedDPMStep
     // console.log("currentData.steps", currentData.steps);
-    var sortedDPMStep =  currentData.steps.slice().sort((a, b) => a - b);
+    var sortedDPMStep = currentData.steps.slice().sort((a, b) => a - b);
     // console.log("currentData.steps", currentData.steps);
     const sliderValue = parseInt(dpmSlider.value, 10);
     const nearestDPM = sortedDPMStep.reduce((prev, curr) =>
@@ -124,7 +125,7 @@
   // Cache for loaded JSON data from files
   const jsonCache = {};
   let currentData = null;
-  function updateUI(){
+  function updateUI() {
     const dpmTicks = document.getElementById("dpmTicks");
     dpmTicks.innerHTML = "";
     var sortedDPMStep = currentData.steps.slice().sort((a, b) => a - b);
@@ -145,7 +146,7 @@
   }
   function loadJSON(filename) {
     // Adjust base path as needed.
-    const url = "http://127.0.0.1:5000/" + filename;
+    const url = data_server + filename;
     if (jsonCache[filename]) {
       currentData = jsonCache[filename];
       updateUI()
@@ -165,12 +166,12 @@
     // dmpInverseIndex = makeInverseIndex(currentData.steps);
     // console.log("dmpInverseIndex", dmpInverseIndex);
     //setup dpmTicks
-    
+
   }
 
   // --- EXPERIMENT and FILE DROPDOWNS ---
   // Populate experiment select by fetching the directory listing from http://127.0.0.1:5000/
-  fetch("http://127.0.0.1:5000/")
+  fetch(data_server, { mode: 'no-cors' })
     .then(response => response.text())
     .then(htmlText => {
       const parser = new DOMParser();
@@ -193,7 +194,7 @@
     // Clear the fileSelect dropdown and reset UI collections.
     fileName.innerHTML = "";
     const selectedExp = expSelect.value;
-    const url = `http://127.0.0.1:5000/${selectedExp}`;
+    const url = data_server + `${selectedExp}`;
     fetch(url)
       .then(response => response.text())
       .then(htmlText => {
@@ -332,21 +333,21 @@
 
   // --- WebGL Setup for Rendering Points (existing shader and render code) ---
   const vertexShaderSource = `
-      attribute vec3 aPosition;
-      uniform mat4 uModelViewMatrix;
-      uniform mat4 uProjectionMatrix;
-      void main(void) {
-        gl_PointSize = 5.0;
-        gl_Position = uProjectionMatrix * uModelViewMatrix * vec4(aPosition, 1.0);
-      }
-    `;
-  const fragmentShaderSource = `
-      precision mediump float;
-      uniform vec4 uColor;
-      void main(void) {
-        gl_FragColor = uColor;
-      }
-    `;
+  attribute vec3 aPosition;
+  uniform mat4 uModelViewMatrix;
+  uniform mat4 uProjectionMatrix;
+  void main(void) {
+    gl_PointSize = 5.0;
+    gl_Position = uProjectionMatrix * uModelViewMatrix * vec4(aPosition, 1.0);
+  }
+`;
+const fragmentShaderSource = `
+  precision mediump float;
+  uniform vec4 uColor;
+  void main(void) {
+    gl_FragColor = uColor;
+  }
+`;
 
   function createShader(gl, type, source) {
     const shader = gl.createShader(type);
@@ -502,82 +503,152 @@
       return out;
     }
   };
-
+  
   function renderAxes() {
+    if (fontTextureLoaded) {
+      renderAxisLabels();
+    }
     const axisVertices = [
       // X-axis (red)
-      -10, 0, 0, 10, 0, 0,
+      0, 0, 0, 10, 0, 0,
       // Y-axis (green)
-      0, -10, 0, 0, 10, 0,
+      0, 0, 0, 0, 10, 0,
       // Z-axis (blue)
-      0, 0, -10, 0, 0, 10
+      0, 0, 0, 0, 0, 10
     ];
-
+  
     const axisColors = [
       [1.0, 0.0, 0.0, 1.0], // Red for X-axis
       [0.0, 1.0, 0.0, 1.0], // Green for Y-axis
       [0.0, 0.0, 1.0, 1.0]  // Blue for Z-axis
     ];
-
+  
+    // Create and bind the buffer for axis vertices
     const axisBuffer = gl.createBuffer();
     gl.bindBuffer(gl.ARRAY_BUFFER, axisBuffer);
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(axisVertices), gl.STATIC_DRAW);
-
+  
+    // Draw each axis separately
     for (let i = 0; i < 3; i++) {
       gl.vertexAttribPointer(programInfo.attribLocations.aPosition, 3, gl.FLOAT, false, 0, i * 2 * 3 * Float32Array.BYTES_PER_ELEMENT);
       gl.enableVertexAttribArray(programInfo.attribLocations.aPosition);
       gl.uniform4fv(programInfo.uniformLocations.uColor, axisColors[i]);
-      gl.drawArrays(gl.LINES, i * 2, 2);
+      gl.drawArrays(gl.LINES, 0, 2); // Draw 2 vertices per axis
     }
-
-    // Add axis labels
-    const labels = [
-      { text: "X", position: [10.5, 0, 0], color: [1.0, 0.0, 0.0, 1.0] },
-      { text: "Y", position: [0, 10.5, 0], color: [0.0, 1.0, 0.0, 1.0] },
-      { text: "Z", position: [0, 0, 10.5], color: [0.0, 0.0, 1.0, 1.0] }
-    ];
-
-    labels.forEach(label => {
-      renderText(label.text, label.position, label.color);
-    });
   }
+  var fontInfo = { //singularity_logs/plots/mlp_blob/vizr/8x8-font.png
+    letterHeight: 8,
+    spaceWidth: 8,
+    spacing: -1,
+    textureWidth: 64,
+    textureHeight: 40,
+    glyphInfos: {
+      'a': { x:  0, y:  0, width: 8, },
+      'b': { x:  8, y:  0, width: 8, },
+      'c': { x: 16, y:  0, width: 8, },
+      'd': { x: 24, y:  0, width: 8, },
+      'e': { x: 32, y:  0, width: 8, },
+      'f': { x: 40, y:  0, width: 8, },
+      'g': { x: 48, y:  0, width: 8, },
+      'h': { x: 56, y:  0, width: 8, },
+      'i': { x:  0, y:  8, width: 8, },
+      'j': { x:  8, y:  8, width: 8, },
+      'k': { x: 16, y:  8, width: 8, },
+      'l': { x: 24, y:  8, width: 8, },
+      'm': { x: 32, y:  8, width: 8, },
+      'n': { x: 40, y:  8, width: 8, },
+      'o': { x: 48, y:  8, width: 8, },
+      'p': { x: 56, y:  8, width: 8, },
+      'q': { x:  0, y: 16, width: 8, },
+      'r': { x:  8, y: 16, width: 8, },
+      's': { x: 16, y: 16, width: 8, },
+      't': { x: 24, y: 16, width: 8, },
+      'u': { x: 32, y: 16, width: 8, },
+      'v': { x: 40, y: 16, width: 8, },
+      'w': { x: 48, y: 16, width: 8, },
+      'x': { x: 56, y: 16, width: 8, },
+      'y': { x:  0, y: 24, width: 8, },
+      'z': { x:  8, y: 24, width: 8, },
+      '0': { x: 16, y: 24, width: 8, },
+      '1': { x: 24, y: 24, width: 8, },
+      '2': { x: 32, y: 24, width: 8, },
+      '3': { x: 40, y: 24, width: 8, },
+      '4': { x: 48, y: 24, width: 8, },
+      '5': { x: 56, y: 24, width: 8, },
+      '6': { x:  0, y: 32, width: 8, },
+      '7': { x:  8, y: 32, width: 8, },
+      '8': { x: 16, y: 32, width: 8, },
+      '9': { x: 24, y: 32, width: 8, },
+      '-': { x: 32, y: 32, width: 8, },
+      '*': { x: 40, y: 32, width: 8, },
+      '!': { x: 48, y: 32, width: 8, },
+      '?': { x: 56, y: 32, width: 8, },
+    },
+  };
+  function makeVerticesForString(fontInfo, s) {
+    const len = s.length;
+    const numVertices = len * 6;
+    const positions = new Float32Array(numVertices * 2);
+    const texcoords = new Float32Array(numVertices * 2);
+    let offset = 0;
+    let x = 0;
+    const maxX = fontInfo.textureWidth;
+    const maxY = fontInfo.textureHeight;
+  
+    for (let i = 0; i < len; ++i) {
+      const letter = s[i];
+      const glyphInfo = fontInfo.glyphInfos[letter];
+      if (glyphInfo) {
+        // console.log("glyphInfo", glyphInfo);
+        const x2 = x + glyphInfo.width;
+        const u1 = glyphInfo.x / maxX;
+        const v1 = (glyphInfo.y + fontInfo.letterHeight) / maxY;
+        const u2 = (glyphInfo.x + glyphInfo.width) / maxX;
+        const v2 = glyphInfo.y / maxY;
+  
+        // 6 vertices per letter
+        positions.set([x, 0, x2, 0, x, fontInfo.letterHeight, x, fontInfo.letterHeight, x2, 0, x2, fontInfo.letterHeight], offset);
+        texcoords.set([u1, v1, u2, v1, u1, v2, u1, v2, u2, v1, u2, v2], offset);
+  
+        x += glyphInfo.width + fontInfo.spacing;
+        offset += 12;
+      } else {
+        // console.warn(`Glyph for character "${letter}" not found.`);
+        x += fontInfo.spaceWidth;
+      }
+    }
+  
+    return {
+      arrays: {
+        position: new Float32Array(positions.buffer, 0, offset),
+        texcoord: new Float32Array(texcoords.buffer, 0, offset),
+      },
+      numVertices: offset / 2,
+    };
+  }
+  let fontTextureLoaded = false; // Flag to track if the texture is loaded
 
-  function renderText(text, position, color) {
-    // Create a 2D canvas for text rendering
-    const textCanvas = document.createElement("canvas");
-    const ctx = textCanvas.getContext("2d");
-    textCanvas.width = 256;
-    textCanvas.height = 256;
-    ctx.clearRect(0, 0, textCanvas.width, textCanvas.height);
-    ctx.fillStyle = `rgba(${color[0] * 255}, ${color[1] * 255}, ${color[2] * 255}, ${color[3]})`;
-    ctx.font = "20px Arial";
-    ctx.textAlign = "center";
-    ctx.textBaseline = "middle";
-    ctx.fillText(text, textCanvas.width / 2, textCanvas.height / 2);
+  const fontTexture = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, fontTexture);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([0, 0, 255, 255])); // Placeholder
 
-    // Create a texture from the canvas
-    const texture = gl.createTexture();
-    gl.bindTexture(gl.TEXTURE_2D, texture);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, textCanvas);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  const fontImage = new Image();
+  fontImage.src = '8x8-font.png'; // Replace with the actual path to your font texture
+  fontImage.onload = () => {
+    console.log("8x8-font.png Font image loaded");
+    gl.bindTexture(gl.TEXTURE_2D, fontTexture);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, fontImage);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
 
-    // Render the texture as a billboard at the specified position
-    const textBuffer = gl.createBuffer();
-    gl.bindBuffer(gl.ARRAY_BUFFER, textBuffer);
-    const size = 0.5;
-    const vertices = [
-      position[0] - size, position[1] - size, position[2],
-      position[0] + size, position[1] - size, position[2],
-      position[0] - size, position[1] + size, position[2],
-      position[0] + size, position[1] + size, position[2]
-    ];
-    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(vertices), gl.STATIC_DRAW);
-    gl.vertexAttribPointer(programInfo.attribLocations.aPosition, 3, gl.FLOAT, false, 0, 0);
-    gl.enableVertexAttribArray(programInfo.attribLocations.aPosition);
-
-    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    fontTextureLoaded = true; // Set the flag to true
+  };
+  function renderTextWithGlyphs(text, position) {
+  }
+  function renderAxisLabels() {
+    renderTextWithGlyphs('x', [10, 0, 0]); // X-axis
   }
   function reshapeTo3D(array) {
     const reshaped = [];
@@ -586,10 +657,10 @@
     }
     return reshaped;
   }
-  
+
   function calculateCD(xs, gt) {
     // reshape xs and gt to 3D arrays. from 1D aray of length 3N to N x 3
-    
+
     // Calculate the Chamfer Distance between two sets of points
     let totalDistance = 0;
     for (let i = 0; i < xs.length; i++) {
@@ -610,7 +681,8 @@
 
     const aspect = canvas.width / canvas.height;
     const projectionMatrix = mat4.create();
-    mat4.perspective(projectionMatrix, 60 * Math.PI / 180, aspect, 0.1, 500.0); // Adjust far clipping plane to 500
+    mat4.perspective(projectionMatrix, 60 * Math.PI / 180, aspect, 0.1, 500.0);
+
     const modelViewMatrix = mat4.create();
     mat4.identity(modelViewMatrix);
 
@@ -629,6 +701,12 @@
 
     // If JSON data is loaded, extract and draw points from GT and xs arrays.
     if (currentData) {
+      // Disable aTexCoord for points
+      // const texcoordLocation = gl.getAttribLocation(shaderProgram, "aTexCoord");
+      // if (texcoordLocation !== -1) {
+      //   gl.disableVertexAttribArray(texcoordLocation);
+      // }
+
       // Draw GT points in red
       const gtPoints = currentData.gt[0]; // assume first set
       //if unnormRadio is True --> unnorm the poitn frist
@@ -657,17 +735,16 @@
       cdValue.textContent = currentData.cd.toFixed(2).padStart(6, ' ');
       gl.bindBuffer(gl.ARRAY_BUFFER, pointBuffer);
       gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(gtArray), gl.STATIC_DRAW);
-      gl.enableVertexAttribArray(programInfo.attribLocations.aPosition);
       gl.vertexAttribPointer(programInfo.attribLocations.aPosition, 3, gl.FLOAT, false, 0, 0);
-      gl.uniform4fv(programInfo.uniformLocations.uColor, [1.0, 0.0, 0.0, 1.0]);
+      gl.enableVertexAttribArray(programInfo.attribLocations.aPosition);
+      gl.uniform4fv(programInfo.uniformLocations.uColor, [1.0, 0.0, 0.0, 1.0]); // Set color to red
       gl.drawArrays(gl.POINTS, 0, gtArray.length / 3);
 
       // Draw xs points in blue (if available)
-      //if sortedDPMStep is not null
-      if (currentData.xts && currentData.xts.length > 0 ) {
+      if (currentData.xts && currentData.xts.length > 0) {
         //get dpmSlider value
         const sliderValue = parseInt(dpmSlider.value);
-        var sortedDPMStep =  currentData.steps.slice().sort((a, b) => a - b);
+        var sortedDPMStep = currentData.steps.slice().sort((a, b) => a - b);
         const nearestDPM = sortedDPMStep.reduce((prev, curr) =>
           Math.abs(curr - sliderValue) < Math.abs(prev - sliderValue) ? curr : prev
         );
@@ -699,7 +776,8 @@
         gl.bindBuffer(gl.ARRAY_BUFFER, pointBuffer);
         gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(xsArray), gl.STATIC_DRAW);
         gl.vertexAttribPointer(programInfo.attribLocations.aPosition, 3, gl.FLOAT, false, 0, 0);
-        gl.uniform4fv(programInfo.uniformLocations.uColor, [0.0, 0.0, 1.0, 1.0]);
+        gl.enableVertexAttribArray(programInfo.attribLocations.aPosition);
+        gl.uniform4fv(programInfo.uniformLocations.uColor, [0.0, 0.0, 1.0, 1.0]); // Set color to blue
         gl.drawArrays(gl.POINTS, 0, xsArray.length / 3);
       }
     }
