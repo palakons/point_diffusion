@@ -30,8 +30,9 @@
 
   // Function to resize the canvas and update WebGL viewport
   function resizeCanvas() {
-    canvas.width = window.innerWidth;
-    canvas.height = window.innerHeight;
+    const rect = canvas.parentElement.getBoundingClientRect();
+    canvas.width = rect.width;
+    canvas.height = rect.height;
     gl.viewport(0, 0, canvas.width, canvas.height);
   }
 
@@ -52,6 +53,12 @@
   //update cdValue
   const cdValue = document.getElementById("cdValue");
   const dpmCdValue = document.getElementById("dpmCdValue");
+
+  const viewXBtn = document.getElementById("viewX");
+  const viewYBtn = document.getElementById("viewY");
+  const viewZBtn = document.getElementById("viewZ");
+  const viewPerBtn = document.getElementById("viewPerspective");
+
 
   let sortedEpochs = []; // Declare sortedEpochs in a higher scope
 
@@ -75,6 +82,45 @@
     // Zero-pad epoch to 6 digits
     const paddedEpoch = epoch.toString().padStart(6, '0');
     return `sample_ep_${paddedEpoch}_gt0_${set}-idx-${frameId}.json`;
+  }
+  // Add event listeners for view buttons
+  viewXBtn.addEventListener("click", () => {
+    setView("x");
+  });
+
+  viewYBtn.addEventListener("click", () => {
+    setView("y");
+  });
+
+  viewZBtn.addEventListener("click", () => {
+    setView("z");
+  });
+
+  viewPerBtn.addEventListener("click", () => {
+    setView("perspective");
+  });
+
+  // Function to set the camera view
+  function setView(view) {
+    switch (view) {
+      case "x":
+        cameraAngleX = 0; // Reset vertical angle
+        cameraAngleY = 90; // Look along the X-axis
+        break;
+      case "y":
+        cameraAngleX = -90; // Look down from above (along Y-axis)
+        cameraAngleY = 0; // Reset horizontal angle
+        break;
+      case "z":
+        cameraAngleX = 0; // Reset vertical angle
+        cameraAngleY = 0; // Look along the Z-axis
+        break;
+      case "perspective":
+        cameraAngleX = 30; // Set a slight tilt
+        cameraAngleY = 45; // Set a diagonal view
+        break;
+    }
+    // cameraDistance = 10; // Reset the distance for all views
   }
 
   epochSlider.addEventListener('input', () => {
@@ -291,6 +337,7 @@
 
         //construct first file name from first elements in epoch, set, frameId
         // epoch is 0-paddde 6 digits
+        console.log("sortedEpochs", sortedEpochs);
         const firstEpoch = sortedEpochs[0].toString().padStart(6, '0');
         fist_file_name = `sample_ep_${firstEpoch}_gt0_${availableSets.values().next().value}-idx-${frameIds.values().next().value}.json`;
         fileName.textContent = fist_file_name;
@@ -341,7 +388,7 @@
     gl_Position = uProjectionMatrix * uModelViewMatrix * vec4(aPosition, 1.0);
   }
 `;
-const fragmentShaderSource = `
+  const fragmentShaderSource = `
   precision mediump float;
   uniform vec4 uColor;
   void main(void) {
@@ -503,10 +550,16 @@ const fragmentShaderSource = `
       return out;
     }
   };
-  
-  function renderAxes() {
-    if (fontTextureLoaded) {
-      renderAxisLabels();
+
+  function renderAxes(modelViewMatrix, projectionMatrix, canvas) {
+
+    //check if modelViewMatrix and projectionMatrix are defined
+    if (!modelViewMatrix || !projectionMatrix) {
+      console.error("ModelViewMatrix or ProjectionMatrix is not defined.");
+      return;
+    }
+    else {
+      renderAxisLabels(modelViewMatrix, projectionMatrix, canvas);
     }
     const axisVertices = [
       // X-axis (red)
@@ -516,18 +569,18 @@ const fragmentShaderSource = `
       // Z-axis (blue)
       0, 0, 0, 0, 0, 10
     ];
-  
+
     const axisColors = [
       [1.0, 0.0, 0.0, 1.0], // Red for X-axis
       [0.0, 1.0, 0.0, 1.0], // Green for Y-axis
       [0.0, 0.0, 1.0, 1.0]  // Blue for Z-axis
     ];
-  
+
     // Create and bind the buffer for axis vertices
     const axisBuffer = gl.createBuffer();
     gl.bindBuffer(gl.ARRAY_BUFFER, axisBuffer);
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(axisVertices), gl.STATIC_DRAW);
-  
+
     // Draw each axis separately
     for (let i = 0; i < 3; i++) {
       gl.vertexAttribPointer(programInfo.attribLocations.aPosition, 3, gl.FLOAT, false, 0, i * 2 * 3 * Float32Array.BYTES_PER_ELEMENT);
@@ -543,40 +596,40 @@ const fragmentShaderSource = `
     textureWidth: 64,
     textureHeight: 40,
     glyphInfos: {
-      'a': { x:  0, y:  0, width: 8, },
-      'b': { x:  8, y:  0, width: 8, },
-      'c': { x: 16, y:  0, width: 8, },
-      'd': { x: 24, y:  0, width: 8, },
-      'e': { x: 32, y:  0, width: 8, },
-      'f': { x: 40, y:  0, width: 8, },
-      'g': { x: 48, y:  0, width: 8, },
-      'h': { x: 56, y:  0, width: 8, },
-      'i': { x:  0, y:  8, width: 8, },
-      'j': { x:  8, y:  8, width: 8, },
-      'k': { x: 16, y:  8, width: 8, },
-      'l': { x: 24, y:  8, width: 8, },
-      'm': { x: 32, y:  8, width: 8, },
-      'n': { x: 40, y:  8, width: 8, },
-      'o': { x: 48, y:  8, width: 8, },
-      'p': { x: 56, y:  8, width: 8, },
-      'q': { x:  0, y: 16, width: 8, },
-      'r': { x:  8, y: 16, width: 8, },
+      'a': { x: 0, y: 0, width: 8, },
+      'b': { x: 8, y: 0, width: 8, },
+      'c': { x: 16, y: 0, width: 8, },
+      'd': { x: 24, y: 0, width: 8, },
+      'e': { x: 32, y: 0, width: 8, },
+      'f': { x: 40, y: 0, width: 8, },
+      'g': { x: 48, y: 0, width: 8, },
+      'h': { x: 56, y: 0, width: 8, },
+      'i': { x: 0, y: 8, width: 8, },
+      'j': { x: 8, y: 8, width: 8, },
+      'k': { x: 16, y: 8, width: 8, },
+      'l': { x: 24, y: 8, width: 8, },
+      'm': { x: 32, y: 8, width: 8, },
+      'n': { x: 40, y: 8, width: 8, },
+      'o': { x: 48, y: 8, width: 8, },
+      'p': { x: 56, y: 8, width: 8, },
+      'q': { x: 0, y: 16, width: 8, },
+      'r': { x: 8, y: 16, width: 8, },
       's': { x: 16, y: 16, width: 8, },
       't': { x: 24, y: 16, width: 8, },
       'u': { x: 32, y: 16, width: 8, },
       'v': { x: 40, y: 16, width: 8, },
       'w': { x: 48, y: 16, width: 8, },
       'x': { x: 56, y: 16, width: 8, },
-      'y': { x:  0, y: 24, width: 8, },
-      'z': { x:  8, y: 24, width: 8, },
+      'y': { x: 0, y: 24, width: 8, },
+      'z': { x: 8, y: 24, width: 8, },
       '0': { x: 16, y: 24, width: 8, },
       '1': { x: 24, y: 24, width: 8, },
       '2': { x: 32, y: 24, width: 8, },
       '3': { x: 40, y: 24, width: 8, },
       '4': { x: 48, y: 24, width: 8, },
       '5': { x: 56, y: 24, width: 8, },
-      '6': { x:  0, y: 32, width: 8, },
-      '7': { x:  8, y: 32, width: 8, },
+      '6': { x: 0, y: 32, width: 8, },
+      '7': { x: 8, y: 32, width: 8, },
       '8': { x: 16, y: 32, width: 8, },
       '9': { x: 24, y: 32, width: 8, },
       '-': { x: 32, y: 32, width: 8, },
@@ -594,7 +647,7 @@ const fragmentShaderSource = `
     let x = 0;
     const maxX = fontInfo.textureWidth;
     const maxY = fontInfo.textureHeight;
-  
+
     for (let i = 0; i < len; ++i) {
       const letter = s[i];
       const glyphInfo = fontInfo.glyphInfos[letter];
@@ -605,11 +658,11 @@ const fragmentShaderSource = `
         const v1 = (glyphInfo.y + fontInfo.letterHeight) / maxY;
         const u2 = (glyphInfo.x + glyphInfo.width) / maxX;
         const v2 = glyphInfo.y / maxY;
-  
+
         // 6 vertices per letter
         positions.set([x, 0, x2, 0, x, fontInfo.letterHeight, x, fontInfo.letterHeight, x2, 0, x2, fontInfo.letterHeight], offset);
         texcoords.set([u1, v1, u2, v1, u1, v2, u1, v2, u2, v1, u2, v2], offset);
-  
+
         x += glyphInfo.width + fontInfo.spacing;
         offset += 12;
       } else {
@@ -617,7 +670,7 @@ const fragmentShaderSource = `
         x += fontInfo.spaceWidth;
       }
     }
-  
+
     return {
       arrays: {
         position: new Float32Array(positions.buffer, 0, offset),
@@ -647,9 +700,54 @@ const fragmentShaderSource = `
   };
   function renderTextWithGlyphs(text, position) {
   }
-  function renderAxisLabels() {
-    renderTextWithGlyphs('x', [10, 0, 0]); // X-axis
+  function project3Dto2D(point3D, modelViewMatrix, projectionMatrix, canvas) {
+    // point3D: [x, y, z]
+    // Returns: [x_screen, y_screen] in pixels
+    let [x, y, z] = point3D;
+    let vec = [x, y, z, 1.0];
+
+    // Multiply by modelViewMatrix
+    let mv = [0, 0, 0, 0];
+    for (let i = 0; i < 4; ++i)
+      mv[i] = modelViewMatrix[i] * vec[0] + modelViewMatrix[4 + i] * vec[1] + modelViewMatrix[8 + i] * vec[2] + modelViewMatrix[12 + i] * vec[3];
+
+    // Multiply by projectionMatrix
+    let pv = [0, 0, 0, 0];
+    for (let i = 0; i < 4; ++i)
+      pv[i] = projectionMatrix[i] * mv[0] + projectionMatrix[4 + i] * mv[1] + projectionMatrix[8 + i] * mv[2] + projectionMatrix[12 + i] * mv[3];
+
+    // Perspective divide
+    let ndc = [pv[0] / pv[3], pv[1] / pv[3]];
+
+    // Convert to screen coordinates
+    let x_screen = (ndc[0] * 0.5 + 0.5) * canvas.width;
+    let y_screen = (1 - (ndc[1] * 0.5 + 0.5)) * canvas.height;
+    return [x_screen, y_screen];
   }
+  function renderAxisLabels(modelViewMatrix, projectionMatrix, canvas) {
+    const axisPoints = { 'X': [10, 0, 0], 'Y': [0, 10, 0], 'Z': [0, 0, 10] };
+    // Remove previous labels
+    const container = canvas.parentElement;
+    container.querySelectorAll('.axis-label').forEach(e => e.remove());
+    for (const [label, pt] of Object.entries(axisPoints)) {
+      const [x, y] = project3Dto2D(pt, modelViewMatrix, projectionMatrix, canvas);
+      const div = document.createElement('div');
+      div.className = 'axis-label';
+      div.textContent = label;
+      div.style.position = 'absolute';
+      div.style.left = `${x}px`;
+      div.style.top = `${y}px`;
+      div.style.color = label === 'X' ? 'red' : label === 'Y' ? 'green' : 'blue';
+      div.style.fontWeight = 'bold';
+      div.style.pointerEvents = 'none';
+      div.style.userSelect = 'none';
+      div.style.zIndex = 10;
+      container.appendChild(div);
+    }
+  }
+  // function renderAxisLabels() {
+  //   renderTextWithGlyphs('x', [10, 0, 0]); // X-axis
+  // }
   function reshapeTo3D(array) {
     const reshaped = [];
     for (let i = 0; i < array.length; i += 3) {
@@ -672,6 +770,42 @@ const fragmentShaderSource = `
     const cd = totalDistance / xs.length;
     return cd;
   }
+  function plotUnitSphere() {
+    //make pointArray of unit sphere
+    // console.log("plotUnitSphere");
+
+    let pointArray = [];
+    //alpha include 10 points from 0 to pi
+
+
+    for (let alpha = 0; alpha < Math.PI; alpha += Math.PI / 10) {
+      for (let beta = 0; beta < 2 * Math.PI; beta += Math.PI / 10 / Math.sin(alpha)) {
+        const x = Math.sin(alpha) * Math.cos(beta);
+        const y = Math.sin(alpha) * Math.sin(beta);
+        const z = Math.cos(alpha);
+        pointArray.push(x, y, z);
+      }
+    }
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, pointBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(pointArray), gl.STATIC_DRAW);
+    gl.vertexAttribPointer(programInfo.attribLocations.aPosition, 3, gl.FLOAT, false, 0, 0);
+    gl.enableVertexAttribArray(programInfo.attribLocations.aPosition);
+    gl.uniform4fv(programInfo.uniformLocations.uColor, [1.0, 1.0, 0.0, 1.0]); // Set color to red
+    gl.drawArrays(gl.POINTS, 0, pointArray.length / 3);
+  }
+  let dataMode = 0; // 0: GT only, 1: GT+XT, 2: XT only
+  const toggleDataBtn = document.getElementById('toggleDataBtn');
+
+  function updateToggleDataUI() {
+    const modes = ["GT only", "GT + XT", "XT only"];
+    toggleDataBtn.textContent = modes[dataMode];
+  }
+  toggleDataBtn.addEventListener('click', () => {
+    dataMode = (dataMode + 1) % 3;
+    updateToggleDataUI();
+  });
+  updateToggleDataUI();
   // --- RENDER LOOP ---
   function render() {
     // Clear with a sky-blue background
@@ -697,48 +831,56 @@ const fragmentShaderSource = `
     gl.uniformMatrix4fv(programInfo.uniformLocations.uModelViewMatrix, false, modelViewMatrix);
 
     // Render axes
-    renderAxes();
+    // renderAxes();
+    renderAxes(modelViewMatrix, projectionMatrix, canvas);
 
     // If JSON data is loaded, extract and draw points from GT and xs arrays.
+    plotUnitSphere()
     if (currentData) {
+      //space-padded 2 significant digit, with comma
+      cdValue.textContent = currentData.cd.toFixed(2).padStart(6, ' ');
+
       // Disable aTexCoord for points
       // const texcoordLocation = gl.getAttribLocation(shaderProgram, "aTexCoord");
       // if (texcoordLocation !== -1) {
       //   gl.disableVertexAttribArray(texcoordLocation);
       // }
 
+      // dataMode = 0; // 0: GT only, 1: GT+XT, 2: XT only
       // Draw GT points in red
-      const gtPoints = currentData.gt[0]; // assume first set
-      //if unnormRadio is True --> unnorm the poitn frist
-      // console.log("unnormed", document.getElementById("unnormRadio").checked);
-      // console.log("std", currentData.data_std);
-      // console.log("mean", currentData.data_mean);
-
-      // "data_mean": [
-      //   78.09962868690491,
-      //   11.083830393850803,
-      //   0.10256138234399259
-      // ],
-      // "data_std": [
-      //     34.22457043749478,
-      //     27.583163497404275,
-      //     1.6358030562888937
-      // ],
+      const gtPoints = currentData.gt[0];
       let gtArray = [];
-      gtPoints.forEach(pt => {
+      gtPoints.forEach((pt, i) => {
         if (document.getElementById("unnormRadio").checked)
-          gtArray.push(pt[0] * currentData.data_std[0] + currentData.data_mean[0], pt[1] * currentData.data_std[1] + currentData.data_mean[1], pt[2] * currentData.data_std[2] + currentData.data_mean[2]);
+          //check if data_std[0] is an array
+          if (Array.isArray(currentData.data_std[0])) {
+            // Per-point mean and std
+            newpoint = [
+              pt[0] * currentData.data_std[i][0] + currentData.data_mean[i][0],
+              pt[1] * currentData.data_std[i][1] + currentData.data_mean[i][1],
+              pt[2] * currentData.data_std[i][2] + currentData.data_mean[i][2]]
+            console.log(newpoint)
+            gtArray.push(
+              pt[0] * currentData.data_std[i][0] + currentData.data_mean[i][0],
+              pt[1] * currentData.data_std[i][1] + currentData.data_mean[i][1],
+              pt[2] * currentData.data_std[i][2] + currentData.data_mean[i][2]
+            );
+
+          } else {
+            gtArray.push(pt[0] * currentData.data_std[0] + currentData.data_mean[0], pt[1] * currentData.data_std[1] + currentData.data_mean[1], pt[2] * currentData.data_std[2] + currentData.data_mean[2]);
+          }
         else gtArray.push(pt[0], pt[1], pt[2])
       }
       );
-      //space-padded 2 significant digit, with comma
-      cdValue.textContent = currentData.cd.toFixed(2).padStart(6, ' ');
-      gl.bindBuffer(gl.ARRAY_BUFFER, pointBuffer);
-      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(gtArray), gl.STATIC_DRAW);
-      gl.vertexAttribPointer(programInfo.attribLocations.aPosition, 3, gl.FLOAT, false, 0, 0);
-      gl.enableVertexAttribArray(programInfo.attribLocations.aPosition);
-      gl.uniform4fv(programInfo.uniformLocations.uColor, [1.0, 0.0, 0.0, 1.0]); // Set color to red
-      gl.drawArrays(gl.POINTS, 0, gtArray.length / 3);
+      if (dataMode === 0 || dataMode === 1) {
+        gl.bindBuffer(gl.ARRAY_BUFFER, pointBuffer);
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(gtArray), gl.STATIC_DRAW);
+        gl.vertexAttribPointer(programInfo.attribLocations.aPosition, 3, gl.FLOAT, false, 0, 0);
+        gl.enableVertexAttribArray(programInfo.attribLocations.aPosition);
+        gl.uniform4fv(programInfo.uniformLocations.uColor, [1.0, 0.0, 0.0, 1.0]); // Set color to red
+        gl.drawArrays(gl.POINTS, 0, gtArray.length / 3);
+      }
+
 
       // Draw xs points in blue (if available)
       if (currentData.xts && currentData.xts.length > 0) {
@@ -760,9 +902,22 @@ const fragmentShaderSource = `
         // console.log( "xsPoints", xsPoints);
         let xsArray = [];
 
-        xsPoints.forEach(pt => {
+        xsPoints.forEach((pt, i) => {
           if (document.getElementById("unnormRadio").checked)
-            xsArray.push(pt[0] * currentData.data_std[0] + currentData.data_mean[0], pt[1] * currentData.data_std[1] + currentData.data_mean[1], pt[2] * currentData.data_std[2] + currentData.data_mean[2]);
+
+            //check if data_std[0] is an array
+            if (Array.isArray(currentData.data_std[0])) {
+              // Per-point mean and std
+              xsArray.push(
+                pt[0] * currentData.data_std[i][0] + currentData.data_mean[i][0],
+                pt[1] * currentData.data_std[i][1] + currentData.data_mean[i][1],
+                pt[2] * currentData.data_std[i][2] + currentData.data_mean[i][2]
+              );
+            } else {
+
+
+              xsArray.push(pt[0] * currentData.data_std[0] + currentData.data_mean[0], pt[1] * currentData.data_std[1] + currentData.data_mean[1], pt[2] * currentData.data_std[2] + currentData.data_mean[2]);
+            }
           else xsArray.push(pt[0], pt[1], pt[2])
         }
         );
@@ -773,12 +928,14 @@ const fragmentShaderSource = `
         calculatedCD = calculateCD(reshapeTo3D(xsArray), reshapeTo3D(gtArray));
         //update dpmCdValue
         dpmCdValue.textContent = calculatedCD.toFixed(2);
-        gl.bindBuffer(gl.ARRAY_BUFFER, pointBuffer);
-        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(xsArray), gl.STATIC_DRAW);
-        gl.vertexAttribPointer(programInfo.attribLocations.aPosition, 3, gl.FLOAT, false, 0, 0);
-        gl.enableVertexAttribArray(programInfo.attribLocations.aPosition);
-        gl.uniform4fv(programInfo.uniformLocations.uColor, [0.0, 0.0, 1.0, 1.0]); // Set color to blue
-        gl.drawArrays(gl.POINTS, 0, xsArray.length / 3);
+        if (dataMode === 1 || dataMode === 2) {
+          gl.bindBuffer(gl.ARRAY_BUFFER, pointBuffer);
+          gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(xsArray), gl.STATIC_DRAW);
+          gl.vertexAttribPointer(programInfo.attribLocations.aPosition, 3, gl.FLOAT, false, 0, 0);
+          gl.enableVertexAttribArray(programInfo.attribLocations.aPosition);
+          gl.uniform4fv(programInfo.uniformLocations.uColor, [0.0, 0.0, 1.0, 1.0]); // Set color to blue
+          gl.drawArrays(gl.POINTS, 0, xsArray.length / 3);
+        }
       }
     }
     requestAnimationFrame(render);
