@@ -12,6 +12,7 @@ import torch.nn.functional as F
 import math
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 import pytorch3d
+from datetime import datetime
 # from pytorch3d.loss import chamfer_distance
 # from model.point_cloud_model import PointCloudModel
 
@@ -99,31 +100,84 @@ def sample(model, scheduler, T, B, N, D, x_0, device, data_mean, data_std):
     return xts_concat, [int(a) for a in time_step_concat], cd_final
 
 
+def save_checkpoint(model, optimizer,
+                    train_cd_list,
+                    train_cd_epochs,
+                    train_loss_list, epoch, base_dir, config, run_name):
+    checkpint_dir = os.path.join(
+        base_dir, "checkpoints_man")
+    proc_id = os.getpid()
+    checkpoint_fname = os.path.join(
+        checkpint_dir, f"cp_{datetime.now().strftime(f'%Y-%m-%d-%H-%M-%S')}-{run_name.replace('/', '_') }_host{os.uname().nodename}_proc{proc_id}.pth")
+    db_fname = os.path.join(
+        base_dir, 'checkpoints_man', 'db.txt')
+
+    checkpoint = {
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'epoch': epoch,
+        'train_cd_list': train_cd_list,
+        'train_loss_list': train_loss_list,
+        'config': config,
+    }
+    os.makedirs(checkpint_dir, exist_ok=True)
+    # Save the checkpoint
+    torch.save(checkpoint, checkpoint_fname)
+    with open(db_fname, "a" if os.path.exists(db_fname) else "w") as f:
+        data = {"fname": checkpoint_fname, "config": config}
+        json.dump(data, f)
+        f.write("\n")
+
+
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    B, N, D = 1, 256, 3  # upto 800 points
+    B, N, D = 1, 128, 3  # 128, 3  # upto 800 points
     T = 100
     seed_value = 42
     method = "4_pvcnn"
     # mlp_layers = [256, 128]
     # mlp_layers = [2048, 1024]
     pvcnn_embed_dim = 64
+    pvcnn_width_multiplier = 1  # 2,4,3
+    pvcnn_voxel_resolution_multiplier = 1  # 0.5,2,4
+
     time_embed_dim = 64
     lr = 1e-4
-    epochs = 3_000_001
+    epochs = 300_001
     vis_freq = 1000
     radar_ch = "RADAR_LEFT_FRONT"
+    ablate_pvcnn_mlp = False
+    ablate_pvcnn_cnn = True
     # base_dir = "/ist-nas/users/palakonk/singularity_logs/"
     base_dir = "/home/palakons/logs/"  # singularity
-    run_name = f"{method}_{N:04d}_MAN_1m_pvcnn_emb{pvcnn_embed_dim}"
+    run_name = f"{method}_{N:04d}_MAN_emb{pvcnn_embed_dim}_wm{pvcnn_width_multiplier}_vrm{pvcnn_voxel_resolution_multiplier}_ablate_mlp{ablate_pvcnn_mlp}_cnn{ablate_pvcnn_cnn}"
     log_dir = f"{base_dir}tb_log/mlp_man/{run_name}"
 
-    writer = SummaryWriter(log_dir=log_dir)
+    exp_config = {
+        "B": B,
+        "N": N,
+        "D": D,
+        "T": T,
+        "seed_value": seed_value,
+        "method": method,
+        "pvcnn_embed_dim": pvcnn_embed_dim,
+        "pvcnn_width_multiplier": pvcnn_width_multiplier,
+        "pvcnn_voxel_resolution_multiplier": pvcnn_voxel_resolution_multiplier,
+        "time_embed_dim": time_embed_dim,
+        "lr": lr,
+        "radar_ch": radar_ch,
+        "epochs": epochs,
+        "run_name": run_name,
+        "ablate_pvcnn_mlp": ablate_pvcnn_mlp,
+        "ablate_pvcnn_cnn": ablate_pvcnn_cnn,
+    }
+    print("exp_config", exp_config)
 
+    writer = SummaryWriter(log_dir=log_dir)
     torch.manual_seed(seed_value)
     # x_0 = torch.randn(B, N, D).to(device)
     x_0 = get_man_data(N, radar_ch=radar_ch).to(device).float()
-    print("x_0", x_0)
+    print("x_0", x_0.shape)  # (1, N, 3)
     data_mean, data_std = x_0.mean(dim=[0, 1]), x_0.std(dim=[0, 1])
     print("data_mean", data_mean)
     print("data_std", data_std)
@@ -138,8 +192,8 @@ def main():
         out_channels=3,
         embed_dim=pvcnn_embed_dim,
         dropout=0.1,
-        width_multiplier=1,
-        voxel_resolution_multiplier=1,).to(device)
+        width_multiplier=pvcnn_width_multiplier,
+        voxel_resolution_multiplier=pvcnn_voxel_resolution_multiplier,).to(device)
     """ Receives input of shape (B, N, in_channels) and returns output
             of shape (B, N, out_channels) """
     scheduler = DDPMScheduler(num_train_timesteps=T,
@@ -150,6 +204,9 @@ def main():
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     tt = trange(epochs)
     cd_loss = 0
+    train_cd_list = []
+    train_cd_epochs = []
+    train_loss_list = []
     for i_epoch, epoch in enumerate(tt):
         t = torch.randint(0, T, (B,), device=device)
         noise = torch.randn_like(x_0)
@@ -167,25 +224,23 @@ def main():
                 model.eval(), scheduler, T, B, N, D, x_0, device, data_mean=data_mean, data_std=data_std)
             path = f"{base_dir}/plots/mlp_man/basic_{method}_{N:04d}_MAN_1m_pvcnn_emb{pvcnn_embed_dim}/sample_ep_{i_epoch:06d}_gt0_train-idx-32d.json"
             save_sample_json(path, epoch, x_0, xts_tensor_list,
-                             steps,  cd=cd_loss, data_mean=data_mean, data_std=data_std, config={
-                                 "B": B,
-                                 "N": N,
-                                 "D": D,
-                                 "T": T,
-                                 "seed_value": seed_value,
-                                 "method": method,
-                                 "pvcnn_embed_dim": pvcnn_embed_dim,
-                                 "time_embed_dim": time_embed_dim,
-                                 "lr": lr,
-                                 "radar_ch": radar_ch
-                             })
+                             steps,  cd=cd_loss, data_mean=data_mean, data_std=data_std, config=exp_config)
             writer.add_scalar(f"CD", cd_loss, epoch)
+            train_cd_epochs.append(epoch)
+            train_cd_list.append(cd_loss.item())
 
         tt.set_description_str(
             f"MSE = {loss.item():.2f}, CD = {cd_loss:.2f}")
+        train_loss_list.append(loss.item())
 
         writer.add_scalar(f"Loss", loss.item(), epoch)
     writer.close()
+    # Save the model
+    print("Saving model...")
+    save_checkpoint(model, optimizer,
+                    train_cd_list=train_cd_list,
+                    train_cd_epochs=train_cd_epochs,
+                    train_loss_list=train_loss_list, epoch=epoch, base_dir=base_dir, config=exp_config, run_name=run_name)
 
 
 if __name__ == "__main__":
