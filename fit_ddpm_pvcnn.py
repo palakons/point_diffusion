@@ -21,7 +21,7 @@ def get_man_data(N, radar_ch):
     # /ist-nas/users/palakonk/singularity_
     data_root = "/data/palakons/new_dataset/MAN/mini/man-truckscenes"
     trucksc = TruckScenes(
-        'v1.0-mini', data_root, True)
+        'v1.0-mini', data_root, False)
 
     first_frame_token = trucksc.scene[0]['first_sample_token']
     frame = trucksc.get('sample', first_frame_token)
@@ -131,7 +131,7 @@ def save_checkpoint(model, optimizer,
 
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    B, N, D = 1, 128, 3  # 128, 3  # upto 800 points
+    B, N, D = 1, 4, 3  # 128, 3  # upto 800 points
     T = 100
     seed_value = 42
     method = "4_pvcnn"
@@ -146,8 +146,8 @@ def main():
     epochs = 300_001
     vis_freq = 1000
     radar_ch = "RADAR_LEFT_FRONT"
-    ablate_pvcnn_mlp = False
-    ablate_pvcnn_cnn = True
+    ablate_pvcnn_mlp = True
+    ablate_pvcnn_cnn = False
     # base_dir = "/ist-nas/users/palakonk/singularity_logs/"
     base_dir = "/home/palakons/logs/"  # singularity
     run_name = f"{method}_{N:04d}_MAN_emb{pvcnn_embed_dim}_wm{pvcnn_width_multiplier}_vrm{pvcnn_voxel_resolution_multiplier}_ablate_mlp{ablate_pvcnn_mlp}_cnn{ablate_pvcnn_cnn}"
@@ -193,7 +193,10 @@ def main():
         embed_dim=pvcnn_embed_dim,
         dropout=0.1,
         width_multiplier=pvcnn_width_multiplier,
-        voxel_resolution_multiplier=pvcnn_voxel_resolution_multiplier,).to(device)
+        voxel_resolution_multiplier=pvcnn_voxel_resolution_multiplier,
+        ablate_pvcnn_mlp=ablate_pvcnn_mlp,
+        ablate_pvcnn_cnn=ablate_pvcnn_cnn
+    ).to(device)
     """ Receives input of shape (B, N, in_channels) and returns output
             of shape (B, N, out_channels) """
     scheduler = DDPMScheduler(num_train_timesteps=T,
