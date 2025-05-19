@@ -19,9 +19,9 @@ from man_dataset import MANDataset, custom_collate_fn_man
 from torch.utils.data import Dataset, DataLoader, Subset
 
 
-def get_man_data(M, N, camera_ch, radar_ch, device, img_size, batch_size, shuffle, n_val=2):
+def get_man_data(M, N, camera_ch, radar_ch, device, img_size, batch_size, shuffle, n_val=2,n_pull=10):
     dataset = MANDataset(
-        10,
+        n_pull,
         N,
         0,
         depth_model="vits",
@@ -195,8 +195,8 @@ def get_sinusoidal_embedding(timesteps, embedding_dim, device):
 
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    M = 2
-    B, N, D = 2, 128, 3  # 128, 3  # upto 800 points
+    M = 1
+    B, N, D = 1, 128, 3  # 128, 3  # upto 800 points
     lr = 1e-4
     epochs = 300_001
     pvcnn_embed_dim = 64
@@ -205,14 +205,16 @@ def main():
     ablate_pvcnn_mlp = False
     ablate_pvcnn_cnn = False
 
-    n_val = 2
+    n_val = 1
+    n_pull = 10
+    method = "4_5_pvcnn_cond_singleten"
+
     T = 100
     pc2_conditioning_dim = 64
     vis_freq = 1000
     radar_ch = "RADAR_LEFT_FRONT"
     camera_ch = "CAMERA_RIGHT_FRONT"
     img_size = 618
-    method = "4_5_pvcnn_cond"
     seed_value = 42
     # base_dir = "/ist-nas/users/palakonk/singularity_logs/"
     base_dir = "/home/palakons/logs/"  # singularity
@@ -229,6 +231,7 @@ def main():
         "T": T,
         "seed_value": seed_value,
         "method": method,
+        "n_pull": n_pull,
         "pvcnn_embed_dim": pvcnn_embed_dim,
         "pvcnn_width_multiplier": pvcnn_width_multiplier,
         "pvcnn_voxel_resolution_multiplier": pvcnn_voxel_resolution_multiplier,
@@ -248,7 +251,7 @@ def main():
     writer = SummaryWriter(log_dir=log_dir)
     torch.manual_seed(seed_value)
     dataloader_train, dataloader_val = get_man_data(
-        M, N, camera_ch, radar_ch, device, img_size, B, shuffle=True, n_val=n_val)
+        M, N, camera_ch, radar_ch, device, img_size, B, shuffle=True, n_val=n_val, n_pull=n_pull)
 
     data_mean, data_std = dataloader_train.dataset.dataset.data_mean, dataloader_train.dataset.dataset.data_std
     print("data_mean", data_mean.tolist())

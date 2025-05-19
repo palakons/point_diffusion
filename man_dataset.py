@@ -21,6 +21,7 @@ from pytorch3d.renderer.cameras import PerspectiveCameras
 
 from matplotlib import pyplot as plt
 
+
 class MANDataset(Dataset):
     def __init__(
         self,
@@ -34,7 +35,8 @@ class MANDataset(Dataset):
         is_scaled=True,
         img_size=618,
         radar_channel='RADAR_LEFT_FRONT',
-        camera_channel='CAMERA_RIGHT_FRONT'
+        camera_channel='CAMERA_RIGHT_FRONT',
+        double_flip_images=True,
     ):
         self.M = M
         self.N = N
@@ -47,7 +49,8 @@ class MANDataset(Dataset):
         self.scene_id = scene_id
         self.radar_channel = radar_channel
         self.camera_channel = camera_channel
-        
+        self.double_flip_images = double_flip_images
+
         # store mean and std
 
         if self.data_file == "man-mini":
@@ -98,9 +101,7 @@ class MANDataset(Dataset):
         if not os.path.exists(depth_image_dir):
             os.makedirs(depth_image_dir)
 
-
-
-    def inverse_SE3(self,T: torch.Tensor) -> torch.Tensor:
+    def inverse_SE3(self, T: torch.Tensor) -> torch.Tensor:
         R = T[:3, :3]
         t = T[:3, 3]
         R_inv = R.T
@@ -109,19 +110,22 @@ class MANDataset(Dataset):
         T_inv[:3, :3] = R_inv
         T_inv[:3, 3] = t_inv
         return T_inv
-    def quat2mat(self,q):  # q in (w, x, y, z)
+
+    def quat2mat(self, q):  # q in (w, x, y, z)
         # === Convert quaternions to rotation matrices ===
         return quaternion_to_matrix(torch.tensor([q[0], q[1], q[2], q[3]])[None])[0]
 
-
-    def to_homogeneous(self,R: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    def to_homogeneous(self, R: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         """Convert rotation and translation to a 4x4 homogeneous transform."""
         T = torch.eye(4)
         T[:3, :3] = R
         T[:3, 3] = t
         return T
 
-    def calib_to_camera_base_MAN(self,cam_calib, cam_pose, radar_calib, radar_pose, image_size_hw: tuple, offset: int = 0, image_size: int = 618, step=4):
+    def calib_to_camera_base_MAN(self, cam_calib, cam_pose, radar_calib, radar_pose, image_size_hw: tuple, offset: int = 0, image_size: int = 618, step=4):
+        """
+        image_size_hw: tuple, (height, width), origninal image size
+        """
 
         # === Build individual transforms as 4x4 homogeneous matrices ===
         T_radar2ego = self.to_homogeneous(self.quat2mat(radar_calib['rotation']), torch.tensor(
@@ -152,6 +156,7 @@ class MANDataset(Dataset):
         MAN_image_height = 943
 
         s = image_size/MAN_image_height
+        print("calib_to_camera_base_MAN s", s)
         # Convert intrinsic matrix K to tensor
 
         K = torch.tensor(cam_calib['camera_intrinsic'])
@@ -175,7 +180,8 @@ class MANDataset(Dataset):
             R=R,
             T=T,
             in_ndc=False,
-            image_size=[image_size_hw],
+            # image_size=[image_size_hw],
+            image_size=[[image_size, image_size]],
         )
 
     def load_data(self, trucksc, frame_token):
@@ -209,6 +215,11 @@ class MANDataset(Dataset):
         depth_image = depth_image[:,
                                   self.square_image_offset: self.square_image_offset + depth_image.shape[0]]
 
+        if self.double_flip_images:
+            # rotate 180 degrees
+            depth_image = torch.flip(depth_image, [1])
+            depth_image = torch.flip(depth_image, [0])
+
         depth_image = torch.nn.functional.interpolate(
             depth_image.unsqueeze(0).unsqueeze(0),
             size=(self.img_size, self.img_size),
@@ -219,7 +230,7 @@ class MANDataset(Dataset):
         # 2) load radar
         # load pcd
         radar_pcd_path = os.path.join(self.data_root, radar['filename'])
-        cloud = o3d.io.read_point_cloud(radar_pcd_path)   
+        cloud = o3d.io.read_point_cloud(radar_pcd_path)
         radar_data = torch.tensor(cloud.points)
         npoints_original = radar_data.shape[0]
 
@@ -234,8 +245,8 @@ class MANDataset(Dataset):
         radar_pose = trucksc.get('ego_pose', radar['ego_pose_token'])
 
         cam_calib_obj = self.calib_to_camera_base_MAN(cam_calib, cam_pose, radar_calib, radar_pose, [self.original_image_size[0]] *
-                                                 2, self.square_image_offset, self.img_size
-                                                 )
+                                                      2, self.square_image_offset, self.img_size
+                                                      )
 
         # 4) load camera
         image_rgb_path = os.path.join(self.data_root, cam['filename'])
@@ -250,6 +261,10 @@ class MANDataset(Dataset):
         camera_front = camera_front[
             :, :, self.square_image_offset: self.square_image_offset + camera_front.shape[1]
         ]
+        if self.double_flip_images:
+            # rotate 180 degrees
+            camera_front = torch.flip(camera_front, [1])
+            camera_front = torch.flip(camera_front, [2])
 
         # resize image to self.img_size
         camera_front = torch.nn.functional.interpolate(
