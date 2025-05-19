@@ -27,7 +27,63 @@
   mainContainer.appendChild(controlsContainer);
 
   document.body.appendChild(mainContainer);
+  function zoomToFitScreen(points, modelViewMatrix, projectionMatrix, canvas) {
+    // points: array of [x, y, z]
+    if (!points || points.length === 0) return;
 
+    ;
+
+    // Project all points to 2D screen coordinates
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (let i = 0; i < points.length; i++) {
+      const [x, y, z] = points[i];
+      let vec = [x, y, z, 1.0];
+
+      // Multiply by modelViewMatrix
+      let mv = [0, 0, 0, 0];
+      for (let j = 0; j < 4; ++j)
+        mv[j] = modelViewMatrix[j] * vec[0] + modelViewMatrix[4 + j] * vec[1] + modelViewMatrix[8 + j] * vec[2] + modelViewMatrix[12 + j] * vec[3];
+
+      // Multiply by projectionMatrix
+      let pv = [0, 0, 0, 0];
+      for (let j = 0; j < 4; ++j)
+        pv[j] = projectionMatrix[j] * mv[0] + projectionMatrix[4 + j] * mv[1] + projectionMatrix[8 + j] * mv[2] + projectionMatrix[12 + j] * mv[3];
+
+      // Perspective divide
+      let ndc = [pv[0] / pv[3], pv[1] / pv[3]];
+
+      // Convert to screen coordinates
+      let x_screen = (ndc[0] * 0.5 + 0.5) * canvas.width;
+      let y_screen = (1 - (ndc[1] * 0.5 + 0.5)) * canvas.height;
+
+      if (x_screen < minX) minX = x_screen;
+      if (y_screen < minY) minY = y_screen;
+      if (x_screen > maxX) maxX = x_screen;
+      if (y_screen > maxY) maxY = y_screen;
+    }
+
+    // Compute scale needed to fit all points with a margin
+    const margin = .9; // 90% of canvas
+
+    leftcanvas = -canvas.width / 2;
+    rightcanvas = canvas.width / 2;
+
+    scalerightX = (maxX - canvas.width / 2) / rightcanvas
+    scaleleftX = (minX - canvas.width / 2) / leftcanvas
+    scaleX = Math.max(scalerightX, scaleleftX);
+
+    topcanvas = -canvas.height / 2;
+    bottomcanvas = canvas.height / 2;
+
+    scaleTopY = (minY - canvas.height / 2) / topcanvas
+    scaleBottomY = (maxY - canvas.height / 2) / bottomcanvas
+    scaleY = Math.max(scaleTopY, scaleBottomY);
+
+    scale = Math.max(scaleX, scaleY);
+
+    // Adjust cameraDistance accordingly (this is a bit heuristic)
+    cameraDistance *= scale / margin;
+  }
   // Function to resize the canvas and update WebGL viewport
   function resizeCanvas() {
     const rect = canvas.parentElement.getBoundingClientRect();
@@ -39,8 +95,11 @@
   // Attach resize event listener
   window.addEventListener('resize', resizeCanvas);
 
-  // Call resizeCanvas initially to set up the correct size
-  resizeCanvas();
+  window.addEventListener('load', () => {
+    // Call resizeCanvas initially to set up the correct size
+    resizeCanvas();
+  });
+
 
   // UI elements
   const expSelect = document.getElementById('expSelect');
@@ -58,6 +117,7 @@
   const viewYBtn = document.getElementById("viewY");
   const viewZBtn = document.getElementById("viewZ");
   const viewPerBtn = document.getElementById("viewPerspective");
+  const zoomToFitBtn = document.getElementById("zoomToFitBtn");
 
 
   let sortedEpochs = []; // Declare sortedEpochs in a higher scope
@@ -98,6 +158,40 @@
 
   viewPerBtn.addEventListener("click", () => {
     setView("perspective");
+  });
+  zoomToFitBtn.addEventListener("click", () => {
+    if (currentData && currentData.gt && currentData.gt[0]) {
+
+      const gtPoints = currentData.gt[0];
+      let points = [];
+      gtPoints.forEach((pt, i) => {
+        if (document.getElementById("unnormRadio").checked)
+          //check if data_std[0] is an array
+          if (Array.isArray(currentData.data_std[0])) {
+            points.push([pt[0] * currentData.data_std[i][0] + currentData.data_mean[i][0],
+            pt[1] * currentData.data_std[i][1] + currentData.data_mean[i][1],
+            pt[2] * currentData.data_std[i][2] + currentData.data_mean[i][2]]
+            );
+          } else {
+            points.push([pt[0] * currentData.data_std[0] + currentData.data_mean[0], pt[1] * currentData.data_std[1] + currentData.data_mean[1], pt[2] * currentData.data_std[2] + currentData.data_mean[2]]);
+          }
+        else points.push([pt[0], pt[1], pt[2]]);
+      });
+      const aspect = canvas.width / canvas.height;
+      const projectionMatrix = mat4.create();
+      mat4.perspective(projectionMatrix, 60 * Math.PI / 180, aspect, 0.1, 500.0);
+
+      const modelViewMatrix = mat4.create();
+      mat4.identity(modelViewMatrix);
+      mat4.translate(modelViewMatrix, modelViewMatrix, [0, 0, -cameraDistance]);
+      mat4.rotate(modelViewMatrix, modelViewMatrix, cameraAngleX * Math.PI / 180, [1, 0, 0]);
+      mat4.rotate(modelViewMatrix, modelViewMatrix, cameraAngleY * Math.PI / 180, [0, 1, 0]);
+      mat4.translate(modelViewMatrix, modelViewMatrix, [cameraPanX, cameraPanY, 0]);
+
+      zoomToFitScreen(points, modelViewMatrix, projectionMatrix, canvas);
+    } else {
+      console.log("No points to zoom to fit");
+    }
   });
 
   // Function to set the camera view
@@ -274,7 +368,7 @@
           }
         });
         console.log("Available sets:", availableSets);
-        console.log("Epochs:", epochs);
+        // console.log("Epochs:", epochs);
         console.log("Frame IDs:", frameIds);
         //availableSets.has("val")
         console.log("Available sets has val:", availableSets.has("val"));
@@ -337,7 +431,7 @@
 
         //construct first file name from first elements in epoch, set, frameId
         // epoch is 0-paddde 6 digits
-        console.log("sortedEpochs", sortedEpochs);
+        // console.log("sortedEpochs", sortedEpochs);
         const firstEpoch = sortedEpochs[0].toString().padStart(6, '0');
         fist_file_name = `sample_ep_${firstEpoch}_gt0_${availableSets.values().next().value}-idx-${frameIds.values().next().value}.json`;
         fileName.textContent = fist_file_name;
@@ -458,7 +552,7 @@
   canvas.addEventListener('wheel', (e) => {
     cameraDistance += e.deltaY * 0.01;
     cameraDistance = Math.max(2, cameraDistance); // Minimum distance
-    cameraDistance = Math.min(cameraDistance, 200); // Maximum distance to prevent zooming too far out
+    cameraDistance = Math.min(cameraDistance, 500); // Maximum distance to prevent zooming too far out
   });
 
   // --- SIMPLE MATRIX UTILITIES ---
@@ -794,7 +888,7 @@
     gl.uniform4fv(programInfo.uniformLocations.uColor, [1.0, 1.0, 0.0, 1.0]); // Set color to red
     gl.drawArrays(gl.POINTS, 0, pointArray.length / 3);
   }
-  let dataMode = 0; // 0: GT only, 1: GT+XT, 2: XT only
+  let dataMode = 1; // 0: GT only, 1: GT+XT, 2: XT only
   const toggleDataBtn = document.getElementById('toggleDataBtn');
 
   function updateToggleDataUI() {
@@ -855,11 +949,11 @@
           //check if data_std[0] is an array
           if (Array.isArray(currentData.data_std[0])) {
             // Per-point mean and std
-            newpoint = [
-              pt[0] * currentData.data_std[i][0] + currentData.data_mean[i][0],
-              pt[1] * currentData.data_std[i][1] + currentData.data_mean[i][1],
-              pt[2] * currentData.data_std[i][2] + currentData.data_mean[i][2]]
-            console.log(newpoint)
+            // newpoint = [
+            //   pt[0] * currentData.data_std[i][0] + currentData.data_mean[i][0],
+            //   pt[1] * currentData.data_std[i][1] + currentData.data_mean[i][1],
+            //   pt[2] * currentData.data_std[i][2] + currentData.data_mean[i][2]]
+            // console.log(newpoint)
             gtArray.push(
               pt[0] * currentData.data_std[i][0] + currentData.data_mean[i][0],
               pt[1] * currentData.data_std[i][1] + currentData.data_mean[i][1],
