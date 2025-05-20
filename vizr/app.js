@@ -50,17 +50,25 @@
         pv[j] = projectionMatrix[j] * mv[0] + projectionMatrix[4 + j] * mv[1] + projectionMatrix[8 + j] * mv[2] + projectionMatrix[12 + j] * mv[3];
 
       // Perspective divide
-      let ndc = [pv[0] / pv[3], pv[1] / pv[3]];
+      let ndc = [pv[0] / pv[3], pv[1] / pv[3], pv[2] / pv[3]];
 
       // Convert to screen coordinates
       let x_screen = (ndc[0] * 0.5 + 0.5) * canvas.width;
       let y_screen = (1 - (ndc[1] * 0.5 + 0.5)) * canvas.height;
+      // console.log("screen (", x_screen, ",", y_screen,")");
 
-      if (x_screen < minX) minX = x_screen;
-      if (y_screen < minY) minY = y_screen;
-      if (x_screen > maxX) maxX = x_screen;
-      if (y_screen > maxY) maxY = y_screen;
+      if (x_screen < minX) {minX = x_screen; minXPoint = points[i]; minXndc = ndc;}
+      if (y_screen < minY) 
+        {minY = y_screen; minYPoint = points[i]; minYndc = ndc;}
+      if (x_screen > maxX) 
+        {maxX = x_screen; maxXPoint = points[i]; maxXndc = ndc;}
+      if (y_screen > maxY) {
+        maxY = y_screen; maxYPoint = points[i]; maxYndc = ndc;
+      }
     }
+    //The upper-left corner of the canvas has the coordinates (0,0).
+
+
 
     // Compute scale needed to fit all points with a margin
     const margin = .9; // 90% of canvas
@@ -68,21 +76,40 @@
     leftcanvas = -canvas.width / 2;
     rightcanvas = canvas.width / 2;
 
-    scalerightX = (maxX - canvas.width / 2) / rightcanvas
-    scaleleftX = (minX - canvas.width / 2) / leftcanvas
+    minX -=canvas.width / 2
+    maxX -=canvas.width / 2
+    minY -=canvas.height / 2
+    maxY -=canvas.height / 2
+
+    scalerightX = (maxX ) / rightcanvas
+    scaleleftX = (minX ) / leftcanvas
     scaleX = Math.max(scalerightX, scaleleftX);
 
     topcanvas = -canvas.height / 2;
     bottomcanvas = canvas.height / 2;
 
-    scaleTopY = (minY - canvas.height / 2) / topcanvas
-    scaleBottomY = (maxY - canvas.height / 2) / bottomcanvas
+    scaleTopY = (minY ) / topcanvas
+    scaleBottomY = (maxY ) / bottomcanvas
     scaleY = Math.max(scaleTopY, scaleBottomY);
 
     scale = Math.max(scaleX, scaleY);
+    //limit scale from .5 to 2
+    scale = Math.max(.5, Math.min(scale, 2));
 
     // Adjust cameraDistance accordingly (this is a bit heuristic)
-    cameraDistance *= scale / margin;
+    
+    cameraDistance *= (scale-1)/5+1 ;
+
+    // console.log("-------------------")
+    // //log minXPoint, minXndc in fixed(2) and in (x,y,z) format
+    // console.log("minX", minX, "xyz", minXPoint[0].toFixed(2), minXPoint[1].toFixed(2), minXPoint[2].toFixed(2), "ndc", minXndc[0].toFixed(2), minXndc[1].toFixed(2), minXndc[2].toFixed(2));
+    // console.log("maxX",maxX, "xyz", maxXPoint[0].toFixed(2), maxXPoint[1].toFixed(2), maxXPoint[2].toFixed(2), "ndc", maxXndc[0].toFixed(2), maxXndc[1].toFixed(2), maxXndc[2].toFixed(2));
+    // console.log("minY",minY, "xyz", minYPoint[0].toFixed(2), minYPoint[1].toFixed(2), minYPoint[2].toFixed(2), "ndc", minYndc[0].toFixed(2), minYndc[1].toFixed(2), minYndc[2].toFixed(2));
+    // console.log("maxY",maxY, "xyz", maxYPoint[0].toFixed(2), maxYPoint[1].toFixed(2), maxYPoint[2].toFixed(2), "ndc", maxYndc[0].toFixed(2), maxYndc[1].toFixed(2), maxYndc[2].toFixed(2));
+    // console.log("right most point",  maxX.toFixed(2),"/", rightcanvas.toFixed(2),"=",scalerightX.toFixed(2), "left most point", minX.toFixed(2), "/", leftcanvas.toFixed(2),"=",scaleleftX.toFixed(2));
+  
+    // console.log("top most point", minY.toFixed(2),"/", topcanvas.toFixed(2),"=",scaleTopY.toFixed(2), "bottom most point", maxY.toFixed(2),"/", bottomcanvas.toFixed(2),"=", scaleBottomY.toFixed(2));
+    // console.log("cameraDistance", cameraDistance.toFixed(2),"scale", scale.toFixed(2));
   }
   // Function to resize the canvas and update WebGL viewport
   function resizeCanvas() {
@@ -178,6 +205,8 @@
         else points.push([pt[0], pt[1], pt[2]]);
       });
       const aspect = canvas.width / canvas.height;
+      //repeat 3 times
+      for (let i = 0; i < 50; i++) {
       const projectionMatrix = mat4.create();
       mat4.perspective(projectionMatrix, 60 * Math.PI / 180, aspect, 0.1, 500.0);
 
@@ -187,8 +216,8 @@
       mat4.rotate(modelViewMatrix, modelViewMatrix, cameraAngleX * Math.PI / 180, [1, 0, 0]);
       mat4.rotate(modelViewMatrix, modelViewMatrix, cameraAngleY * Math.PI / 180, [0, 1, 0]);
       mat4.translate(modelViewMatrix, modelViewMatrix, [cameraPanX, cameraPanY, 0]);
-
       zoomToFitScreen(points, modelViewMatrix, projectionMatrix, canvas);
+      }
     } else {
       console.log("No points to zoom to fit");
     }
@@ -948,12 +977,6 @@
         if (document.getElementById("unnormRadio").checked)
           //check if data_std[0] is an array
           if (Array.isArray(currentData.data_std[0])) {
-            // Per-point mean and std
-            // newpoint = [
-            //   pt[0] * currentData.data_std[i][0] + currentData.data_mean[i][0],
-            //   pt[1] * currentData.data_std[i][1] + currentData.data_mean[i][1],
-            //   pt[2] * currentData.data_std[i][2] + currentData.data_mean[i][2]]
-            // console.log(newpoint)
             gtArray.push(
               pt[0] * currentData.data_std[i][0] + currentData.data_mean[i][0],
               pt[1] * currentData.data_std[i][1] + currentData.data_mean[i][1],
