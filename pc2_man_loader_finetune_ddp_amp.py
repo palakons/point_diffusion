@@ -53,6 +53,87 @@ from pytorch3d.renderer.cameras import PerspectiveCameras
 from truckscenes import TruckScenes
 
 
+class BlobDataset(Dataset):
+    def __init__(self, M, N, device="cpu", is_scaled=False):
+        self.M = M
+        self.N = N
+        self.device = device
+        self.is_scaled = is_scaled
+        self.data_mean = torch.tensor([0,0,0], dtype=torch.float64)
+        self.data_std = torch.tensor([1,1,1], dtype=torch.float64)
+
+        self.data_bank = []
+        for i in range(M):
+            depth_image = torch.randn(  618, 618)
+            radar_data = torch.randn(N, 3)
+            camera_front = torch.randn(3, 618, 618)
+            # gernate random string of length 32
+            frame_token = "".join( 
+                random.choices(
+                    "abcdefghijklmnopqrstuvwxyz0123456789", k=32
+                )
+            )
+            npoints_original = radar_data.shape[0]
+            npoints_filtered = radar_data.shape[0]
+            cam_object = PerspectiveCameras(
+            focal_length=torch.tensor([[1.0, 1.0]]),
+            principal_point=torch.tensor([[0.0, 0.0]]),
+            R=torch.eye(3).unsqueeze(0),
+            T=torch.zeros(3).unsqueeze(0),
+            in_ndc=False,
+            image_size=[(618, 618)],
+        )
+            self.data_bank.append(
+                (
+                    depth_image,
+                    radar_data,
+                    cam_object,
+                    camera_front,
+                    frame_token,
+                    npoints_original,
+                    npoints_filtered
+                )
+            )
+
+        all_radar_positions = torch.stack(
+            [d[1] for d in self.data_bank], dim=0)
+        print("all_radar_positions", all_radar_positions.shape)  #1x 16 x3 
+
+        actual_data_mean = all_radar_positions.mean(axis=(0, 1))
+        asctual_data_std = all_radar_positions.std(axis=(0, 1))
+        print("actual_data_mean", actual_data_mean)
+        print("asctual_data_std", asctual_data_std)
+
+        self.data_mean = actual_data_mean
+        self.data_std = asctual_data_std
+
+    def __len__(self):
+        return self.M
+
+    def __getitem__(self, idx):
+        if not self.is_scaled:
+            return self.data_bank[idx]
+
+        (
+            depth_image,
+            filtered_radar_data,
+            cam_calib_obj,
+            camera_front,
+            frame_token,
+            npoints_original,
+            npoints_filtered
+        ) = self.data_bank[idx]
+
+        return (
+            depth_image,
+            (filtered_radar_data - self.data_mean) / self.data_std,
+            cam_calib_obj,
+            camera_front,
+            frame_token,
+            npoints_original,
+            npoints_filtered
+        )
+
 class MANDataset(Dataset):
     def __init__(
         self,
@@ -316,6 +397,11 @@ class MANDataset(Dataset):
             npoints_original,
             npoints_filtered
         ) = self.data_bank[idx]
+
+        # print("depth_image", depth_image.shape)
+        # print("filtered_radar_data", filtered_radar_data.shape)
+        # print("camera_front", camera_front.shape)
+        # exit()
 
         # print("mean", self.data_mean)
         # print("std", self.data_std)
@@ -843,7 +929,7 @@ class PointCloudLoss(nn.Module):
 
 def extract_batch(cfg: ProjectConfig, batch, device):
 
-    if cfg.dataset.type in ["man-mini", "man-full"]:
+    if cfg.dataset.type in ["man-mini", "man-full","blob"]:
 
         (
             depths,
@@ -903,10 +989,11 @@ def train_one_epoch(
         
         extract_time = time.time()
 
-        x_0 = pcpm.point_cloud_to_tensor(pc, normalize=True, scale=True)
+        x_0 = pcpm.point_cloud_to_tensor(pc, normalize=True, scale=True) # normalized point cloud directly from dataloader/dataset.getitem()
+        # print("x_0", x_0.shape)
 
         B, N, D = x_0.shape
-        noise = torch.randn_like(x_0)
+        noise = torch.randn_like(x_0)#a normal distribution with mean 0 and variance 1
         timesteps = torch.randint(
             0,
             scheduler.config.num_train_timesteps,
@@ -914,7 +1001,7 @@ def train_one_epoch(
             device=device,
             dtype=torch.long,
         )
-        x_t = scheduler.add_noise(x_0, noise, timesteps)  # noisy_x
+        x_t = scheduler.add_noise(x_0, noise, timesteps)  # noisy_x 
         # print("type x_t", type(x_t))
         # print("dtype x_t", x_t.dtype)
         
@@ -922,7 +1009,7 @@ def train_one_epoch(
 
         x_t_input = apply_conditioning_to_xt(
             cfg,
-            (x_t * data_std + data_mean) if cfg.dataset.is_scaled else x_t,
+            (x_t * data_std + data_mean) if cfg.dataset.is_scaled else x_t, # if the original point cloud is scaled (normalized), then unnormalize it os that projection is correct
             camera,
             image_rgb,
             depths,
@@ -930,9 +1017,10 @@ def train_one_epoch(
             timesteps,
             pcpm,
         )
+        # print("x_t_input", x_t_input.shape)
 
         condition_time = time.time()
-        if cfg.dataset.is_scaled:
+        if cfg.dataset.is_scaled: # if we unnormalized earlier, we need to scale back the first 3 dimensions
             # scale back the first 3 dimensions
             x_t_input[:, :, :3] = x_t[:, :, :3]
 
@@ -940,6 +1028,7 @@ def train_one_epoch(
 
         with autocast():
             noise_pred = model(x_t_input, timesteps)
+            # print("noise_pred", noise_pred.shape)
 
             # if not noise_pred.shape == noise.shape:
             #     raise ValueError(
@@ -967,10 +1056,10 @@ def train_one_epoch(
             pc, camera, image_rgb, mask, depths, idx, npoints,            npoints_filtered = extract_batch(
                 cfg, batch, device)
 
-            x_0 = pcpm.point_cloud_to_tensor(pc, normalize=True, scale=True)
+            x_0 = pcpm.point_cloud_to_tensor(pc, normalize=True, scale=True) # normalized point cloud directly from dataloader/dataset.getitem()
 
             B, N, D = x_0.shape
-            noise = torch.randn_like(x_0)
+            noise = torch.randn_like(x_0) #a normal distribution with mean 0 and variance 1
             timesteps = torch.randint(
                 0,
                 scheduler.config.num_train_timesteps,
@@ -982,9 +1071,10 @@ def train_one_epoch(
             # print("type x_t", type(x_t))
             # print("dtype x_t", x_t.dtype)
 
+
             x_t_input = apply_conditioning_to_xt(
                 cfg,
-                (x_t * data_std + data_mean) if cfg.dataset.is_scaled else x_t,
+                (x_t * data_std + data_mean) if cfg.dataset.is_scaled else x_t, # if the original point cloud is scaled (normalized), then unnormalize it os that projection is correct
                 camera,
                 image_rgb,
                 depths,
@@ -993,11 +1083,11 @@ def train_one_epoch(
                 pcpm,
             )
 
-            if cfg.dataset.is_scaled:
+            if cfg.dataset.is_scaled: # if we unnormalized earlier, we need to scale back the first 3 dimensions
                 # scale back the first 3 dimensions
                 x_t_input[:, :, :3] = x_t[:, :, :3]
 
-            noise_pred = model(x_t_input, timesteps)
+            noise_pred = model(x_t_input, timesteps) # point cloud input to the model is of normalized 
 
             if not noise_pred.shape == noise.shape:
                 raise ValueError(
@@ -2171,7 +2261,7 @@ def train(
                         {f"val/average": val_cd_emas["ave"][alpha]},
                         epoch,
                     )
-            if (epoch + 1) % cfg.run.checkpoint_freq == 0:
+            if cfg.run.checkpoint_freq>0 and  (epoch + 1) % cfg.run.checkpoint_freq == 0:
                 temp_epochs = cfg.run.max_steps
                 cfg.run.max_steps = epoch + 1
 
@@ -2218,7 +2308,7 @@ def train(
 
                 cfg.run.max_steps = temp_epochs
 
-        if True:  # save checkpoint
+        if cfg.run.checkpoint_freq>0:  # save checkpoint
             combined_train_losses, combined_train_cds = combine_loss_cd_history(
                 prev_train_losses, new_train_losses, prev_train_cds, new_train_cds)
             combined_val_losses, combined_val_cds = combine_loss_cd_history(
@@ -2836,7 +2926,65 @@ def get_checkpoint_fname_json(cfg: ProjectConfig, db_fname, CHECKPOINT_DIR):
 def get_dataset(cfg: ProjectConfig, device="cpu"):
     if cfg.dataset.type in ["man-mini", "man-full"]:
         return get_mandataset(cfg)
-    else:
+    elif cfg.dataset.type == 'blob':
+        print("blob dataset")
+        dataset = BlobDataset(
+            cfg.dataloader.num_scenes,
+            cfg.dataset.max_points,
+            device=device,
+            is_scaled=cfg.dataset.is_scaled,
+        )
+        print("dataset", dataset)
+        
+        indices = list(range(len(dataset)))
+        if cfg.dataset.subset_name == 'interleaved':
+            train_indices = indices[::4] + indices[1::4]
+            val_indices = indices[2::4]
+            test_indices = indices[3::4]
+        elif cfg.dataset.subset_name == 'random':
+            random.shuffle(indices)
+            train_indices = indices[:int(len(indices) * 0.5)]
+            val_indices = indices[int(len(indices) * 0.5):int(len(indices) * 0.75)]
+            test_indices = indices[int(len(indices) * 0.75):]
+        elif cfg.dataset.subset_name == 'block':
+            train_indices = indices[:int(len(indices) * 0.5)]
+            val_indices = indices[int(len(indices) * 0.5):int(len(indices) * 0.75)]
+            test_indices = indices[int(len(indices) * 0.75):]
+        else:
+            raise ValueError(
+                f"Unknown subset name: {cfg.dataset.subset_name}. Must be 'interleaved', 'random', or 'block'."
+            )
+        print("lens", len(train_indices), len(val_indices), len(test_indices))
+        
+        dataset_train = Subset(dataset, train_indices)
+        dataset_val = Subset(dataset, val_indices)
+        dataset_test = Subset(dataset, test_indices)
+        print("lens", len(dataset_train), len(dataset_val), len(dataset_test))
+        
+        dataloader_train, dataloader_val, dataloader_vis = (
+            DataLoader(
+                dataset_train,
+                batch_size=cfg.dataloader.batch_size,
+                num_workers=cfg.dataloader.num_workers,
+                collate_fn=custom_collate_fn_man,
+                shuffle=cfg.dataloader.shuffle,
+            ),
+            DataLoader(
+                dataset_val,
+                batch_size=cfg.dataloader.batch_size,
+                num_workers=cfg.dataloader.num_workers,
+                collate_fn=custom_collate_fn_man,
+                shuffle=cfg.dataloader.shuffle,
+            ),
+            DataLoader(
+                dataset_test,
+                batch_size=cfg.dataloader.batch_size,
+                num_workers=cfg.dataloader.num_workers,
+                collate_fn=custom_collate_fn_man,
+                shuffle=cfg.dataloader.shuffle,
+            ))
+        return dataloader_train, dataloader_val, dataloader_vis
+    else: 
         raise ValueError(
             f"dataset type {cfg.dataset.type} not supported"
         )

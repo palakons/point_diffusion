@@ -1,3 +1,5 @@
+import numpy as np
+import cv2
 import argparse
 from truckscenes import TruckScenes
 from model.mypvcnn import PVC2Model
@@ -315,6 +317,13 @@ def get_camera_conditioning(img_size, feature_model,  camera, frame_token, image
                 image_rgb[i:i + 1].float().to(device)).to(device)
             local_feature_cache[frame_tkn] = local_feature
         local_features.append(local_feature)
+        # distance_transform = compute_distance_transform(B=len(frame_token),
+        #                                                 img_size=img_size, device=device) #all zeros
+        # print("local_feature", local_feature.shape)
+        # print("local_feature", local_feature)
+        # print("distance_transform", distance_transform.shape)
+        # print("distance_transform", distance_transform)
+        # exit()
     local_features = torch.cat(local_features, dim=0).to(device)
     # print("local_features", local_features.shape)
     # local_features torch.Size([1, 384, 618, 618]) cpu
@@ -428,6 +437,18 @@ def get_camera_conditioning(img_size, feature_model,  camera, frame_token, image
     x_t_input = torch.cat(x_t_input, dim=2)  # (B, N, D)
 
     return x_t_input
+
+
+def compute_distance_transform(B, img_size, device):
+    mask = torch.ones((B, 1, img_size, img_size), device=device)
+    image_size = mask.shape[-1]
+    distance_transform = torch.stack([
+        torch.from_numpy(cv2.distanceTransform(
+            (1 - m), distanceType=cv2.DIST_L2, maskSize=cv2.DIST_MASK_3
+        ) / (image_size / 2))
+        for m in mask.squeeze(1).detach().cpu().numpy().astype(np.uint8)
+    ]).unsqueeze(1).clip(0, 1).to(device)
+    return distance_transform
 
 
 def main():
@@ -545,16 +566,21 @@ def main():
     # base_dir = "/home/palakons/logs/"  # singularity
     base_dir = args.base_dir
 
+    data_group = "mlp_man"
     run_name = f"{method}_{N:04d}_MAN_sc{M}_emb{pvcnn_embed_dim}_wm{pvcnn_width_multiplier}_vrm{pvcnn_voxel_resolution_multiplier}_ablate_mlp{'T' if ablate_pvcnn_mlp else 'F'}_cnn{'T' if ablate_pvcnn_cnn else 'F'}_flip{'T' if flip_images else 'F'}"
-    log_dir = f"{base_dir}tb_log/mlp_man/{run_name}"
+    log_dir = f"{base_dir}tb_log/{data_group}/{run_name}"
     dir_rev = 0
     while os.path.exists(log_dir):
         dir_rev += 1
-        log_dir = f"{base_dir}tb_log/mlp_man/{run_name}_r{dir_rev:02d}"
+        log_dir = f"{base_dir}tb_log/{data_group}/{run_name}_r{dir_rev:02d}"
     if dir_rev > 0:
         run_name += f"_r{dir_rev:02d}"
         print("run_name", run_name)
-    assert M <= 8, f"Support M<=8, now {M}"
+    assert M <= n_pull-n_val, f"n_pull {n_pull} should be greater than M {M} + n_val {n_val}"
+    with open(os.path.abspath(__file__), 'r') as f:
+        code = f.read()
+
+
 
     exp_config = {
         "M": M,
@@ -587,7 +613,8 @@ def main():
         "gpu": torch.cuda.get_device_name(0),
         # utc time
         "timestamp_utc": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-
+        #also have a copy of this code
+        "code": code,
     }
     print("exp_config", exp_config)
 
@@ -779,7 +806,7 @@ def main():
                     # print("cd", cd.item())
                     # print("frame_tkn", frame_tkn)
 
-                    path = f"{base_dir}/plots/mlp_man/{run_name}/sample_ep_{i_epoch:06d}_gt0_train-idx-{frame_tkn[:3]}.json"
+                    path = f"{base_dir}/plots/{data_group}/{run_name}/sample_ep_{i_epoch:06d}_gt0_train-idx-{frame_tkn[:3]}.json"
                     save_sample_json(path, epoch, x_0_data, xts,
                                      steps,  cd=cd.item(), data_mean=data_mean, data_std=data_std, config=exp_config)
                     # writer.add_scalar(
@@ -826,7 +853,7 @@ def main():
                     # print("cd", cd.item())
                     # print("frame_tkn", frame_tkn)
 
-                    path = f"{base_dir}/plots/mlp_man/basic_{method}_{N:04d}_MAN_1m_pvcnn_emb{pvcnn_embed_dim}/sample_ep_{i_epoch:06d}_gt0_val-idx-{frame_tkn[:3]}.json"
+                    path = f"{base_dir}/plots/{data_group}/basic_{method}_{N:04d}_MAN_1m_pvcnn_emb{pvcnn_embed_dim}/sample_ep_{i_epoch:06d}_gt0_val-idx-{frame_tkn[:3]}.json"
                     save_sample_json(path, epoch, x_0_data, xts,
                                      steps,  cd=cd.item(), data_mean=data_mean, data_std=data_std, config=exp_config)
                     # writer.add_scalar(
