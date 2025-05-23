@@ -128,8 +128,8 @@ def sample(feature_model, model, scheduler, T, B, N, D, gt_normed, device, data_
             # print("x_t", x_t.shape)
             # x_t torch.Size([1, 4, 3])
 
-            x_t_cond = get_camera_conditioning(
-            # x_t_cond = flattened_conditioning(
+            # x_t_cond = get_camera_conditioning(
+            x_t_cond = flattened_conditioning(
                 img_size,
                                                feature_model, camera, frame_token, image_rgb, x_t, device=device, raster_point_radius=0.0075, raster_points_per_pixel=1, bin_size=0, scale_factor=1.0,stat_factor =stat_factor)
 
@@ -305,20 +305,20 @@ def flattened_conditioning(img_size, feature_model,  camera, frame_token, image_
         else:
             local_feature = feature_model(
                 image_rgb[i:i + 1].float().to(device), return_upscaled_features=False).to(device)
-            print("local_feature", local_feature.shape) #1, 384, 38, 38
+            # print("local_feature", local_feature.shape) #1, 384, 38, 38
                 
             local_feature_cache[frame_tkn] = local_feature
             # print("saved local_feature_cache", frame_tkn, local_feature.shape)
 
         local_features.append(local_feature)
     local_features = torch.cat(local_features, dim=0).to(device)
-    print("local_features", local_features.shape) #2, 384, 38, 38
+    # print("local_features", local_features.shape) #2, 384, 38, 38
     flattened_feature = local_features.reshape(local_features.shape[0], -1) 
     #expand to [B,N,384*38*38]'
-    print("flattened_feature", flattened_feature.shape) #2, 384*38*38
+    # print("flattened_feature", flattened_feature.shape) #2, 384*38*38
     flattened_feature = flattened_feature.unsqueeze(1).expand(normed_points.shape[0], normed_points.shape[1], -1)
-    print("flattened_feature", flattened_feature.shape) #2, 4, 384*38*38
-    exit()
+    # print("flattened_feature", flattened_feature.shape) #2, 4, 384*38*38
+    return flattened_feature
 
 def get_camera_conditioning(img_size, feature_model,  camera, frame_token, image_rgb, normed_points, device, raster_point_radius: float = 0.0075, raster_points_per_pixel: int = 1, bin_size: int = 0, scale_factor: float = 1.0, point_mean=torch.tensor([0, 0, 0]), point_std=torch.tensor([1, 1, 1]),stat_factor=0):
     """
@@ -503,8 +503,8 @@ def compute_distance_transform(B, img_size, device):
     ]).unsqueeze(1).clip(0, 1).to(device)
     return distance_transform
 
-def get_argparse():
 
+def main():
     parser = argparse.ArgumentParser()
 
     # Adding optional argument
@@ -562,13 +562,7 @@ def get_argparse():
                         help="Number of timesteps for DDPM")
     parser.add_argument("-statf", "--stat_factor", type=float, default=0.0,
     help="Statistical factor for conditioning: 0 means no scaling, 1 means full scaling to 0-mean and 1-std, channel-wise")
-    parser.add_argument("-pv_drop", "--pvcnn_dropout", type=float, default=0.1,
-                        help="Dropout rate for PVCNN")
     args = parser.parse_args()
-    return args
-
-def main():
-    args = get_argparse()
 
     with open(os.path.abspath(__file__), 'r') as f:
         code = f.read()
@@ -586,7 +580,8 @@ def main():
     epochs = args.epochs
     # pc2_conditioning_dim = 64
     pc2_conditioning_dim = args.pc2_conditioning_dim
-    vits_dim = 384
+    vits_dim = 384*(618//16)*(618//16)  # 384*618//16*618//16
+
 
     # pvcnn_embed_dim = 64
     pvcnn_embed_dim = args.pvcnn_embed_dim
@@ -630,7 +625,6 @@ def main():
     # base_dir = "/home/palakons/logs/"  # singularity
     base_dir = args.base_dir
     stat_factor = args.stat_factor
-    pvcnn_dropout = args.pvcnn_dropout
 
     data_group = "pc2_man"
     run_name = f"{method}_{N:04d}_sc{M}-b{B}-p{n_pull}"
@@ -676,7 +670,6 @@ def main():
         # utc time
         "timestamp_utc": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
         "stat_factor": stat_factor,
-        "pvcnn_dropout": pvcnn_dropout,
     }
     # not dispaly "code" in the config
     print("exp_config", exp_config)
@@ -695,7 +688,7 @@ def main():
         in_channels=D + vits_dim,
         out_channels=D,
         embed_dim=pvcnn_embed_dim,
-        dropout=pvcnn_dropout, #maybe turn off dropout for single 
+        dropout=0.1,
         width_multiplier=pvcnn_width_multiplier,
         voxel_resolution_multiplier=pvcnn_voxel_resolution_multiplier,
         ablate_pvcnn_mlp=ablate_pvcnn_mlp,
@@ -754,8 +747,8 @@ def main():
             t = torch.randint(0, T, (B,), device=device) #uniform
             x_t_data = scheduler.add_noise(x_0_data, noise, t)
             add_noise_time = time.time()
-            x_t_cond = get_camera_conditioning(
-            # x_t_cond = flattened_conditioning(
+            # x_t_cond = get_camera_conditioning(
+            x_t_cond = flattened_conditioning(
                 img_size,
                 feature_model, camera, frame_token, image_rgb, x_t_data,  device=device, raster_point_radius=0.0075, raster_points_per_pixel=1, bin_size=0, scale_factor=1.0, point_mean=data_mean.to(device).float(), point_std=data_std.to(device).float(), stat_factor=stat_factor)
             # print("x_t", x_t.shape)  # x_t torch.Size([1, 4, 387]) 3+384
@@ -820,8 +813,8 @@ def main():
 
                 x_t_data = scheduler.add_noise(x_0_data, noise, t)
 
-                x_t_cond = get_camera_conditioning(
-                # x_t_cond = flattened_conditioning(
+                # x_t_cond = get_camera_conditioning(
+                x_t_cond = flattened_conditioning(
                     img_size,
                     feature_model, camera, frame_token, image_rgb, x_t_data, device=device, raster_point_radius=0.0075, raster_points_per_pixel=1, bin_size=0, scale_factor=1.0,stat_factor=stat_factor)
 

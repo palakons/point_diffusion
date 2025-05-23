@@ -17,6 +17,8 @@ from datetime import datetime
 # from model.point_cloud_model import PointCloudModel
 from man_dataset import MANDataset, custom_collate_fn_man
 from torch.utils.data import Dataset, DataLoader, Subset
+from matplotlib import pyplot as plt
+import numpy as np
 
 
 def get_man_data(M, N, camera_ch, radar_ch, device, img_size, batch_size, shuffle, n_val=2,n_pull=10):
@@ -195,8 +197,8 @@ def get_sinusoidal_embedding(timesteps, embedding_dim, device):
 
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    M = 1
-    B, N, D = 1, 128, 3  # 128, 3  # upto 800 points
+    M = 4
+    B, N, D = 2, 128, 3  # 128, 3  # upto 800 points
     lr = 1e-4
     epochs = 300_001
     pvcnn_embed_dim = 64
@@ -205,9 +207,9 @@ def main():
     ablate_pvcnn_mlp = False
     ablate_pvcnn_cnn = False
 
-    n_val = 1
+    n_val = 2
     n_pull = 10
-    method = "4_5_pvcnn_cond_singleten"
+    method = "4_5_pvcnn_cond_m4b4_notnormed_cond"
 
     T = 100
     pc2_conditioning_dim = 64
@@ -218,7 +220,8 @@ def main():
     seed_value = 42
     # base_dir = "/ist-nas/users/palakonk/singularity_logs/"
     base_dir = "/home/palakons/logs/"  # singularity
-    run_name = f"{method}_{N:04d}_MAN_sc{M}_emb{pvcnn_embed_dim}_wm{pvcnn_width_multiplier}_vrm{pvcnn_voxel_resolution_multiplier}_ablate_mlp{'T' if ablate_pvcnn_mlp else 'F'}_cnn{'T' if ablate_pvcnn_cnn else 'F'}"
+    # run_name = f"{method}_{N:04d}_MAN_sc{M}_emb{pvcnn_embed_dim}_wm{pvcnn_width_multiplier}_vrm{pvcnn_voxel_resolution_multiplier}_ablate_mlp{'T' if ablate_pvcnn_mlp else 'F'}_cnn{'T' if ablate_pvcnn_cnn else 'F'}"
+    run_name = f"{method}_{N:04d}_MAN_sc{M}"
     log_dir = f"{base_dir}tb_log/mlp_man/{run_name}"
     assert M<=8, f"Support M<=8, now {M}"
 
@@ -258,8 +261,23 @@ def main():
     print("data_std", data_std.tolist())
 
     all_cond_signal = get_sinusoidal_embedding(torch.tensor(
-        range(M+n_val), device=device), pc2_conditioning_dim, device=device)
-    # print("all_cond_signal", all_cond_signal.shape)
+        range(M+n_val), device=device) , pc2_conditioning_dim, device=device)
+    if False:
+        fname = "/home/palakons/from_scratch/encoding.png"
+        print("all_cond_signal", all_cond_signal)
+        
+        #make subplots
+        plt.figure(figsize=(10, 5))
+        plt.subplot(1, 2, 1)
+        plt.imshow(all_cond_signal.cpu().numpy())
+        plt.colorbar()
+
+        plt.subplot(1, 2, 2)
+        plt.imshow(np.log(all_cond_signal.cpu()))
+        plt.title("Conditioning signal")
+        plt.savefig(fname)
+        exit()
+        # print("all_cond_signal", all_cond_signal.shape)
 
     model = PVC2Model(
         in_channels=D + pc2_conditioning_dim,
@@ -332,7 +350,8 @@ def main():
             noise = torch.randn_like(x_0_data)
             x_t = scheduler.add_noise(x_0_data, noise, t)
             x_t = torch.cat(
-                [x_t, x_0_cond_norm], dim=-1)
+                # [x_t, x_0_cond_norm], dim=-1)
+                [x_t, x_0_cond], dim=-1)
             pred_noise = model(x_t, t)
             loss = F.mse_loss(pred_noise, noise)
             sum_loss += loss.item() * B
@@ -387,7 +406,8 @@ def main():
                 x_t = scheduler.add_noise(x_0_data, noise, t)
 
                 x_t = torch.cat(
-                    [x_t, x_0_cond_norm], dim=-1)
+                    # [x_t, x_0_cond_norm], dim=-1)
+                    [x_t, x_0_cond], dim=-1)
 
                 pred_noise = model(x_t, t)
                 loss = F.mse_loss(pred_noise, noise)
@@ -426,7 +446,8 @@ def main():
                 x_0_cond_normed = (x_0_cond - cond_mean) / cond_std
 
                 xts_tensor_list, steps, cd_loss = sample(
-                    model.eval(), scheduler, T, B, N, D, x_0_data, device, data_mean=data_mean, data_std=data_std, x_0_cond_normed=x_0_cond_normed)
+                    model.eval(), scheduler, T, B, N, D, x_0_data, device, data_mean=data_mean, data_std=data_std, x_0_cond_normed=x_0_cond)
+                    # model.eval(), scheduler, T, B, N, D, x_0_data, device, data_mean=data_mean, data_std=data_std, x_0_cond_normed=x_0_cond_normed)
 
                 sum_train_cd += cd_loss.sum().item()
                 # print("len(xts_tensor_list)", len(xts_tensor_list))
@@ -482,7 +503,8 @@ def main():
                 x_0_cond_normed = (x_0_cond - cond_mean) / cond_std
 
                 xts_tensor_list, steps, cd_loss = sample(
-                    model.eval(), scheduler, T, B, N, D, x_0_data, device, data_mean=data_mean, data_std=data_std, x_0_cond_normed=x_0_cond_normed)
+                    model.eval(), scheduler, T, B, N, D, x_0_data, device, data_mean=data_mean, data_std=data_std, x_0_cond_normed=x_0_cond)
+                    # model.eval(), scheduler, T, B, N, D, x_0_data, device, data_mean=data_mean, data_std=data_std, x_0_cond_normed=x_0_cond_normed)
 
                 sum_val_cd += cd_loss.sum().item()
                 # print("len(xts_tensor_list)", len(xts_tensor_list))
