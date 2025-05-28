@@ -5,7 +5,12 @@ import os
 app = Flask(__name__)
 CORS(app)  # Enable CORS for all routes
 
-BASE_DIR = "/ist-nas/users/palakonk/singularity_logs/plots/fit_man_1_frame_fast"
+BASE_DIR = "/ist-nas/users/palakonk/singularity_logs/plots/fit_man_1_frame_test_loop"
+BASE_DIR = "/ist-nas/users/palakonk/singularity_logs/plots/mlp_blob"
+
+BASE_DIR = "/ist-nas/users/palakonk/singularity_logs/plots/mlp_man"
+BASE_DIR = "/ist-nas/users/palakonk/singularity_logs/plots/pc2_man"
+
 
 def safe_join(base, *paths):
     # Prevent directory traversal attacks.
@@ -13,6 +18,7 @@ def safe_join(base, *paths):
     if os.path.commonpath([final_path, base]) != os.path.abspath(base):
         abort(404)
     return final_path
+
 
 @app.route('/', defaults={'req_path': ''})
 @app.route('/<path:req_path>')
@@ -46,5 +52,6 @@ def dir_listing(req_path):
         # If path doesn't exist, return 404.
         abort(404)
 
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", debug=True, port=5000)
+    app.run(host="0.0.0.0", debug=True,)

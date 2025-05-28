@@ -6,7 +6,7 @@ from model.mypvcnn import PVC2Model
 from contextlib import nullcontext
 import open3d as o3d
 from torch.utils.tensorboard import SummaryWriter
-from tqdm import trange
+from tqdm import trange, tqdm
 from pytorch3d.loss.chamfer import chamfer_distance
 from model.feature_model_finetune import FeatureModel
 from pytorch3d.renderer import PointsRasterizationSettings, PointsRasterizer
@@ -27,9 +27,52 @@ from torch.utils.data import Dataset, DataLoader, Subset
 import matplotlib.pyplot as plt
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 import time
+from model.pvcnn.modules.pvconv import PVConv
+from mymdm import MDM
 
 local_feature_cache = {}
 
+
+class SinusoidalTimestepEmbed(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, timesteps):
+        half_dim = self.dim // 2
+        emb = math.log(10000.0) / (half_dim - 1)
+        emb = torch.exp(torch.arange(half_dim, device=timesteps.device) * -emb)
+        emb = timesteps.float().unsqueeze(1) * emb.unsqueeze(0)
+        return torch.cat([torch.sin(emb), torch.cos(emb)], dim=1) # T x dim
+
+
+class SimpleDenoiser(nn.Module):
+    def __init__(self, input_dim=3, output_dim=3, time_embed_dim=64, model_layers=[]):
+        super().__init__()
+        self.time_mlp = nn.Sequential(
+            SinusoidalTimestepEmbed(time_embed_dim),
+            nn.Linear(time_embed_dim, 128),
+            nn.ReLU()
+        )
+
+        self.net = nn.Sequential()
+        for i, dim in enumerate(model_layers):
+            if i == 0:
+                self.net.append(nn.Linear(input_dim + 128, dim))
+            else:
+                self.net.append(nn.Linear(model_layers[i - 1], dim))
+            self.net.append(nn.ReLU())
+        self.net.append(nn.Linear(model_layers[-1], output_dim))
+        print("SimpleDenoiser input_dim", input_dim)
+        print("SimpleDenoiser model_layers", model_layers)
+        print("SimpleDenoiser output_dim", output_dim)
+
+    def forward(self, x_t, t):
+        t_embed = self.time_mlp(t)  # (B, 128)
+        #expand to [B,N,128]
+        t_embed = t_embed.unsqueeze(1).expand(x_t.shape[0], x_t.shape[1], -1)
+        x = torch.cat([x_t, t_embed], dim=-1)
+        return self.net(x)
 
 def get_man_data(M, N, camera_ch, radar_ch, device, img_size, batch_size, shuffle, n_val=2, n_pull=10, flip_images=False):
     dataset = MANDataset(
@@ -162,7 +205,7 @@ def save_checkpoint(model, optimizer,
         base_dir, "checkpoints_man")
     proc_id = os.getpid()
     checkpoint_fname = os.path.join(
-        checkpint_dir, f"cp_{datetime.now().strftime(f'%Y-%m-%d-%H-%M-%S')}-{run_name.replace('/', '_') }_host{os.uname().nodename}_proc{proc_id}.pth")
+        checkpint_dir, f"cp_{datetime.utcnow().strftime(f'%Y-%m-%d-%H-%M-%S')}-{run_name.replace('/', '_') }_host{os.uname().nodename}_proc{proc_id}.pth")
     db_fname = os.path.join(
         base_dir, 'checkpoints_man', 'db.txt')
 
@@ -200,6 +243,22 @@ def get_sinusoidal_embedding(timesteps, embedding_dim, device):
     emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
     return emb
 
+def get_timestep_embedding(embed_dim, timesteps, device):
+    """
+    Timestep embedding function. Not that this should work just as well for 
+    continuous values as for discrete values.
+    """
+    assert len(timesteps.shape) == 1  # and timesteps.dtype == tf.int32
+    half_dim = embed_dim // 2
+    emb = np.log(10000) / (half_dim - 1)
+    emb = torch.from_numpy(
+        np.exp(np.arange(0, half_dim) * -emb)).float().to(device)
+    emb = timesteps[:, None] * emb[None, :]
+    emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
+    if embed_dim % 2 == 1:  # zero pad
+        emb = nn.functional.pad(emb, (0, 1), "constant", 0)
+    assert emb.shape == torch.Size([timesteps.shape[0], embed_dim])
+    return emb
 
 def plot_image_depth_projected(
     gt,
@@ -534,7 +593,7 @@ def get_argparse():
     parser.add_argument("-vits_checkpoint", "--vits_checkpoint", type=str, default=None,
                         help="Path to VITS checkpoint")
     parser.add_argument("-flip", "--flip_images", action='store_true',
-                        help="Flip images or not", default=True)
+                        help="Flip images or not", default=True) #problem, if we dont wanna flip images
     parser.add_argument("-img_size", "--img_size", type=int, default=618,
                         help="Image size for VITS model")
     parser.add_argument("-radar_ch", "--radar_channel", type=str, default="RADAR_LEFT_FRONT",
@@ -563,15 +622,40 @@ def get_argparse():
                         help="Data group where tensorboard and plots are saved")
     parser.add_argument("-model", "--model_name", type=str, default="pvcnn",
                         help="Model name for the experiment")
+    parser.add_argument("-noise_img", "--noise_image", action='store_true', default=False,
+                        help="Use noise image for conditioning")
+    #stackedpvcnnn kernel size 3,
+    parser.add_argument("-pvc_kernel", "--pvcnn_kernel_size", type=int, default=3,
+                        help="Kernel size for PVCNN convolution layers")
+    # pvc_attention
+    parser.add_argument("-pvc_att", "--pvcnn_attention", action='store_true', default=False,
+                        help="Use attention in PVCNN")
+    #with_se
+    parser.add_argument("-pvc_se", "--pvcnn_se", action='store_true', default=False,
+                        help="Use Squeeze-and-Excitation in PVCNN")
+    #with_se_relu
+    parser.add_argument("-pvc_se_relu", "--pvcnn_se_relu", action='store_true', default=False,  
+                        help="Use ReLU activation in Squeeze-and-Excitation in PVCNN")
+    #normalize
+    parser.add_argument("-pvc_norm", "--pvcnn_normalize", action='store_true', default=False,
+                        help="Use normalization in PVCNN")  
+    #eps
+    parser.add_argument("-pvc_eps", "--pvcnn_eps", type=float, default=0,
+                        help="Epsilon value for normalization in PVCNN")
+    #num_blocks 
+    parser.add_argument("-pvc_blocks", "--pvcnn_num_blocks", type=int, default=2,
+                        help="Number of blocks in PVCNN")
+            
     args = parser.parse_args()
     return args
 
 
 def get_conditioning(args, device, id_list, all_cond_signal, x_t_data, feature_model,  camera, frame_token, image_rgb,   raster_point_radius: float = 0.0075, raster_points_per_pixel: int = 1, bin_size: int = 0, scale_factor: float = 1.0, point_mean=torch.tensor([0, 0, 0]), point_std=torch.tensor([1, 1, 1])):
     if args.cond_type == "camera":
+        image_to_be_conditioned =  torch.randn_like(image_rgb, device=device) if args.noise_image else image_rgb
         return get_camera_conditioning(
             args.img_size,
-            feature_model, camera, frame_token, image_rgb, x_t_data,  device=device, raster_point_radius=raster_point_radius, raster_points_per_pixel=raster_points_per_pixel, bin_size=bin_size, scale_factor=scale_factor, point_mean=point_mean, point_std=point_std, stat_factor=args.stat_factor)
+            feature_model, camera, frame_token, image_to_be_conditioned, x_t_data,  device=device, raster_point_radius=raster_point_radius, raster_points_per_pixel=raster_points_per_pixel, bin_size=bin_size, scale_factor=scale_factor, point_mean=point_mean, point_std=point_std, stat_factor=args.stat_factor)
     if args.cond_type == "zero":
         return torch.zeros((x_t_data.shape[0], x_t_data.shape[1], args.pc2_conditioning_dim)).to(device)
     if args.cond_type == "id":
@@ -676,7 +760,63 @@ def sample_cd_save(args, model, scheduler, dataloader, save_key, feature_model, 
             if frame_tkn not in cd_list:
                 cd_list[frame_tkn] = []
             cd_list[frame_tkn].append(cd.item())
-    return sum_cd / len(dataloader.dataset), cd_list
+    cd_ave=sum_cd / len(dataloader.dataset)
+    writer.add_scalars(
+                f"CD", {f"{save_key}/average": cd_ave}, epoch)
+    return cd_ave, cd_list
+
+
+class StackedPVConvModel(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=3, resolution=32, num_blocks=2, 
+    num_classes=3,attention=False,
+                 dropout=0.0, with_se=True, with_se_relu=True, normalize=True, eps=0,
+                 ablate_pvcnn_mlp: bool = False,
+                 ablate_pvcnn_cnn: bool = False):
+        """ with_se=True for pc2 paper
+        with_se_relu=True for pvcnn paper
+        normalize=True for pvcnn paper
+        eps=0 for numerical stability,per pc2 paper
+        kernel_size=3 for pvcnn paper
+        """
+        super().__init__()
+        layers = []
+        for i in range(num_blocks):
+            layers.append(PVConv(
+                in_channels if i == 0 else out_channels,
+                out_channels,
+                kernel_size,
+                resolution,
+                dropout=dropout,
+                attention=attention,
+                with_se=with_se,
+                with_se_relu=with_se_relu,
+                normalize=normalize,
+                eps=eps,
+                ablate_pvcnn_mlp=ablate_pvcnn_mlp,
+                ablate_pvcnn_cnn=ablate_pvcnn_cnn
+            ))
+        self.blocks = nn.ModuleList(layers)
+        self.out_proj = nn.Linear(out_channels, num_classes)  # Optional: final linear
+        self.embed_dim =128
+        print("stacked PVC", 
+              f"in_channels={in_channels}, out_channels={out_channels}, kernel_size={kernel_size}, resolution={resolution}, num_blocks={num_blocks}, num_classes={num_classes}, attention={attention}, dropout={dropout}, with_se={with_se}, with_se_relu={with_se_relu}, normalize={normalize}, eps={eps}, ablate_pvcnn_mlp={ablate_pvcnn_mlp}, ablate_pvcnn_cnn={ablate_pvcnn_cnn}")
+
+    def forward(self, inputs: torch.Tensor, t: torch.Tensor):
+        """ Receives input of shape (B, N, in_channels) and returns output
+            of shape (B, N, out_channels) """
+        inputs=inputs.transpose(1, 2)
+        t_emb = get_timestep_embedding(
+            self.embed_dim, t, inputs.device).float()
+
+        t_emb = t_emb[:, :, None].expand(-1, -1, inputs.shape[-1])
+        coords = inputs[:, :3, :].contiguous()  # (B, 3, N)
+        x = inputs  # (B, 3 + S, N)
+
+        for block in self.blocks:
+            x, coords, temb = block((x, coords, t_emb))
+        # print("x", x.shape)
+        x = self.out_proj(x.transpose(1, 2))
+        return x # (B, N, num_classes)
 
 def get_model(args,D, device):
 
@@ -693,7 +833,7 @@ def get_model(args,D, device):
 
     if args.model_name == "pvcnn":
         return  PVC2Model(
-            in_channels=D,
+            in_channels=D+cond_dim,
             out_channels=D,
             embed_dim=args.pvcnn_embed_dim,
             dropout=args.pvcnn_dropout,
@@ -701,10 +841,88 @@ def get_model(args,D, device):
             voxel_resolution_multiplier=args.pvcnn_voxel_resolution_multiplier,
             ablate_pvcnn_mlp=args.ablate_pvcnn_mlp,
             ablate_pvcnn_cnn=args.ablate_pvcnn_cnn,
-            cond_dim=cond_dim
+            natural_cond_dim=args.pc2_conditioning_dim
         ).to(device)
+    elif args.model_name == "mlp2048":
+        mlp_layers = [2048, 1024]
+        return SimpleDenoiser(input_dim=D+cond_dim, output_dim= D,
+                           time_embed_dim=args.pc2_conditioning_dim, model_layers=mlp_layers).to(device)
+    elif args.model_name == "stacked_pvcnn":
+        out_channels, num_blocks,voxel_resolution=32,args.pvcnn_num_blocks,32
+        return StackedPVConvModel(
+            in_channels=D+cond_dim,
+            out_channels=int(out_channels*args.pvcnn_width_multiplier),
+            kernel_size=args.pvcnn_kernel_size,
+            resolution=int(voxel_resolution*args.pvcnn_voxel_resolution_multiplier),
+            num_blocks=num_blocks,
+            num_classes=D,
+            dropout=args.pvcnn_dropout,
+            attention=args.pvcnn_attention, #fasle for pc2 paper
+            with_se=args.pvcnn_se, #True,  # pc2 paper
+            with_se_relu=args.pvcnn_se_relu, #True,  # pvcnn paper
+            normalize=args.pvcnn_normalize, #True,  # pvcnn paper
+            eps=args.pvcnn_eps,  #0, numerical stability, per pc2 paper
+            ablate_pvcnn_mlp=args.ablate_pvcnn_mlp,
+            ablate_pvcnn_cnn=args.ablate_pvcnn_cnn
+        ).to(device)
+
+    elif args.model_name == "mdm":
+        #import MDM /ist-nas/users/palakonk/singularity/home/palakons/from_scratch/truckscenes-devkit/mydev/guided_diffusion/models/mdm.py
+        print("Using MDMModel with cond_dim", cond_dim)
+
+        # max_pc_len=128, 
+        # in_channels=3, 
+        # out_channels=3,
+        # num_heads=6, 
+        # ff_size=2048,
+        # model_channels=512,
+        # num_layers=3,
+        # condition_dim=2,
+        # dropout=0.1,
+        return MDM(
+            in_channels=D,
+            out_channels=D,
+            num_heads=8,
+            ff_size=2048,
+            model_channels=512,
+            num_layers=6,
+            condition_dim=cond_dim,
+            dropout=args.pvcnn_dropout
+        ).to(device)
+
+            
     else:
         raise ValueError(f"Unknown model {args.model_name}")
+
+def match_args(args, ckp_config,except_keys=["epochs", "method", "base_dir", "vis_freq", "data_group"]):
+    """Check if the args match the checkpoint config"""
+    for key, value in args.items():
+        if key in except_keys:
+            continue
+        if key == "noise_image" and key not in ckp_config and value is False:
+            continue
+        if key not in ckp_config or ckp_config[key] != value:
+            return False
+    return True
+
+def get_checkpoint_fname(args, db_fname):
+    assert  os.path.exists(db_fname), f"Database file {db_fname} does not exist. Please run the database script first."
+    with open(db_fname, "r") as f:
+        # extract all lines to a list
+        lines = f.readlines()
+        f_candidate=None
+        candinate_epoch = -1
+        for line in tqdm(lines):
+            ckp = json.loads(line)
+
+            if  os.path.exists(ckp["fname"]) and "configs" in ckp["config"] :
+
+                if match_args(args.__dict__, ckp["config"]["configs"]) and candinate_epoch < ckp["config"]["configs"]["epochs"] <= args.epochs:
+                    f_candidate= ckp["fname"]
+                    candinate_epoch = ckp["config"]["configs"]["epochs"]
+                    print("Found candidate checkpoint", f_candidate, "for epoch", candinate_epoch)
+        return f_candidate
+
 
 def main():
     args = get_argparse()
@@ -713,71 +931,12 @@ def main():
         code = f.read()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     D = 3
-    # lr = 1e-4
-    # lr = args.learning_rate
-    # # epochs = 300_001
-    # epochs = args.epochs
-    # # pc2_conditioning_dim = 64
-    # pc2_conditioning_dim = args.pc2_conditioning_dim
-
-    # vits_proj_dim if 0, not projecting
-
-    # else vits_proj_dim is the original dim to be projected to args.pc2_conditioning_dim
-
-    # from conditioning, we have vits_proj_dim dimension, the model accepts args.pc2_conditioning_dim dimension
-
-
-    # pvcnn_embed_dim = 64
-    # pvcnn_embed_dim = args.pvcnn_embed_dim
-    # # pvcnn_width_multiplier = 1  # 2,4,3
-    # pvcnn_width_multiplier = args.pvcnn_width_multiplier
-    # # pvcnn_voxel_resolution_multiplier = 1  # 0.5,2,4
-    # pvcnn_voxel_resolution_multiplier = args.pvcnn_voxel_resolution_multiplier
-    # # ablate_pvcnn_mlp = False
-    # ablate_pvcnn_mlp = args.ablate_pvcnn_mlp
-    # # ablate_pvcnn_cnn = False
-    # ablate_pvcnn_cnn = args.ablate_pvcnn_cnn
-    # # vits_model = "vit_small_patch16_224_msn"
-    # vits_model = args.vits_model
-    # # finetune_vits = False
-    # finetune_vits = args.finetune_vits
-    # # vits_checkpoint = None
-    # vits_checkpoint = args.vits_checkpoint
-    # # flip_images = True
-    # flip_images = args.flip_images
-
-    # # n_val = 1
-    # n_val = args.n_val
-    # # n_pull = 1
-    # n_pull = args.n_pull
-    # # method = "6_pvcnn_camcond_reduce64_test_time"
-    # method = args.method
-
-    # # T = 100
-    # T = args.T
-    # # vis_freq = 1000
-    # vis_freq = args.vis_freq
-    # # radar_ch = "RADAR_LEFT_FRONT"
-    # radar_ch = args.radar_channel
-    # # camera_ch = "CAMERA_RIGHT_FRONT"
-    # camera_ch = args.camera_channel
-    # # img_size = 618  # 943#
-    # img_size = args.img_size
-    # # seed_value = 42
-    # seed_value = args.seed_value
-    # # base_dir = "/ist-nas/users/palakonk/singularity_logs/"
-    # # base_dir = "/home/palakons/logs/"  # singularity
-    # base_dir = args.base_dir
-    # stat_factor = args.stat_factor
-    # pvcnn_dropout = args.pvcnn_dropout
-
-    # data_group = "pc2_man"
     run_name = f"{args.method}_{args.num_points:04d}_sc{args.num_scenes}-b{args.batch_size }-p{args.n_pull}"
-    log_dir = f"{args.base_dir}tb_log/{args.data_group}/{run_name}"
+    log_dir = f"{args.base_dir}/tb_log/{args.data_group}/{run_name}"
     dir_rev = 0
     while os.path.exists(log_dir):
         dir_rev += 1
-        log_dir = f"{args.base_dir}tb_log/{args.data_group}/{run_name}_r{dir_rev:02d}"
+        log_dir = f"{args.base_dir}/tb_log/{args.data_group}/{run_name}_r{dir_rev:02d}"
     if dir_rev > 0:
         run_name += f"_r{dir_rev:02d}"
         print("run_name", run_name)
@@ -788,7 +947,7 @@ def main():
         "hostname": os.uname().nodename,
         "gpu": torch.cuda.get_device_name(0),
         # utc time
-        "timestamp_utc": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+        "timestamp_utc": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"), #start time
         "device": str(device),
     }
     # not dispaly "code" in the config
@@ -818,12 +977,33 @@ def main():
                               )
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
-    tt = trange(args.epochs)
     train_cd_list = {}
     val_cd_list = {}
     cd_epochs = []
     train_loss_list = []
     val_loss_list = []
+    start_epoch = 0
+
+    # Load checkpoint if exists
+    db_fname = f"{args.base_dir}/checkpoints_man/db.txt"
+    ckp_fname = get_checkpoint_fname(args, db_fname)
+    if ckp_fname is not None:
+        fname = os.path.basename(ckp_fname)
+        print("Loading checkpoint from", fname)
+        ckp = torch.load(ckp_fname, map_location=device)
+
+        start_epoch = ckp["epoch"]
+        model.load_state_dict(ckp["model_state_dict"])
+        optimizer.load_state_dict(ckp["optimizer_state_dict"])
+        train_cd_list = ckp.get("train_cd_list", {})
+        val_cd_list = ckp.get("val_cd_list", {})
+        cd_epochs = ckp.get("cd_epochs", [])
+        train_loss_list = ckp.get("train_loss_list", [])
+        val_loss_list = ckp.get("val_loss_list", [])
+        print("Loaded checkpoint starting at epoch", start_epoch)
+    
+        
+    tt = trange(start_epoch, args.epochs, desc="Training", unit="epoch", leave=True)
 
     if args.cond_type == "id":
 
@@ -838,7 +1018,8 @@ def main():
     else:
         all_cond_signal = None
         id_list = None
-
+    cd_train_ave = -1
+    cd_val_ave = -1
     for epoch in tt:
         # print("all_cond_signal", all_cond_signal)
         train_loss, new_train_loss_list = train_val_one_epoch(args, dataloader_train, model, optimizer,
@@ -865,7 +1046,7 @@ def main():
                     val_cd_list=val_cd_list,
                     cd_epochs=cd_epochs,
                     val_loss_list=val_loss_list,
-                    train_loss_list=train_loss_list, epoch=epoch, base_dir=args.base_dir, config=exp_config, run_name=run_name, code=code)
+                    train_loss_list=train_loss_list, epoch=args.epochs, base_dir=args.base_dir, config=exp_config, run_name=run_name, code=code)
 
 
 if __name__ == "__main__":
