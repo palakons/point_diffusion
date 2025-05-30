@@ -52,7 +52,7 @@ class MDM(nn.Module):
         # Output layer
         self.output_process = nn.Linear(self.model_channels, self.out_channels)
         
-    def forward(self, x_org, timesteps):
+    def forward(self, x, timesteps):
 
 
         """
@@ -60,25 +60,30 @@ class MDM(nn.Module):
         x: [batch_size, nfeats, nframes], denoted x_t in the paper (input)
         timesteps: [batch_size, nframes] (input)
         """
-        x =x_org.permute(0, 2, 1)  # [bs, nframes, nfeats] -> [bs, nfeats, nframes]
         # Condition Embedding
         # cond_emb = kwargs['cond']
-        cond_emb = x[:, 3:, :]  # [bs, d, T] -> [bs, T, d]
-        cond_emb_proj = self.cond_proj_layer(cond_emb)   # [bs, T, d]
+        cond_emb = x[:, 0, 3:]   # [bs, condition_dim]
+        cond_emb *=0 #fortesting
+        # print("cond_emb : ", cond_emb.shape) #torch.Size([1, 2])
+        cond_emb_proj = self.cond_proj_layer(cond_emb)   # [bs,  model_channels]
         # Time Embedding
+        # print("cond_emb_proj : ", cond_emb_proj.shape) #torch.Size([1, 128])
         t_emb = self.time_embed(timesteps)
-        # print("After emb time : ", emb.shape)
+        # print("After emb time : ", t_emb.shape)
         # emb = emb.unsqueeze(dim=1)  #NOTE: [bs, d] -> [bs, 1, d] since we need to add the #n frames dim for timesteps
         # print("Expand T-dim of emb time : ", emb.shape)
         
-        emb = cond_emb_proj.unsqueeze(1) + t_emb  # [bs, 1, d]
-        # print("timecomb emb : ", emb.shape)
+        emb = cond_emb_proj.unsqueeze(1) + t_emb  # [bs, 1, d] ????
+        # print("timecomb emb : ", emb.shape) #torch.Size([1, 1, 512])
+        # print("x : ", x.shape) #torch.Size([1, 128, 67])
+        x=x[:,:,:3]
+        # print("x : ", x.shape)#torch.Size([1, 128, 3])
         x = self.input_process(x)
         # print("x : ", x.shape)
         # print("emb : ", emb.shape)
         # print("sparse_emb : ", sparse_emb.shape)
         
-        xseq = th.cat((emb, x[:,:3,:]), dim=1) #NOTE: [bs, nframes, d] -> [bs, nframes+1, d]
+        xseq = th.cat((emb, x), dim=1) #NOTE: [bs, nframes, d] -> [bs, nframes+1, d]
         # print("xseq : ", xseq.shape)
         xseq = self.pos_encoder(xseq)
         # print("xseq : ", xseq.shape)
@@ -86,9 +91,9 @@ class MDM(nn.Module):
         # print("output : ", output.shape)
         
         output = self.output_process(output)
-        print("output : ", output.shape)
-        return output.permute(0, 2, 1)  # [bs, nframes, d] -> [bs, d, nframes]
-        return {"output":output}
+        # print("output : ", output.shape) #torch.Size([1, 128, 3])
+        return output
+        # return {"output":output}
  
 class TimestepEmbedder(nn.Module):
     def __init__(self, latent_dim, sequence_pos_encoder):

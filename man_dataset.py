@@ -346,6 +346,33 @@ class MANDataset(Dataset):
             npoints_filtered
         )
 
+def combine_perspective_cameras(cameras_list):
+    focal_length = []
+    principal_point = []
+    R = []
+    T = []
+    image_sizes_hw = []
+    for camera in cameras_list:
+        focal_length.append(camera.focal_length)
+        principal_point.append(camera.principal_point)
+        R.append(camera.R)
+        T.append(camera.T)
+        image_sizes_hw.append(camera.image_size)
+
+    focal_lengths = torch.concat(focal_length)
+    principal_points = torch.concat(principal_point)
+    Rs = torch.concat(R)
+    Ts = torch.concat(T)
+    image_sizes_hw = torch.concat(image_sizes_hw)
+
+    return PerspectiveCameras(
+        focal_length=focal_lengths,
+        principal_point=principal_points,
+        R=Rs,
+        T=Ts,
+        in_ndc=False,
+        image_size=image_sizes_hw,
+    )
 
 def custom_collate_fn_man(batch):
     (
@@ -367,36 +394,37 @@ def custom_collate_fn_man(batch):
     radar_data_after = torch.stack(radar_data)
     depths_after = torch.stack(depths)
 
-    focal_length = []
-    principal_point = []
-    R = []
-    T = []
-    image_sizes_hw = []
-    for camera_base in camera_base_list:
-        focal_length.append(camera_base.focal_length)
+    # focal_length = []
+    # principal_point = []
+    # R = []
+    # T = []
+    # image_sizes_hw = []
+    # for camera_base in camera_base_list:
+    #     focal_length.append(camera_base.focal_length)
 
-        principal_point.append(camera_base.principal_point)
-        R.append(camera_base.R)
-        T.append(camera_base.T)
-        image_sizes_hw.append(camera_base.image_size)
+    #     principal_point.append(camera_base.principal_point)
+    #     R.append(camera_base.R)
+    #     T.append(camera_base.T)
+    #     image_sizes_hw.append(camera_base.image_size)
 
-    focal_lengths = torch.concat(focal_length)
-    principal_points = torch.concat(principal_point)
-    Rs = torch.concat(R)
-    Ts = torch.concat(T)
-    image_sizes_hw = torch.concat(image_sizes_hw)
+    # focal_lengths = torch.concat(focal_length)
+    # principal_points = torch.concat(principal_point)
+    # Rs = torch.concat(R)
+    # Ts = torch.concat(T)
+    # image_sizes_hw = torch.concat(image_sizes_hw)
 
-    # print("image_sizes_hw: ", image_sizes_hw)
+    # # print("image_sizes_hw: ", image_sizes_hw)
 
-    camera_bases = PerspectiveCameras(
-        focal_length=focal_lengths,
-        principal_point=principal_points,
-        R=Rs,
-        T=Ts,
-        in_ndc=False,
-        image_size=image_sizes_hw,
-    )
+    # camera_bases = PerspectiveCameras(
+    #     focal_length=focal_lengths,
+    #     principal_point=principal_points,
+    #     R=Rs,
+    #     T=Ts,
+    #     in_ndc=False,
+    #     image_size=image_sizes_hw,
+    # )
 
+    camera_bases = combine_perspective_cameras(camera_base_list)
     return (
         depths_after,
         radar_data_after,
