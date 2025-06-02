@@ -20,10 +20,6 @@
     <label for="frameId">Frame ID:</label>
     <select id="frameId">
     </select>
-    <label>Unnormalized:</label>
-    <input type="radio" name="unnorm" value="true" id="unnormRadio" checked>True
-    <input type="radio" name="unnorm" value="false" id="unnormRadio">False
-    <br>
     <label for="epochSlider">Epoch:</label>
     <span id="epochValue">999</span>
     <input type="range" id="epochSlider" list="epochTicks" style="width:600px;">
@@ -32,9 +28,14 @@
     <br>
     <label for="fileName">Select JSON File:</label>
     <span id="fileName">No file selected</span>
+    <label id="fileNameLink"></label>
     <br>
     <label for="cdValue">Unnormalized DPMStep-0 Epoch CD:</label>
     <span id="cdValue"></span>
+    <br>
+    <label>Unnormalized:</label>
+    <input type="radio" name="unnorm" value="true" id="unnormRadio" checked>True
+    <input type="radio" name="unnorm" value="false" id="unnormRadio">False
     <br>
     <label for="dpmSlider">DPM Step:</label>
     <span id="dpmValue"></span>

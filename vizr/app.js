@@ -57,11 +57,9 @@
       let y_screen = (1 - (ndc[1] * 0.5 + 0.5)) * canvas.height;
       // console.log("screen (", x_screen, ",", y_screen,")");
 
-      if (x_screen < minX) {minX = x_screen; minXPoint = points[i]; minXndc = ndc;}
-      if (y_screen < minY) 
-        {minY = y_screen; minYPoint = points[i]; minYndc = ndc;}
-      if (x_screen > maxX) 
-        {maxX = x_screen; maxXPoint = points[i]; maxXndc = ndc;}
+      if (x_screen < minX) { minX = x_screen; minXPoint = points[i]; minXndc = ndc; }
+      if (y_screen < minY) { minY = y_screen; minYPoint = points[i]; minYndc = ndc; }
+      if (x_screen > maxX) { maxX = x_screen; maxXPoint = points[i]; maxXndc = ndc; }
       if (y_screen > maxY) {
         maxY = y_screen; maxYPoint = points[i]; maxYndc = ndc;
       }
@@ -76,20 +74,20 @@
     leftcanvas = -canvas.width / 2;
     rightcanvas = canvas.width / 2;
 
-    minX -=canvas.width / 2
-    maxX -=canvas.width / 2
-    minY -=canvas.height / 2
-    maxY -=canvas.height / 2
+    minX -= canvas.width / 2
+    maxX -= canvas.width / 2
+    minY -= canvas.height / 2
+    maxY -= canvas.height / 2
 
-    scalerightX = (maxX ) / rightcanvas
-    scaleleftX = (minX ) / leftcanvas
+    scalerightX = (maxX) / rightcanvas
+    scaleleftX = (minX) / leftcanvas
     scaleX = Math.max(scalerightX, scaleleftX);
 
     topcanvas = -canvas.height / 2;
     bottomcanvas = canvas.height / 2;
 
-    scaleTopY = (minY ) / topcanvas
-    scaleBottomY = (maxY ) / bottomcanvas
+    scaleTopY = (minY) / topcanvas
+    scaleBottomY = (maxY) / bottomcanvas
     scaleY = Math.max(scaleTopY, scaleBottomY);
 
     scale = Math.max(scaleX, scaleY);
@@ -97,8 +95,8 @@
     scale = Math.max(.5, Math.min(scale, 2));
 
     // Adjust cameraDistance accordingly (this is a bit heuristic)
-    
-    cameraDistance *= (scale-1)/5+1 ;
+
+    cameraDistance *= (scale - 1) / 5 + 1;
 
     // console.log("-------------------")
     // //log minXPoint, minXndc in fixed(2) and in (x,y,z) format
@@ -107,7 +105,7 @@
     // console.log("minY",minY, "xyz", minYPoint[0].toFixed(2), minYPoint[1].toFixed(2), minYPoint[2].toFixed(2), "ndc", minYndc[0].toFixed(2), minYndc[1].toFixed(2), minYndc[2].toFixed(2));
     // console.log("maxY",maxY, "xyz", maxYPoint[0].toFixed(2), maxYPoint[1].toFixed(2), maxYPoint[2].toFixed(2), "ndc", maxYndc[0].toFixed(2), maxYndc[1].toFixed(2), maxYndc[2].toFixed(2));
     // console.log("right most point",  maxX.toFixed(2),"/", rightcanvas.toFixed(2),"=",scalerightX.toFixed(2), "left most point", minX.toFixed(2), "/", leftcanvas.toFixed(2),"=",scaleleftX.toFixed(2));
-  
+
     // console.log("top most point", minY.toFixed(2),"/", topcanvas.toFixed(2),"=",scaleTopY.toFixed(2), "bottom most point", maxY.toFixed(2),"/", bottomcanvas.toFixed(2),"=", scaleBottomY.toFixed(2));
     // console.log("cameraDistance", cameraDistance.toFixed(2),"scale", scale.toFixed(2));
   }
@@ -121,21 +119,19 @@
 
   // Attach resize event listener
   window.addEventListener('resize', resizeCanvas);
-
-  window.addEventListener('load', () => {
-    // Call resizeCanvas initially to set up the correct size
-    resizeCanvas();
-  });
+  1
 
 
   // UI elements
   const expSelect = document.getElementById('expSelect');
+  const frameIdInput = document.getElementById('frameId');
+
   const fileNameDOM = document.getElementById('fileName');
+  const fileNameLink = document.getElementById('fileNameLink');
   const epochSlider = document.getElementById('epochSlider');
   const dpmSlider = document.getElementById('dpmSlider');
   const epochValue = document.getElementById('epochValue');
   const dpmValue = document.getElementById('dpmValue');
-  const frameIdInput = document.getElementById('frameId');
   //update cdValue
   const cdValue = document.getElementById("cdValue");
   const dpmCdValue = document.getElementById("dpmCdValue");
@@ -145,6 +141,11 @@
   const viewZBtn = document.getElementById("viewZ");
   const viewPerBtn = document.getElementById("viewPerspective");
   const zoomToFitBtn = document.getElementById("zoomToFitBtn");
+  const trainRadio = document.getElementById("trainRadio");
+  const valRadio = document.getElementById("valRadio");
+  const setChecked = document.querySelector('input[name="set"]:checked')
+  const epochTicks = document.getElementById("epochTicks");
+  const dpmTicks = document.getElementById("dpmTicks");
 
 
   let sortedEpochs = []; // Declare sortedEpochs in a higher scope
@@ -170,6 +171,37 @@
     const paddedEpoch = epoch.toString().padStart(6, '0');
     return `sample_ep_${paddedEpoch}_gt0_${set}-idx-${frameId}.json`;
   }
+
+  // Add event listeners for set
+  trainRadio.addEventListener("change", () => {
+
+    setChanged();
+    frameIDChanged();
+    epochSlider.value = Math.max(...Array.from(matchedEpoch));
+    // call  updateDPMSlider only after epochChanged finished
+
+    epochChanged();
+    updateDPMSlider();
+  });
+  valRadio.addEventListener("change", () => {
+    setChanged();
+    frameIDChanged();
+    epochSlider.value = Math.max(...Array.from(matchedEpoch));
+    // call  updateDPMSlider only after epochChanged finished
+
+    epochChanged();
+    updateDPMSlider();
+  });
+  // Add event listeners for frameId input
+  frameIdInput.addEventListener("input", () => {
+    frameIDChanged();
+    epochSlider.value = Math.max(...Array.from(matchedEpoch));
+    // call  updateDPMSlider only after epochChanged finished
+
+    epochChanged();
+    updateDPMSlider();
+  });
+
   // Add event listeners for view buttons
   viewXBtn.addEventListener("click", () => {
     setView("x");
@@ -207,16 +239,16 @@
       const aspect = canvas.width / canvas.height;
       //repeat 3 times
       for (let i = 0; i < 50; i++) {
-      const projectionMatrix = mat4.create();
-      mat4.perspective(projectionMatrix, 60 * Math.PI / 180, aspect, 0.1, 500.0);
+        const projectionMatrix = mat4.create();
+        mat4.perspective(projectionMatrix, 60 * Math.PI / 180, aspect, 0.1, 500.0);
 
-      const modelViewMatrix = mat4.create();
-      mat4.identity(modelViewMatrix);
-      mat4.translate(modelViewMatrix, modelViewMatrix, [0, 0, -cameraDistance]);
-      mat4.rotate(modelViewMatrix, modelViewMatrix, cameraAngleX * Math.PI / 180, [1, 0, 0]);
-      mat4.rotate(modelViewMatrix, modelViewMatrix, cameraAngleY * Math.PI / 180, [0, 1, 0]);
-      mat4.translate(modelViewMatrix, modelViewMatrix, [cameraPanX, cameraPanY, 0]);
-      zoomToFitScreen(points, modelViewMatrix, projectionMatrix, canvas);
+        const modelViewMatrix = mat4.create();
+        mat4.identity(modelViewMatrix);
+        mat4.translate(modelViewMatrix, modelViewMatrix, [0, 0, -cameraDistance]);
+        mat4.rotate(modelViewMatrix, modelViewMatrix, cameraAngleX * Math.PI / 180, [1, 0, 0]);
+        mat4.rotate(modelViewMatrix, modelViewMatrix, cameraAngleY * Math.PI / 180, [0, 1, 0]);
+        mat4.translate(modelViewMatrix, modelViewMatrix, [cameraPanX, cameraPanY, 0]);
+        zoomToFitScreen(points, modelViewMatrix, projectionMatrix, canvas);
       }
     } else {
       console.log("No points to zoom to fit");
@@ -247,26 +279,7 @@
   }
 
   epochSlider.addEventListener('input', () => {
-    epochValue.textContent = epochSlider.value;
-
-    // Find the nearest value in sortedEpochs
-    const sliderValue = parseInt(epochSlider.value, 10);
-    const nearestEpoch = sortedEpochs.reduce((prev, curr) =>
-      Math.abs(curr - sliderValue) < Math.abs(prev - sliderValue) ? curr : prev
-    );
-
-    // Update the slider value to the nearest epoch
-    epochSlider.value = nearestEpoch;
-    epochValue.textContent = nearestEpoch;
-
-    // Zero-pad nearestEpoch to 6 digits
-    const paddedEpoch = nearestEpoch.toString().padStart(6, '0');
-
-    // Update the fileName span
-    fileName.textContent = constructFileName(paddedEpoch, document.querySelector('input[name="set"]:checked').value, frameIdInput.value);
-    // Load the JSON file
-    loadJSON(expSelect.value + "/" + fileName.textContent);
-    // console.log("v  epochSlider dmpInverseIndex", dmpInverseIndex);
+    epochChanged();
   });
 
   dpmSlider.addEventListener('input', () => {
@@ -283,19 +296,12 @@
     dpmSlider.value = nearestDPM;
     dpmValue.textContent = nearestDPM;
   });
-  function makeInverseIndex(steps) {
-    const inverseIndex = {};
-    steps.forEach((step, index) => {
-      inverseIndex[step] = index;
-    });
-    return inverseIndex;
-  }
 
   // Cache for loaded JSON data from files
   const jsonCache = {};
   let currentData = null;
-  function updateUI() {
-    const dpmTicks = document.getElementById("dpmTicks");
+
+  function updateDPMSlider() {
     dpmTicks.innerHTML = "";
     var sortedDPMStep = currentData.steps.slice().sort((a, b) => a - b);
     // console.log("sortedDPMStep", sortedDPMStep);
@@ -318,7 +324,7 @@
     const url = data_server + filename;
     if (jsonCache[filename]) {
       currentData = jsonCache[filename];
-      updateUI()
+      updateDPMSlider() //update DDPM steps
       // console.log("Loaded from cache:", filename);
     } else {
       fetch(url)
@@ -327,7 +333,7 @@
           jsonCache[filename] = data;
           currentData = data;
           // console.log("Fetched:", filename);
-          updateUI()
+          updateDPMSlider() //update ddpm steps
         })
         .catch(err => console.error("Error loading JSON:", err));
     }
@@ -358,9 +364,104 @@
     })
     .catch(err => console.error("Error fetching experiments", err));
 
-  // When an experiment is selected, fetch its directory and build fileSelect options.// When an experiment is selected, fetch its directory and build fileSelect options.
+
+  jsonFileList = []
+  function epochChanged() {
+    const setV = document.querySelector('input[name="set"]:checked').value;
+    const epoch = epochSlider.value;
+    const frameId = frameIdInput.value;
+
+    const selectedExp = expSelect.value;
+    epochValue.textContent = epoch;
+    last_file_name = constructFileName(epoch, setV, frameId);
+    //make href ot the file
+    fileName.textContent = last_file_name;
+    fileNameLink.href = data_server + selectedExp + "/" + last_file_name;
+    fileNameLink.innerHTML = `<a href="${fileNameLink.href}" target="_blank">Link</a>`;
+    loadJSON(selectedExp + "/" + last_file_name);
+  }
+  function frameIDChanged() {
+    setV = document.querySelector('input[name="set"]:checked').value;
+    frameIdInput.value = frameIdInput.value.toString();
+    [matchedSet, matchedEpoch, matchedFrameId] = filterFname(jsonFileList, null, setV, frameIdInput.value);
+    console.log("Available sets:", matchedSet);
+    console.log("Available epochs len:", matchedEpoch);
+    console.log("Available frameIds:", matchedFrameId);
+
+    if (matchedEpoch.size > 0) {
+      const epochArr = Array.from(matchedEpoch);
+      const minEpoch = Math.min(...epochArr);
+      const maxEpoch = Math.max(...epochArr);
+      epochSlider.min = minEpoch;
+      epochSlider.max = maxEpoch;
+      epochSlider.value = maxEpoch;
+      epochValue.textContent = maxEpoch;
+
+      // Update sortedEpochs
+      sortedEpochs = epochArr.sort((a, b) => a - b);
+
+      // Clear and update the datalist with each unique epoch found.
+      epochTicks.innerHTML = "";
+      sortedEpochs.forEach(epoch => {
+        const option = document.createElement("option");
+        option.value = epoch;
+        option.label = epoch;
+        epochTicks.appendChild(option);
+      });
+    }
+  }
+  function setChanged() {
+    setV = document.querySelector('input[name="set"]:checked').value;
+
+    [matchedSet, matchedEpoch, matchedFrameId] = filterFname(jsonFileList, null, setV, null);
+
+    if (matchedFrameId.size > 0) {
+      const sortedFrameIds = Array.from(matchedFrameId).sort(); // lexicographic sort
+      //update frameId input with drop down
+      // Clear existing options
+      frameId.innerHTML = "";
+      sortedFrameIds.forEach(fid => {
+        const option = document.createElement("option");
+        option.value = fid;
+        option.textContent = fid;
+        frameId.appendChild(option);
+      });
+    }
+
+
+  }
+  function filterFname(jsonFileList, filterEpoch, filterSet, filterFrameId) {
+    // Filter the jsonFileList to get unique sets
+    matchedSet = new Set();
+    matchedEpoch = new Set();
+    matchedFrameId = new Set();
+    jsonFileList.forEach(fileName => {
+      // Regex explanation:
+      // - Group 1: epoch number (e.g. "000999")
+      // - Group 2: the set ("train" or "val")
+      // - Group 3: exactly 3 characters immediately before ".json" (e.g. "32d")
+      const match = fileName.match(/sample_ep_(\d+)_gt\d+_(train|val)-idx-(.{3})\.json/);
+      if (match) {
+        // const epoch = match[1];
+        const epoch = parseInt(match[1], 10);
+        const set = match[2];
+        const frameId = match[3];
+        ok = true;
+        if (filterEpoch && filterEpoch !== epoch) ok = false;
+        if (filterSet && filterSet !== set) ok = false;
+        if (filterFrameId && filterFrameId !== frameId) ok = false;
+        if (ok) {
+          matchedSet.add(set);
+          matchedEpoch.add(epoch);
+          matchedFrameId.add(frameId);
+        }
+      }
+    });
+    return [matchedSet, matchedEpoch, matchedFrameId];
+  }
   expSelect.addEventListener("change", () => {
     // Clear the fileSelect dropdown and reset UI collections.
+    jsonFileList = [];
     fileName.innerHTML = "";
     const selectedExp = expSelect.value;
     const url = data_server + `${selectedExp}`;
@@ -387,118 +488,58 @@
             // - Group 3: exactly 3 characters immediately before ".json" (e.g. "32d")
             const match = fileName.match(/sample_ep_(\d+)_gt\d+_(train|val)-idx-(.{3})\.json/);
             if (match) {
-              const epoch = parseInt(match[1], 10);
-              const setStr = match[2];
-              const frameId = match[3]; // exactly 3 characters (e.g. "32d")
-              epochs.add(epoch);
-              availableSets.add(setStr);
-              frameIds.add(frameId);
+              jsonFileList.push(fileName);
             }
           }
         });
-        console.log("Available sets:", availableSets);
-        // console.log("Epochs:", epochs);
-        console.log("Frame IDs:", frameIds);
-        //availableSets.has("val")
-        console.log("Available sets has val:", availableSets.has("val"));
+        [matchedSet, matchedEpoch, matchedFrameId] = filterFname(jsonFileList, null, null, null);
 
-        // Update the epoch slider and datalist using the epochs Set.
-        if (epochs.size > 0) {
-          const epochArr = Array.from(epochs);
-          const minEpoch = Math.min(...epochArr);
-          const maxEpoch = Math.max(...epochArr);
-          epochSlider.min = minEpoch;
-          epochSlider.max = maxEpoch;
-          epochSlider.value = maxEpoch;
-          epochValue.textContent = maxEpoch;
+        trainRadio.disabled = !matchedSet.has("train");
+        valRadio.disabled = !matchedSet.has("val");
+        console.log(matchedSet.has("train"), matchedSet.has("val"))
+        trainRadio.checked = matchedSet.has("train");
+        valRadio.checked = matchedSet.has("val") && !matchedSet.has("train");
+        setChanged();
+        frameIDChanged();
+        epochSlider.value = Math.max(...Array.from(matchedEpoch));
+        // call  updateDPMSlider only after epochChanged finished
 
-          // Update sortedEpochs
-          sortedEpochs = epochArr.sort((a, b) => a - b);
-
-          // Clear and update the datalist with each unique epoch found.
-          const tickDatalist = document.getElementById("epochTicks");
-          tickDatalist.innerHTML = "";
-          sortedEpochs.forEach(epoch => {
-            const option = document.createElement("option");
-            option.value = epoch;
-            option.label = epoch;
-            tickDatalist.appendChild(option);
-          });
-        }
-
-        // Update the frameId input.
-        // Since these are three-character strings, you might want to show them as radio buttons.
-        // For simplicity, here we just pick the first value.
-        if (frameIds.size > 0) {
-          const sortedFrameIds = Array.from(frameIds).sort(); // lexicographic sort
-          //update frameId input with drop down
-          // Clear existing options
-          frameId.innerHTML = "";
-          sortedFrameIds.forEach(fid => {
-            const option = document.createElement("option");
-            option.value = fid;
-            option.textContent = fid;
-            frameId.appendChild(option);
-
-          });
-        }
-
-        // Update the set radio buttons.
-        // For example, enable/disable the radio buttons if a set is missing.
-        const trainRadio = document.getElementById("trainRadio");
-        const valRadio = document.getElementById("valRadio");
-        if (!availableSets.has("train")) {
-          trainRadio.disabled = true;
-        } else {
-          trainRadio.disabled = false;
-        }
-        if (!availableSets.has("val")) {
-          valRadio.disabled = true;
-        } else {
-          valRadio.disabled = false;
-        }
-
-        //construct first file name from first elements in epoch, set, frameId
-        // epoch is 0-paddde 6 digits
-        // console.log("sortedEpochs", sortedEpochs);
-        const firstEpoch = sortedEpochs[0].toString().padStart(6, '0');
-        fist_file_name = `sample_ep_${firstEpoch}_gt0_${availableSets.values().next().value}-idx-${frameIds.values().next().value}.json`;
-        fileName.textContent = fist_file_name;
-        loadJSON(selectedExp + "/" + fist_file_name);
+        epochChanged();
+        updateDPMSlider();
       })
       .catch(err => console.error("Error fetching file list for experiment", err));
   });
 
   // Helper function to update radio buttons
-  function updateRadioButtons(containerId, values, name) {
-    const container = document.getElementById(containerId);
-    container.innerHTML = ""; // Clear existing buttons
-    values.forEach(value => {
-      const label = document.createElement("label");
-      const radio = document.createElement("input");
-      radio.type = "radio";
-      radio.name = name;
-      radio.value = value;
-      label.appendChild(radio);
-      label.appendChild(document.createTextNode(value));
-      container.appendChild(label);
-    });
-  }
+  // function updateRadioButtons(containerId, values, name) {
+  //   const container = document.getElementById(containerId);
+  //   container.innerHTML = ""; // Clear existing buttons
+  //   values.forEach(value => {
+  //     const label = document.createElement("label");
+  //     const radio = document.createElement("input");
+  //     radio.type = "radio";
+  //     radio.name = name;
+  //     radio.value = value;
+  //     label.appendChild(radio);
+  //     label.appendChild(document.createTextNode(value));
+  //     container.appendChild(label);
+  //   });
+  // }
 
   // Helper function to update slider
-  function updateSlider(sliderId, values) {
-    const slider = document.getElementById(sliderId);
-    const min = Math.min(...values);
-    const max = Math.max(...values);
-    slider.min = min;
-    slider.max = max;
-    slider.value = min; // Set to minimum by default
-    const valueDisplay = document.getElementById(sliderId + "Value");
-    valueDisplay.textContent = min; // Update display
-    slider.addEventListener("input", () => {
-      valueDisplay.textContent = slider.value;
-    });
-  }
+  // function updateSlider(sliderId, values) {
+  //   const slider = document.getElementById(sliderId);
+  //   const min = Math.min(...values);
+  //   const max = Math.max(...values);
+  //   slider.min = min;
+  //   slider.max = max;
+  //   slider.value = min; // Set to minimum by default
+  //   const valueDisplay = document.getElementById(sliderId + "Value");
+  //   valueDisplay.textContent = min; // Update display
+  //   slider.addEventListener("input", () => {
+  //     valueDisplay.textContent = slider.value;
+  //   });
+  // }
 
 
   // --- WebGL Setup for Rendering Points (existing shader and render code) ---
@@ -761,47 +802,47 @@
       '?': { x: 56, y: 32, width: 8, },
     },
   };
-  function makeVerticesForString(fontInfo, s) {
-    const len = s.length;
-    const numVertices = len * 6;
-    const positions = new Float32Array(numVertices * 2);
-    const texcoords = new Float32Array(numVertices * 2);
-    let offset = 0;
-    let x = 0;
-    const maxX = fontInfo.textureWidth;
-    const maxY = fontInfo.textureHeight;
+  // function makeVerticesForString(fontInfo, s) {
+  //     const len = s.length;
+  //     const numVertices = len * 6;
+  //     const positions = new Float32Array(numVertices * 2);
+  //     const texcoords = new Float32Array(numVertices * 2);
+  //     let offset = 0;
+  //     let x = 0;
+  //     const maxX = fontInfo.textureWidth;
+  //     const maxY = fontInfo.textureHeight;
 
-    for (let i = 0; i < len; ++i) {
-      const letter = s[i];
-      const glyphInfo = fontInfo.glyphInfos[letter];
-      if (glyphInfo) {
-        // console.log("glyphInfo", glyphInfo);
-        const x2 = x + glyphInfo.width;
-        const u1 = glyphInfo.x / maxX;
-        const v1 = (glyphInfo.y + fontInfo.letterHeight) / maxY;
-        const u2 = (glyphInfo.x + glyphInfo.width) / maxX;
-        const v2 = glyphInfo.y / maxY;
+  //     for (let i = 0; i < len; ++i) {
+  //       const letter = s[i];
+  //       const glyphInfo = fontInfo.glyphInfos[letter];
+  //       if (glyphInfo) {
+  //         // console.log("glyphInfo", glyphInfo);
+  //         const x2 = x + glyphInfo.width;
+  //         const u1 = glyphInfo.x / maxX;
+  //         const v1 = (glyphInfo.y + fontInfo.letterHeight) / maxY;
+  //         const u2 = (glyphInfo.x + glyphInfo.width) / maxX;
+  //         const v2 = glyphInfo.y / maxY;
 
-        // 6 vertices per letter
-        positions.set([x, 0, x2, 0, x, fontInfo.letterHeight, x, fontInfo.letterHeight, x2, 0, x2, fontInfo.letterHeight], offset);
-        texcoords.set([u1, v1, u2, v1, u1, v2, u1, v2, u2, v1, u2, v2], offset);
+  //         // 6 vertices per letter
+  //         positions.set([x, 0, x2, 0, x, fontInfo.letterHeight, x, fontInfo.letterHeight, x2, 0, x2, fontInfo.letterHeight], offset);
+  //         texcoords.set([u1, v1, u2, v1, u1, v2, u1, v2, u2, v1, u2, v2], offset);
 
-        x += glyphInfo.width + fontInfo.spacing;
-        offset += 12;
-      } else {
-        // console.warn(`Glyph for character "${letter}" not found.`);
-        x += fontInfo.spaceWidth;
-      }
-    }
+  //         x += glyphInfo.width + fontInfo.spacing;
+  //         offset += 12;
+  //       } else {
+  //         // console.warn(`Glyph for character "${letter}" not found.`);
+  //         x += fontInfo.spaceWidth;
+  //       }
+  //     }
 
-    return {
-      arrays: {
-        position: new Float32Array(positions.buffer, 0, offset),
-        texcoord: new Float32Array(texcoords.buffer, 0, offset),
-      },
-      numVertices: offset / 2,
-    };
-  }
+  //     return {
+  //       arrays: {
+  //         position: new Float32Array(positions.buffer, 0, offset),
+  //         texcoord: new Float32Array(texcoords.buffer, 0, offset),
+  //       },
+  //       numVertices: offset / 2,
+  //     };
+  //   }
   let fontTextureLoaded = false; // Flag to track if the texture is loaded
 
   const fontTexture = gl.createTexture();
@@ -821,8 +862,8 @@
 
     fontTextureLoaded = true; // Set the flag to true
   };
-  function renderTextWithGlyphs(text, position) {
-  }
+  // function renderTextWithGlyphs(text, position) {
+  // }
   function project3Dto2D(point3D, modelViewMatrix, projectionMatrix, canvas) {
     // point3D: [x, y, z]
     // Returns: [x_screen, y_screen] in pixels
@@ -914,7 +955,7 @@
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(pointArray), gl.STATIC_DRAW);
     gl.vertexAttribPointer(programInfo.attribLocations.aPosition, 3, gl.FLOAT, false, 0, 0);
     gl.enableVertexAttribArray(programInfo.attribLocations.aPosition);
-    gl.uniform4fv(programInfo.uniformLocations.uColor, [1.0, 1.0, 0.0, 1.0]); // Set color to red
+    gl.uniform4fv(programInfo.uniformLocations.uColor, [1.0, 1.0, 0.0, .7]); // Set color to yellow
     gl.drawArrays(gl.POINTS, 0, pointArray.length / 3);
   }
   let dataMode = 1; // 0: GT only, 1: GT+XT, 2: XT only
@@ -994,8 +1035,10 @@
         gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(gtArray), gl.STATIC_DRAW);
         gl.vertexAttribPointer(programInfo.attribLocations.aPosition, 3, gl.FLOAT, false, 0, 0);
         gl.enableVertexAttribArray(programInfo.attribLocations.aPosition);
-        gl.uniform4fv(programInfo.uniformLocations.uColor, [1.0, 0.0, 0.0, 1.0]); // Set color to red
+        gl.uniform4fv(programInfo.uniformLocations.uColor, [1.0, 0.0, 0.0, .7]); // Set color to red
+        gl.disable(gl.DEPTH_TEST);
         gl.drawArrays(gl.POINTS, 0, gtArray.length / 3);
+        gl.enable(gl.DEPTH_TEST);
       }
 
 
@@ -1050,13 +1093,15 @@
           gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(xsArray), gl.STATIC_DRAW);
           gl.vertexAttribPointer(programInfo.attribLocations.aPosition, 3, gl.FLOAT, false, 0, 0);
           gl.enableVertexAttribArray(programInfo.attribLocations.aPosition);
-          gl.uniform4fv(programInfo.uniformLocations.uColor, [0.0, 0.0, 1.0, 1.0]); // Set color to blue
-          gl.drawArrays(gl.POINTS, 0, xsArray.length / 3);
+          gl.uniform4fv(programInfo.uniformLocations.uColor, [0.0, 0.0, 1.0, .7]); // Set color to blue
+          gl.disable(gl.DEPTH_TEST);
+          gl.drawArrays(gl.POINTS, 0, xsArray.length / 3); gl.enable(gl.DEPTH_TEST);
         }
       }
     }
     requestAnimationFrame(render);
   }
-
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
   render();
 })();
