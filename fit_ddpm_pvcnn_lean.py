@@ -76,7 +76,7 @@ class SimpleDenoiser(nn.Module):
         x = torch.cat([x_t, t_embed], dim=-1)
         return self.net(x)
 
-def get_man_data(M, N, camera_ch, radar_ch, device, img_size, batch_size, shuffle, n_val=2, n_pull=10, flip_images=False):
+def get_man_data(M, N, camera_ch, radar_ch, device, img_size, batch_size, shuffle, n_val=2, n_pull=10, flip_images=False, coord_only=True):
     dataset = MANDataset(
         n_pull,
         N,
@@ -89,7 +89,8 @@ def get_man_data(M, N, camera_ch, radar_ch, device, img_size, batch_size, shuffl
         img_size=img_size,
         radar_channel=radar_ch,
         camera_channel=camera_ch,
-        double_flip_images=flip_images,)
+        double_flip_images=flip_images,
+        coord_only=coord_only,)
 
     indices = list(range(len(dataset)))
     train_indices = indices[:M]
@@ -144,7 +145,8 @@ def save_sample_json(path, epoch, gt_tensor, xts_tensor_list, steps,  cd=None, d
         "epoch": epoch,
         "gt": gt_tensor.detach().cpu().tolist(),
         "xts": [xt.detach().cpu().tolist() for xt in xts_tensor_list],
-        "steps": steps,
+        "steps": steps if isinstance(
+            steps, list) else steps.detach().cpu().tolist(),
     }
     if cd is not None:
         data["cd"] = float(cd)
@@ -164,7 +166,7 @@ def save_sample_json(path, epoch, gt_tensor, xts_tensor_list, steps,  cd=None, d
         json.dump(data, f, indent=4)
 
 
-def sample(args, id_list, all_cond_signal, feature_model,unet_cond_model, model, scheduler, T, B, N, D, gt_normed, device, data_mean, data_std, camera, frame_token, image_rgb):
+def sample(args, id_list, all_cond_signal, feature_model,unet_cond_model, model, scheduler, T, B, N, D, gt_normed, device, data_mean, data_std, camera, frame_token, image_rgb,depth_image=None):
     scheduler.set_timesteps(T)
     x_t = torch.randn(B, N, D).to(device)
     xts_tensor_list = []
@@ -174,7 +176,7 @@ def sample(args, id_list, all_cond_signal, feature_model,unet_cond_model, model,
             t_tensor = torch.full((B,), t, device=device, dtype=torch.long)
 
             x_t_cond = get_conditioning(args, device, id_list, all_cond_signal, x_t, feature_model,unet_cond_model, camera, frame_token,
-                                        image_rgb, point_mean=data_mean, point_std=data_std)
+                                        image_rgb, depth_image,point_mean=data_mean, point_std=data_std)
 
             noise_pred = model(torch.cat(
                 [x_t, x_t_cond], dim=-1), t_tensor)
@@ -185,18 +187,39 @@ def sample(args, id_list, all_cond_signal, feature_model,unet_cond_model, model,
 
             xts_tensor_list.append(x_t.cpu())
 
-    sampled = x_t.to(device)
-    data_mean = data_mean.to(device)
-    data_std = data_std.to(device)
-
-    cd_final, _ = chamfer_distance(
-        sampled*data_std+data_mean, gt_normed*data_std+data_mean, batch_reduction=None)
 
     xts_concat = torch.stack(xts_tensor_list[::10] + xts_tensor_list[-1:])
 
     time_step_concat = torch.cat(
         [scheduler.timesteps[::10], scheduler.timesteps[-1:]], dim=0)
-    return xts_concat, [int(a) for a in time_step_concat], cd_final
+
+    sampled = x_t.to(device)
+    data_mean = data_mean.to(device)
+    data_std = data_std.to(device)
+
+    unormed_sampled = sampled * data_std + data_mean
+    unormed_gt = gt_normed * data_std + data_mean
+
+    cd_final, _ = chamfer_distance(
+        unormed_sampled[:,:3], unormed_gt[:,:3], batch_reduction=None)
+    # print("cd_final", cd_final)
+    if D==7:
+        ave_distance = torch.mean(torch.norm(unormed_sampled[:, :,:3] - unormed_gt[:, :,:3], dim=-1), dim=-1)
+
+        # print("unormed_sampled", unormed_sampled.shape) #[B,N,7]
+        # print("unormed_gt", unormed_gt.shape)#[B,N,7]
+        # print("ave_distance", ave_distance)
+
+        # print("ave_distance", torch.norm(torch.tensor([[[1,0,0],[1,0,1]]]).float(), dim=-1))
+
+        vrel_mse = torch.mean((unormed_sampled[:,:, 3:6] - unormed_gt[:,:, 3:6]) ** 2, dim=[1,2])
+        # print("vrel_mse",vrel_mse)
+        rcs_mse = torch.mean((unormed_sampled[:,:, 6:] - unormed_gt[:,:, 6:]) ** 2, dim=[1,2])
+        # print("rcs_mse", rcs_mse)
+        return xts_concat, time_step_concat, cd_final, ave_distance, vrel_mse, rcs_mse
+
+
+    return xts_concat, [int(a) for a in time_step_concat], cd_final,None,None,None
 
 
 def save_checkpoint(model, optimizer,unet_cond_model,
@@ -652,11 +675,15 @@ def get_argparse():
     #duplication augnentation minibathc factor
     parser.add_argument("-dup", "--duplication_augmentation_factor", type=int, default=1,
                         help="Duplication augmentation factor for the batch size")
+    # get_all data, not coord_only
+    parser.add_argument("-getvr", "--get_all_data", action='store_true', default=False,
+                        help="Get all data from the dataset, not only coordinates")
+
     args = parser.parse_args()
     return args
 
 
-def get_conditioning(args, device, id_list, all_cond_signal, x_t_data, feature_model, unet_cond_model, camera, frame_token, image_rgb,   raster_point_radius: float = 0.0075, raster_points_per_pixel: int = 1, bin_size: int = 0, scale_factor: float = 1.0, point_mean=torch.tensor([0, 0, 0]), point_std=torch.tensor([1, 1, 1])):
+def get_conditioning(args, device, id_list, all_cond_signal, x_t_data, feature_model, unet_cond_model, camera, frame_token, image_rgb, depth_image,  raster_point_radius: float = 0.0075, raster_points_per_pixel: int = 1, bin_size: int = 0, scale_factor: float = 1.0, point_mean=torch.tensor([0, 0, 0]), point_std=torch.tensor([1, 1, 1])):
     if args.cond_type == "camera":
         image_to_be_conditioned =  torch.randn_like(image_rgb, device=device) if args.noise_image else image_rgb
         return get_camera_conditioning(
@@ -687,15 +714,24 @@ def get_conditioning(args, device, id_list, all_cond_signal, x_t_data, feature_m
         out= torch.empty((x_t_data.shape[0], x_t_data.shape[1], 0)).to(device)
         return out
     
-    if args.cond_type == "unet":
+    if "unet" in args.cond_type :
         # print("Using UNet conditioning")
         # print("input image_rgb shape", image_rgb.shape) #torch.Size([1, 3, 618, 618])
         st_time = time.time()
         #print devices 
         # print(" model device", next(unet_cond_model.parameters()).device)
         # print(" image_rgb device", image_rgb.device)
-        out = unet_cond_model(
-            image_rgb).to(device)  # (B, N, D)
+        # print(args.cond_type,"image_rgb shape", image_rgb.shape, "device", image_rgb.device, "type", image_rgb.dtype)
+        # print("depth_image shape", depth_image.shape, "device", depth_image.device, "type", depth_image.dtype)
+        # unet_depth image_rgb shape torch.Size([2, 3, 618, 618]) device cuda:0 type torch.float32
+        # depth_image shape torch.Size([2, 618, 618]) device cuda:0 type torch.float32     
+        if args.cond_type == "unet":
+            cond_unet_input = image_rgb
+        elif args.cond_type == "unet_depth":
+            cond_unet_input =depth_image.unsqueeze(1) 
+        elif args.cond_type == "unet_imgdepth":
+            cond_unet_input = torch.cat([image_rgb, depth_image.unsqueeze(1)], dim=1) # torch.Size([2, 4, 618, 618])
+        out = unet_cond_model(cond_unet_input).to(device)  # (B, N, D)
         et_time = time.time()
         # print(f"UNet conditioning time for {args.cond_type} : {et_time - st_time:.4f} seconds")
         # print("unet_cond_model output shape", out.shape) #unet_cond_model output shape torch.Size([1, 128])
@@ -728,12 +764,15 @@ def train_val_one_epoch(args, dataloader, model, optimizer, scheduler, feature_m
                 frame_token,
                 npoints,
                 npoints_filtered) = batch
+
+            # print(f"shape radar_data {radar_data.shape}, image_rgb {image_rgb.shape}, frame_token {len(frame_token)} npoints {npoints}, npoints_filtered {npoints_filtered}")
             
             image_rgb = image_rgb.to(device)
+            depths = depths.to(device)
             
             if args.cond_type!= "camera":
                 x_t_cond = get_conditioning(args, device, id_list, all_cond_signal, radar_data.float().to(device),
-                                        feature_model, unet_cond_model,camera, frame_token, image_rgb,   point_mean=dataloader.dataset.dataset.data_mean.to(device).float(), point_std=dataloader.dataset.dataset.data_std.to(device).float())
+                                        feature_model, unet_cond_model,camera, frame_token, image_rgb,   depths,point_mean=dataloader.dataset.dataset.data_mean.to(device).float(), point_std=dataloader.dataset.dataset.data_std.to(device).float())
                 #duplicate duplication_augmentation_factor times dim 0
                 x_t_cond = x_t_cond.repeat(
                     args.duplication_augmentation_factor, 1, 1) if operation == "train" else x_t_cond
@@ -769,7 +808,7 @@ def train_val_one_epoch(args, dataloader, model, optimizer, scheduler, feature_m
 
             if args.cond_type == "camera":
                 x_t_cond = get_conditioning(args, device, id_list, all_cond_signal, x_t_data,
-                                        feature_model, unet_cond_model,camera, frame_token, image_rgb,   point_mean=dataloader.dataset.dataset.data_mean.to(device).float(), point_std=dataloader.dataset.dataset.data_std.to(device).float())
+                                        feature_model, unet_cond_model,camera, frame_token, image_rgb,   depths,point_mean=dataloader.dataset.dataset.data_mean.to(device).float(), point_std=dataloader.dataset.dataset.data_std.to(device).float())
 
             x_t = torch.cat(
                 [x_t_data, x_t_cond], dim=-1)
@@ -798,6 +837,9 @@ def sample_cd_save(args, model, scheduler, dataloader, save_key, feature_model,u
     data_mean = dataloader.dataset.dataset.data_mean.to(device).float()
     data_std = dataloader.dataset.dataset.data_std.to(device).float()
     sum_cd = 0
+    sum_ave_distance = 0
+    sum_vrel_mse = 0
+    sum_rcs_mse = 0
     for i_batch, batch in enumerate(dataloader):
         (depths,
             radar_data,
@@ -807,13 +849,20 @@ def sample_cd_save(args, model, scheduler, dataloader, save_key, feature_model,u
             npoints,
             npoints_filtered) = batch
         image_rgb = image_rgb.to(device)
+        depths = depths.to(device)
         B, N, D = radar_data.shape
         x_0_data = radar_data.float().to(device)
 
-        xts_tensor_list, steps, cd_loss = sample(args, id_list, all_cond_signal, feature_model, unet_cond_model.eval(),
-                                                 model.eval(), scheduler, args.T, B, N, D, x_0_data, device, data_mean=data_mean, data_std=data_std, image_rgb=image_rgb, camera=camera, frame_token=frame_token)
+        xts_tensor_list, steps, cd_loss,ave_distance, vrel_mse, rcs_mse = sample(args, id_list, all_cond_signal, feature_model, unet_cond_model.eval(),
+                                                 model.eval(), scheduler, args.T, B, N, D, x_0_data, device, data_mean=data_mean, data_std=data_std, image_rgb=image_rgb, 
+                                                 depth_image=depths, camera=camera, frame_token=frame_token)
 
         sum_cd += cd_loss.sum().item()
+        if D==7:
+            sum_ave_distance += ave_distance.sum().item()
+            sum_vrel_mse += vrel_mse.sum().item()
+            sum_rcs_mse += rcs_mse.sum().item()
+
         for i_result, frame_tkn in enumerate(frame_token):
             xts = xts_tensor_list[:, i_result, :, :]
             cd = cd_loss[i_result]
@@ -823,10 +872,28 @@ def sample_cd_save(args, model, scheduler, dataloader, save_key, feature_model,u
                 0), xts, steps,  cd=cd.item(), data_mean=data_mean, data_std=data_std, config=exp_config)
             writer.add_scalars(
                 f"CD", {f"{save_key}/{frame_tkn[:3]}": cd.item()}, epoch)
+            if D==7:
+                writer.add_scalars(
+                    f"ave_distance", {f"{save_key}/{frame_tkn[:3]}": ave_distance[i_result].item()}, epoch)
+                writer.add_scalars(
+                    f"vrel_mse", {f"{save_key}/{frame_tkn[:3]}": vrel_mse[i_result].item()}, epoch)
+                writer.add_scalars(
+                    f"rcs_mse", {f"{save_key}/{frame_tkn[:3]}": rcs_mse[i_result].item()}, epoch)
             if frame_tkn not in cd_list:
                 cd_list[frame_tkn] = []
             cd_list[frame_tkn].append(cd.item())
     cd_ave=sum_cd / len(dataloader.dataset)
+    if D==7:
+        ave_distance = sum_ave_distance / len(dataloader.dataset)
+        vrel_mse = sum_vrel_mse / len(dataloader.dataset)
+        rcs_mse = sum_rcs_mse / len(dataloader.dataset)
+        writer.add_scalars(
+            f"mean_distance", {f"{save_key}/average": ave_distance}, epoch)
+        writer.add_scalars(
+            f"vrel_mse", {f"{save_key}/average": vrel_mse}, epoch)
+        writer.add_scalars(
+            f"rcs_mse", {f"{save_key}/average": rcs_mse}, epoch)
+
     writer.add_scalars(
                 f"CD", {f"{save_key}/average": cd_ave}, epoch)
     return cd_ave, cd_list
@@ -904,7 +971,7 @@ def get_model(args,D, device):
         cond_dim = 0
     elif args.cond_type == "zero":
         cond_dim = args.pc2_conditioning_dim
-    elif args.cond_type == "unet":
+    elif "unet" in args.cond_type :
         cond_dim = 128
 
     if args.model_name == "pvcnn":
@@ -1012,7 +1079,7 @@ def main():
     with open(os.path.abspath(__file__), 'r') as f:
         code = f.read()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    D = 3
+    D = 7 if args.get_all_data else 3 # if not args.get_all_data, we only use xyz, otherwise we use all data (xyz + vrel + rcs)
     run_name = f"{args.method}_{args.num_points:04d}_sc{args.num_scenes}-b{args.batch_size }-p{args.n_pull}"
     log_dir = f"{args.base_dir}/tb_log/{args.data_group}/{run_name}"
     dir_rev = 0
@@ -1039,7 +1106,7 @@ def main():
     writer.add_text("config", json.dumps(exp_config, indent=4))
     torch.manual_seed(args.seed_value)
     dataloader_train, dataloader_val = get_man_data(args.num_scenes, args.num_points, args.camera_channel, args.radar_channel,
-                                                    device, args.img_size, args.batch_size, shuffle=True, n_val=args.n_val, n_pull=args.n_pull, flip_images=args.flip_images)
+                                                    device, args.img_size, args.batch_size, shuffle=True, n_val=args.n_val, n_pull=args.n_pull, flip_images=args.flip_images,coord_only = not args.get_all_data)
 
     data_mean, data_std = dataloader_train.dataset.dataset.data_mean, dataloader_train.dataset.dataset.data_std
     print("data_mean", data_mean.tolist())
@@ -1070,9 +1137,19 @@ def main():
     attention_resolutions="16,8"
     attention_ds = [args.img_size // int(res) for res in attention_resolutions.split(",")]
     channel_mult =(0.5, 1, 1, 2, 2, 4, 4)
-    unet_cond_model =  EncoderUNetModelNoTime(
+
+    if "unet" in args.cond_type :
+        if args.cond_type == "unet":
+            cond_in_channels = 3
+        elif args.cond_type == "unet_depth":
+            cond_in_channels = 1
+        elif args.cond_type == "unet_imgdepth":
+            cond_in_channels = 4
+        else:
+            raise ValueError(f"Unknown UNet conditioning type {args.cond_type}")
+        unet_cond_model =  EncoderUNetModelNoTime(
             image_size=args.img_size,
-            in_channels=D,
+            in_channels=cond_in_channels, #ch of image which is 3 (RGB)
             model_channels=128,
             out_channels=128,
             num_res_blocks=2,
@@ -1088,6 +1165,8 @@ def main():
             use_new_attention_order=False,
             pool='adaptive'
         ).to(device)
+    else:
+        unet_cond_model = None
 
     # Load checkpoint if exists
     if args.resume_from_checkpoint:
@@ -1141,7 +1220,7 @@ def main():
             cd_train_ave, new_train_cd_list = sample_cd_save(args, model, scheduler, dataloader_train, "train", feature_model, unet_cond_model,
                                                              device, epoch, id_list, all_cond_signal, run_name, exp_config, writer, train_cd_list)
             cd_val_ave, new_val_cd_list = sample_cd_save(args, model, scheduler, dataloader_val, "val", feature_model, unet_cond_model,
-                                                         device, epoch, id_list, all_cond_signal, run_name, exp_config, writer, val_cd_list)
+                                                         device, epoch, id_list, all_cond_signal, run_name, exp_config, writer, val_cd_list,)
 
         tt.set_description_str(
             f"MSE = {train_loss:.2f}, CD_tr = {cd_train_ave:.2f}, CD_val = {cd_val_ave:.2f}")
