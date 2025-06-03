@@ -679,6 +679,12 @@ def get_argparse():
     parser.add_argument("-getvr", "--get_all_data", action='store_true', default=False,
                         help="Get all data from the dataset, not only coordinates")
 
+    parser.add_argument("-mdm_size_mult", "--mdm_size_multiplier", type=float, default=1.0,
+                        help="Multiplier for the size of the MDM model")
+    
+
+
+
     args = parser.parse_args()
     return args
 
@@ -1031,10 +1037,10 @@ def get_model(args,D, device):
         return MDM(
             in_channels=D,
             out_channels=D,
-            num_heads=8,
-            ff_size=2048,
-            model_channels=512,
-            num_layers=6,
+            num_heads=int(8* args.mdm_size_multiplier), # 6 for small, 8 for medium, 12 for large
+            ff_size=int(2048 * args.mdm_size_multiplier), # 2048 for small, 4096 for medium, 8192 for large
+            model_channels=int(512 * args.mdm_size_multiplier), # 512 for small, 1024 for medium, 2048 for large
+            num_layers=int(6 * args.mdm_size_multiplier), # 6 for small, 12 for medium, 24 for large
             condition_dim=cond_dim,
             dropout=args.pvcnn_dropout
         ).to(device)

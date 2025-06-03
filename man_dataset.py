@@ -4,9 +4,10 @@ import open3d as o3d
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import trange
 from pytorch3d.loss.chamfer import chamfer_distance
-import json
+import json,pypcd4
 import os
 import torch
+import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
 import math
@@ -37,6 +38,8 @@ class MANDataset(Dataset):
         radar_channel='RADAR_LEFT_FRONT',
         camera_channel='CAMERA_RIGHT_FRONT',
         double_flip_images=True,
+        coord_only=True,  # if True, only return coordinates of points
+
     ):
         self.M = M
         self.N = N
@@ -50,6 +53,7 @@ class MANDataset(Dataset):
         self.radar_channel = radar_channel
         self.camera_channel = camera_channel
         self.double_flip_images = double_flip_images
+        self.coord_only = coord_only  # if True, only return coordinates of points
 
         # store mean and std
 
@@ -82,9 +86,10 @@ class MANDataset(Dataset):
                 f"Warning: only {len(self.data_bank)} samples found in scene {self.scene_id}")
 
         all_radar_positions = torch.stack(
-            [d[1] for d in self.data_bank], dim=0)
-        print("all_radar_positions", all_radar_positions.shape)  # 1x 16 x3
+            [d[1] for d in self.data_bank], dim=0) #filtered_radar_data
         # print("all_radar_positions", all_radar_positions)  # 1x 16 x3
+        print("all_radar_positions", all_radar_positions.shape)  # 1x 16 x1
+
 
         # calculate means
         dims = all_radar_positions.shape
@@ -94,6 +99,15 @@ class MANDataset(Dataset):
         # std are 1s, same shape of data_mean
         if all_radar_positions.reshape(-1, dims[-1]).shape[0] == 1:
             self.data_std = torch.ones_like(self.data_mean)
+        
+        print("data_mean", self.data_mean, "data_std", self.data_std, )
+
+        # all_radar_positions torch.Size([1, 128, 3])
+        # all_vrel torch.Size([1, 128, 3])
+        # all_rcs torch.Size([1, 128, 1])
+        # data_mean tensor([79.6537,  5.0939,  0.3102]) data_std tensor([36.9492, 28.5173,  2.8060])
+        # vrel_mean tensor([-2.1093, -0.1453,  0.0066]) vrel_std tensor([0.3315, 0.7359, 0.1138])
+        # rcs_mean tensor([-2.3594]) rcs_std tensor([7.6742])
 
         # print("self.data_mean", self.data_mean)
         # print("self.data_std", self.data_std)
@@ -156,7 +170,7 @@ class MANDataset(Dataset):
         MAN_image_height = 943
 
         s = image_size/MAN_image_height
-        print("calib_to_camera_base_MAN s", s)
+        # print("calib_to_camera_base_MAN s", s)
         # Convert intrinsic matrix K to tensor
 
         K = torch.tensor(cam_calib['camera_intrinsic'])
@@ -230,8 +244,21 @@ class MANDataset(Dataset):
         # 2) load radar
         # load pcd
         radar_pcd_path = os.path.join(self.data_root, radar['filename'])
-        cloud = o3d.io.read_point_cloud(radar_pcd_path)
-        radar_data = torch.tensor(cloud.points)
+        # cloud = o3d.io.read_point_cloud(radar_pcd_path)
+        # # print("radar_pcd_path", radar_pcd_path)
+        # # print("cloud", cloud)
+        # radar_data = torch.tensor(cloud.points)
+        # print("radar_data", radar_data.shape)  # (N, 3) 
+        # print("type(radar_data)", type(radar_data))  # <class 'torch.Tensor'>
+        
+        
+        radar_data = pypcd4.PointCloud.from_path(radar_pcd_path).pc_data
+        points = np.array([radar_data["x"], radar_data["y"], radar_data["z"],
+                           radar_data["vrel_x"], radar_data["vrel_y"], radar_data["vrel_z"],
+                           radar_data["rcs"]], dtype=np.float64).T
+        # print("points", points.shape)  # (7, N)
+
+        radar_data_all = torch.tensor(points, dtype=torch.float32)
         npoints_original = radar_data.shape[0]
 
         # 3) load calibration
@@ -274,7 +301,7 @@ class MANDataset(Dataset):
             align_corners=False,
         ).squeeze(0)
 
-        world_points = radar_data.clone().detach().float()
+        world_points = radar_data_all[:,:3].clone().detach().float()
 
         image_coord = cam_calib_obj.transform_points(world_points)
         points_uv = image_coord[:, :2]  # N x2
@@ -287,7 +314,7 @@ class MANDataset(Dataset):
             & (points_uv[:, 0] < camera_front.shape[1])
             # & (points_uv[:, 2] > 0)  # Ensure points are in front of the camera
         )
-        filtered_radar_data = radar_data[mask]
+        filtered_radar_data = radar_data_all[mask]
         npoints_filtered = filtered_radar_data.shape[0]
 
         # 6) randomly filter point or sample to have N points
@@ -305,7 +332,11 @@ class MANDataset(Dataset):
                     ],
                 ]
             )
-
+        if self.coord_only:
+            filtered_radar_data = filtered_radar_data[:, :3]
+        # print(f"frame_token: {frame_token}, npoints_original: {npoints_original}, npoints_filtered: {npoints_filtered}")
+        # print("filtered_radar_data", filtered_radar_data.shape)  # (N, 3) or (N, 7)
+        
         return (
             depth_image,
             filtered_radar_data,
@@ -313,7 +344,7 @@ class MANDataset(Dataset):
             camera_front,
             frame_token,
             npoints_original,
-            npoints_filtered
+            npoints_filtered,
         )
 
     def __len__(self):
@@ -331,10 +362,11 @@ class MANDataset(Dataset):
             camera_front,
             frame_token,
             npoints_original,
-            npoints_filtered
+            npoints_filtered,
         ) = self.data_bank[idx]
 
         point_out = (filtered_radar_data - self.data_mean) / self.data_std
+
 
         return (
             depth_image,
