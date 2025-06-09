@@ -25,6 +25,11 @@ class MDM(nn.Module):
         self.ff_size = ff_size
         self.condition_dim = condition_dim
         self.dropout = dropout
+
+        print(f"MDM: in_channels {self.in_channels}, out_channels {self.out_channels}, "
+              f"model_channels {self.model_channels}, num_heads {self.num_heads}, "
+              f"ff_size {self.ff_size}, num_layers {self.num_layers}, "
+              f"condition_dim {self.condition_dim}, dropout {self.dropout}, ")
         
         # Input Embedding (Processing the input e.g., project into the latent before pass through the trasnformer layer)
         self.input_process = nn.Linear(self.in_channels, self.model_channels)
@@ -62,8 +67,8 @@ class MDM(nn.Module):
         """
         # Condition Embedding
         # cond_emb = kwargs['cond']
-        cond_emb = x[:, 0, 3:]   # [bs, condition_dim]
-        cond_emb *=0 #fortesting
+        cond_emb = x[:, 0, self.in_channels :]   # [bs, condition_dim]
+        # cond_emb *=0 #fortesting
         # print("cond_emb : ", cond_emb.shape) #torch.Size([1, 2])
         cond_emb_proj = self.cond_proj_layer(cond_emb)   # [bs,  model_channels]
         # Time Embedding
@@ -76,8 +81,8 @@ class MDM(nn.Module):
         emb = cond_emb_proj.unsqueeze(1) + t_emb  # [bs, 1, d] ????
         # print("timecomb emb : ", emb.shape) #torch.Size([1, 1, 512])
         # print("x : ", x.shape) #torch.Size([1, 128, 67])
-        x=x[:,:,:3]
-        # print("x : ", x.shape)#torch.Size([1, 128, 3])
+        x=x[:,:,:self.in_channels]
+        # print("2x : ", x.shape)#torch.Size([1, 128, 3])
         x = self.input_process(x)
         # print("x : ", x.shape)
         # print("emb : ", emb.shape)

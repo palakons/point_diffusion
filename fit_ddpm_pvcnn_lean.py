@@ -681,7 +681,9 @@ def get_argparse():
 
     parser.add_argument("-mdm_size_mult", "--mdm_size_multiplier", type=float, default=1.0,
                         help="Multiplier for the size of the MDM model")
-    
+    #shuffle images
+    parser.add_argument("-shuffle_img", "--shuffle_images", action='store_true', default=False, 
+                        help="Shuffle images in the batch")
 
 
 
@@ -751,11 +753,13 @@ def train_val_one_epoch(args, dataloader, model, optimizer, scheduler, feature_m
 
     if operation == "train":
         model.train()
-        unet_cond_model.train()
+        if unet_cond_model is not None:
+            unet_cond_model.train()
         cm = nullcontext()
     elif operation == "val":
         model.eval()
-        unet_cond_model.eval()
+        if unet_cond_model is not None:
+            unet_cond_model.eval()
         cm = torch.no_grad()
     else:
         raise ValueError(f"Unknown operation {operation}")
@@ -770,19 +774,43 @@ def train_val_one_epoch(args, dataloader, model, optimizer, scheduler, feature_m
                 frame_token,
                 npoints,
                 npoints_filtered) = batch
+        
+            #if shuffle_images is True, shuffle the images in the batch
+            if args.shuffle_images and operation == "train":
+                # print("Shuffling images in the batch")
+                shuffle_indices = torch.randperm(image_rgb.size(0))
+                image_rgb = image_rgb[shuffle_indices]
+                depths = depths[shuffle_indices]
 
             # print(f"shape radar_data {radar_data.shape}, image_rgb {image_rgb.shape}, frame_token {len(frame_token)} npoints {npoints}, npoints_filtered {npoints_filtered}")
             
             image_rgb = image_rgb.to(device)
             depths = depths.to(device)
+            radar_data = radar_data.float().to(device)
+            point_mean = dataloader.dataset.dataset.data_mean.to(device).float()
+            point_std = dataloader.dataset.dataset.data_std.to(device).float()
+
+            # print(f"shape radar_data {radar_data.shape}, image_rgb {image_rgb.shape}, frame_token {len(frame_token)} npoints {npoints}, npoints_filtered {npoints_filtered} point_mean {point_mean.shape}, point_std {point_std.shape}")
+            #shape radar_data torch.Size([2, 4, 3]), 
+            # image_rgb torch.Size([2, 3, 618, 618]), 
+            # frame_token 2 
+            # npoints tensor([800, 800]), 
+            # npoitsnts_filtered tensor([585, 569]) 
+            # point_mean torch.Size([3]), 
+            # point_std torch.Size([3])
+
+            # print("radar_data", radar_data)
+            # print("image_rgb", image_rgb[:,:,:3,:3 ]) #torch.Size([2, 3, 3, 3])
+            # print("depths", depths[:,:3,:3]) #torch.Size([2, 3, 3])
+            # print("frame_token", frame_token)#frame_token ['deb7b3f332f042d49e7636d6e4959354', '32d2bcf46e734dffb14fe2e0a823d059']
             
             if args.cond_type!= "camera":
-                x_t_cond = get_conditioning(args, device, id_list, all_cond_signal, radar_data.float().to(device),
-                                        feature_model, unet_cond_model,camera, frame_token, image_rgb,   depths,point_mean=dataloader.dataset.dataset.data_mean.to(device).float(), point_std=dataloader.dataset.dataset.data_std.to(device).float())
+                x_t_cond = get_conditioning(args, device, id_list, all_cond_signal, radar_data,
+                                        feature_model, unet_cond_model,camera, frame_token, image_rgb,   depths,point_mean=point_mean, point_std=point_std)
                 #duplicate duplication_augmentation_factor times dim 0
                 x_t_cond = x_t_cond.repeat(
                     args.duplication_augmentation_factor, 1, 1) if operation == "train" else x_t_cond
-
+                    
             if operation == "train": # duplication_augmentation_factor
                 # print(f"camera focal length {camera.focal_length.shape}, camera principal point {camera.principal_point.shape} R {camera.R.shape}, T {camera.T.shape} I {camera.image_size.shape}")
                 # print(f"radar_data shape {radar_data.shape}, image_rgb shape {image_rgb.shape}, frame_token {len(frame_token)} npoints {npoints}, npoints_filtered {npoints_filtered}")
@@ -802,10 +830,18 @@ def train_val_one_epoch(args, dataloader, model, optimizer, scheduler, feature_m
                 # print(f"camera focal length {camera.focal_length.shape}, camera principal point {camera.principal_point.shape} R {camera.R.shape}, T {camera.T.shape} I {camera.image_size.shape}")
                 # print(f"radar_data shape {radar_data.shape}, image_rgb shape {image_rgb.shape}, frame_token {len(frame_token)} npoints {npoints}, npoints_filtered {npoints_filtered}")
                 
+            # print("radar_data", radar_data)
+            # print("camera length", camera.focal_length)
+            # print("camera principal point", camera.principal_point)
+            # print("camera R", camera.R)
+            # print("camera T", camera.T)
+            # print("image_rgb", image_rgb.shape) #torch.Size([2, 3, 3, 3])
+            # print("Frame tokens", frame_token)
+
             B, N, D = radar_data.shape
 
 
-            x_0_data = radar_data.float().to(device)
+            x_0_data = radar_data
 
             noise = torch.randn_like(x_0_data)
             tv_step_t = torch.randint(
@@ -819,6 +855,13 @@ def train_val_one_epoch(args, dataloader, model, optimizer, scheduler, feature_m
             x_t = torch.cat(
                 [x_t_data, x_t_cond], dim=-1)
 
+            # print(f"noise shape {noise.shape}")
+            # print(f"tv_step_t {tv_step_t.shape}, {tv_step_t}")
+            # print(f" x_t_data {x_t_data.shape}, x_0_data {x_0_data.shape}, x_t_cond {x_t_cond.shape}, x_t {x_t.shape}")
+
+            # noise shape torch.Size([4, 4, 3])
+            # tv_step_t torch.Size([4]), tensor([ 3, 69,  0, 24], device='cuda:0')
+            # x_t_data torch.Size([4, 4, 3]), x_0_data torch.Size([4, 4, 3]), x_t_cond torch.Size([4, 4, 128]), x_t torch.Size([4, 4, 131])
             if operation == "train":
                 optimizer.zero_grad()
 
@@ -828,6 +871,11 @@ def train_val_one_epoch(args, dataloader, model, optimizer, scheduler, feature_m
 
             sum_loss += loss.item() * B
 
+            # print(f"pred_noise {pred_noise.shape}")
+            # print(f"loss {loss.item():.4f}")
+            # print("sum loss", sum_loss)
+
+            # exit()
             if operation == "train":
                 loss.backward()
                 optimizer.step()
@@ -859,7 +907,7 @@ def sample_cd_save(args, model, scheduler, dataloader, save_key, feature_model,u
         B, N, D = radar_data.shape
         x_0_data = radar_data.float().to(device)
 
-        xts_tensor_list, steps, cd_loss,ave_distance, vrel_mse, rcs_mse = sample(args, id_list, all_cond_signal, feature_model, unet_cond_model.eval(),
+        xts_tensor_list, steps, cd_loss,ave_distance, vrel_mse, rcs_mse = sample(args, id_list, all_cond_signal, feature_model, unet_cond_model.eval() if unet_cond_model is not None else None,
                                                  model.eval(), scheduler, args.T, B, N, D, x_0_data, device, data_mean=data_mean, data_std=data_std, image_rgb=image_rgb, 
                                                  depth_image=depths, camera=camera, frame_token=frame_token)
 
