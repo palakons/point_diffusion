@@ -30,6 +30,7 @@ import time
 from model.pvcnn.modules.pvconv import PVConv
 from mymdm import MDM
 
+from pytorch3d.renderer.cameras import PerspectiveCameras
 from truckscenes_devkit.mydev.guided_diffusion.models.unet import EncoderUNetModelNoTime
 
 local_feature_cache = {}
@@ -777,10 +778,23 @@ def train_val_one_epoch(args, dataloader, model, optimizer, scheduler, feature_m
         
             #if shuffle_images is True, shuffle the images in the batch
             if args.shuffle_images and operation == "train":
-                # print("Shuffling images in the batch")
-                shuffle_indices = torch.randperm(image_rgb.size(0))
-                image_rgb = image_rgb[shuffle_indices]
-                depths = depths[shuffle_indices]
+                if args.batch_size >1:
+                    # print("Shuffling images in the batch")
+                    shuffle_indices = torch.randperm(image_rgb.size(0))
+                    print(f"Shuffle_indices {shuffle_indices}")
+                    image_rgb = image_rgb[shuffle_indices]
+                    depths = depths[shuffle_indices]
+                    frame_token = [frame_token[i] for i in shuffle_indices]
+                    camera = PerspectiveCameras(
+                        focal_length=camera.focal_length[shuffle_indices],
+                        principal_point=camera.principal_point[shuffle_indices],
+                        R=camera.R[shuffle_indices],
+                        T=camera.T[shuffle_indices],
+                        image_size=camera.image_size[shuffle_indices],
+                    )
+                else:
+                    print("No use shuffling images in the batch, batch size is 1")
+
 
             # print(f"shape radar_data {radar_data.shape}, image_rgb {image_rgb.shape}, frame_token {len(frame_token)} npoints {npoints}, npoints_filtered {npoints_filtered}")
             
@@ -1179,7 +1193,12 @@ def main():
                               clip_sample=False,  # important for point clouds
                               )
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
+    # optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
+    optimizer = torch.optim.Adam(
+    list(model.parameters()) + (list(unet_cond_model.parameters()) if unet_cond_model is not None else []),
+    lr=args.learning_rate
+)
+    assert optimizer is not None, "Optimizer is None, please check the learning rate and model parameters"
     train_cd_list = {}
     val_cd_list = {}
     cd_epochs = []
@@ -1221,6 +1240,10 @@ def main():
         ).to(device)
     else:
         unet_cond_model = None
+    
+    print("MDM model", model)
+    print("UNet conditioning model", unet_cond_model)
+    exit()
 
     # Load checkpoint if exists
     if args.resume_from_checkpoint:
