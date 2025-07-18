@@ -1,5 +1,5 @@
 import math
-import os
+import os,sys
 import os.path as osp
 import time
 from datetime import datetime
@@ -209,21 +209,22 @@ def line_to_dir(line):
     theta, phi= line[:2]
     return np.array([np.cos(theta) * np.cos(phi), np.sin(theta) * np.cos(phi), np.sin(phi)])
 
-def plot_lines_5d_matplot_multi(ax,lines, title="Lines", color='blue'):
+def plot_lines_5d_matplot_multi(ax,lines, title="Lines", color='blue', line_style=None, d_line=10):
     
     for i,line in enumerate(lines):
         #max_theta, max_phi, max_qy, max_qz, max_qx
         theta, phi, =line['thetaphi']
         x0,y0, z0 = line['p0']
         direction = line_to_dir_multi(line)
-        ax.plot([x0 - direction[0] * 10,  # Extend line in both directions
-                 x0 + direction[0] * 10],
-                [y0 - direction[1] * 10,  # Extend line in both directions
-                 y0 + direction[1] * 10],
-                [z0 - direction[2] * 10,  # Extend line in both directions
-                 z0 + direction[2] * 10],
+        ax.plot([x0 - direction[0] * d_line,  # Extend line in both directions
+                 x0 + direction[0] * d_line],
+                [y0 - direction[1] * d_line,  # Extend line in both directions
+                 y0 + direction[1] * d_line],
+                [z0 - direction[2] * d_line,  # Extend line in both directions
+                 z0 + direction[2] * d_line],
                 color=color if isinstance(color,str) else color[i],
                 linewidth=2,
+                linestyle=line_style if line_style is not None else '-',
                 label=f'{title}: {theta*180/np.pi:.2f},{phi*180/np.pi:.2f}({x0:.2f},{y0:.2f},{z0:.2f})/{line["votes"]:.2f}')
         #plot point p0
         ax.scatter(x0, y0, z0, color=color if isinstance(color,str) else color[i], s=50, 
@@ -266,43 +267,48 @@ def voxel_downsample_index(points, voxel_size):
     _, unique_idx = np.unique(coords, axis=0, return_index=True)
     return unique_idx
 
-# mask_out_value =[80,110,120]
-mask_out_value =[138,125,97]
-mask_in_value=[58,53,25]
 
-colamp_output_file =f'/data/palakons/colmap_data/seq_0/dense/fused.ply'
-if os.path.exists(colamp_output_file):
-    import open3d as o3d
-    pcd = o3d.io.read_point_cloud(colamp_output_file)
-    o3d.visualization.draw_geometries([pcd])
-    #plot matplotlib
-    points = np.asarray(pcd.points)
-    colors = np.asarray(pcd.colors)
-    print("points.shape:", points.shape)
+def read_ply(colamp_output_file =f'/data/palakons/colmap_data/seq_0/dense/fused.ply'):
+    
+    if os.path.exists(colamp_output_file):
+        import open3d as o3d
+        pcd = o3d.io.read_point_cloud(colamp_output_file)
+        o3d.visualization.draw_geometries([pcd])
+        #plot matplotlib
+        points = np.asarray(pcd.points)
+        colors = np.asarray(pcd.colors)
+        print("points.shape:", points.shape)
+    return points, colors
 
+def make_table_sizes( angular_range, spatial_range,max_dist,available_vram= 10240*.9):
+    """
+    Estimate optimal table sizes for the Hough accumulator based on parameter ranges and available VRAM.
 
-#random mask for 10% of points
-mask = np.random.rand(points.shape[0]) <= .5
-points = points[mask]
-colors = colors[mask]
-# print("colors after masking:", colors)
-print("points shape:", points.shape)
-mask_thresh=.1
-# masked_points, masked_colors = get_masked_colmap_points(points,colors, mask_in_value,mask_thresh,filt_type="in")
-masked_colors = colors
-masked_points = points
+    This function ensures that the spatial resolution is balanced with the angular resolution at the maximum visible distance (`max_dist`),
+    so that distant structures are not underrepresented compared to nearby ones.
 
-print("masked_points shape:", masked_points.shape)
-print("masked_colors shape:", masked_colors.shape)
-#filter out z<0
-# masked_colors = masked_colors[masked_points[:, 2] > 0]
-# masked_points = masked_points[masked_points[:, 2] > 0]
-# #x<4
-# masked_colors = masked_colors[masked_points[:, 0] > 4]
-# masked_points = masked_points[masked_points[:, 0] > 4]
-print("masked_points shape:", masked_points.shape)
-print("masked_colors shape:", masked_colors.shape)
+    Args:
+        rat (float): Scaling ratio to control overall accumulator resolution.
+        available_vram (int): Estimated available GPU memory in MiB.
+        max_dist (float): Maximum distance of visible points in the scene (used to balance spatial and angular resolutions).
 
+    Returns:
+        tuple: Calculated sizes for each dimension of the Hough accumulator table.
+    """
+    #optmize for rat
+    rat=2
+    angular_spatial_resolution , spatial_resolution =1,0
+    while angular_spatial_resolution > spatial_resolution:
+        rat += 1
+        num_dist_var = ((available_vram * 1024 * 1024 / 4) / rat**2)**(1/3)
+        angular_resolution = angular_range / rat
+        angular_spatial_resolution = max_dist * np.sin(angular_resolution)
+        spatial_resolution = spatial_range / num_dist_var
+
+    print("rat:", rat, f"num_dist_var {num_dist_var:.2f}",f"angular_spatial_resolution: {angular_spatial_resolution:.2f}", f"spatial_resolution: {spatial_resolution:.2f}")
+
+    table_sizes = np.array([int(rat),int(rat),int(num_dist_var),int(num_dist_var),int(num_dist_var)])
+    return table_sizes
 
 if False:
     # set np seed
@@ -320,90 +326,93 @@ if False:
     #add white noise
     masked_points = rand_point + np.random.normal(0, 0.1, rand_point.shape)  # Adding some noise to the points
     print("masked_points shape after adding noise:", masked_points.shape)
-    #color randomly
-    masked_colors = np.random.rand(masked_points.shape[0], 3)  #
-    masked_colors = masked_colors   # Scale colors to [0, 255] range
-    masked_colors = masked_colors.reshape(-1, 3)  # Reshape to Nx
 
+#trucksc file root
+trucksc_file_root = "/data/palakons/new_dataset/MAN/mini/man-truckscenes"
+trucksc = TruckScenes('v1.0-mini', trucksc_file_root, True)
 
 # param_ranges = [[0, np.pi], [0, np.pi], [2.5, 3.5], [-1.5, -.5], [2.5, 3.5]]
-# param_ranges = [[0, np.pi], [0, np.pi], [-5, 5], [-5, 5], [-5, 5]]
-param_ranges = [[0, np.pi], [0, np.pi], [-20, 20], [-20, 20], [-20, 20]]
+param_ranges = [[0, np.pi]]*2+ [[-150, 150]]*3
+# param_ranges = [[0, np.pi], [0, np.pi], [-20, 20], [-20, 20], [-20, 20]]
 # param_ranges = [[np.pi/4, np.pi/2], [3/4*np.pi, 5/4*np.pi], [5, 15], [-5, 0], [5, 15]]
 h_level =1
-output_n_best = 30
+output_n_best = 10
 vote_filter_threshold=.1
 vote_method='hard'
-smooth_kernel = 9
-point_prune_voxel_size = .5  # Voxel size for pruning points
-# availble_vram = torch.cuda.get_device_properties(0).total_memory / 1e6*.9 #MiB
-availble_vram = 10240*.9 #MiB
-# for rat in np.linspace(3, 55,10 , endpoint=False):
-if point_prune_voxel_size > 0:
-    downsample_index =voxel_downsample_index(masked_points, point_prune_voxel_size)
-    print("downsample_index shape:", downsample_index.shape)
-    masked_points = masked_points[downsample_index, :]
-    masked_colors = masked_colors[downsample_index, :]
-for rat in [65]:#np.linspace(131, 645,8, endpoint=False):
+smooth_kernel = 0
+point_prune_voxel_size = 0 # Voxel size for pruning points
+available_vram = 10240*.9 #MiB
+max_dist = 150
+table_sizes = make_table_sizes( param_ranges[0][1]- param_ranges[0][0], param_ranges[2][1]- param_ranges[2][0],max_dist,available_vram= available_vram)
+
+#make seq_id and i_frame accept from CLI
+
+seq_id = int(sys.argv[1]) if len(sys.argv) > 1 else 0
+i_frame = int(sys.argv[2]) if len(sys.argv) > 2 else 0
+
+print(f"seq_id: {seq_id}, i_frame: {i_frame}")
+d_plot=200
+
+fig_png_fname = "/home/palakons/logs/r-r/"+ f"hough_radars_{table_sizes[0]:04d}_hlevel_{h_level}_nbest_{output_n_best}_vth_{vote_filter_threshold:.2f}_{smooth_kernel:02d}_{vote_method}_{point_prune_voxel_size:.2f}_{seq_id:02d}_{i_frame:02d}.png"
+
+fig,ax = plt.subplots(2, 2, subplot_kw={'projection': '3d'}, figsize=(16, 16))
+
+fig.suptitle(f"Hough Lines smooth{smooth_kernel}_vote{vote_method}_prune{point_prune_voxel_size:.2f} (rat={table_sizes[0]}, h_level={h_level}, n_best={output_n_best}, vth={vote_filter_threshold:.2f})\n"
+             f"seq_id: {seq_id}, i_frame: {i_frame}", fontsize=16)
+
+name =  ["perspective","xy plane","xz plane","yz plane"]
+views_ele_azm = [
+    (30, -45),  # Perspective view
+    (90, -90),   # Top-down view (XY plane)
+    (0, -90),    # Side view (XZ plane)
+    (0, 0)    # Side view (YZ plane)
+]
+cmap = plt.cm.gist_rainbow 
+radar_colors = [cmap(i / 6) for i in range(6)]  # Generate 6 distinct colors for radars
+line_style= [ '-', '--', '-.', ':', '-', '--']  # Different line styles for each radar
+
+radars_data = {}
+for i_rad,radar_ch in enumerate(["RADAR_LEFT_FRONT", "RADAR_RIGHT_FRONT", "RADAR_LEFT_BACK", "RADAR_RIGHT_BACK", "RADAR_LEFT_SIDE", "RADAR_RIGHT_SIDE"]):
+    radars_data[radar_ch] = {"hough_lines": None, "time": None}
+    radar_token = get_camera_token(trucksc, seq_id=seq_id, i_frame=i_frame, camera_channel=radar_ch)
+    radar_obj = get_rtk_man_ego(radar_token)
+    rad_file = radar_obj['image_file']  # File path to the radar data
+    radar_data = pypcd4.PointCloud.from_path(os.path.join(trucksc_file_root,rad_file) ).pc_data
+    radar_points = np.array([radar_data["x"], radar_data["y"], radar_data["z"]], dtype=np.float64)
+
+    print(f"radar_points shape: {radar_points.shape}, dtype: {radar_points.dtype}")
+
+    # radars_data[radar_ch]["points"] = radar_obj["rotation"] @ radar_points + radar_obj["translation"].reshape(3, 1)  # Transform points to world coordinates
+    print(f"radar_points.shape: {radar_points.shape}, dtype: {radar_points.dtype}")
+
+    masked_points = (radar_obj["rotation"] @ radar_points + radar_obj["translation"].reshape(3, 1)).T
+
+    if point_prune_voxel_size > 0:
+        downsample_index =voxel_downsample_index(masked_points, point_prune_voxel_size)
+        print("downsample_index shape:", downsample_index.shape)
+        masked_points = masked_points[downsample_index, :]
+
     time0 =     time.time()
-    # rat**2*num_dist_var**3 =availble_vram
-    num_dist_var = ((availble_vram * 1024 * 1024 / 4) / rat**2)**(1/3)
 
-    table_sizes = np.array([int(rat),int(rat),int(num_dist_var),int(num_dist_var),int(num_dist_var)])
-    print("table_sizes:", table_sizes,table_sizes[0]* table_sizes[1]* table_sizes[2]* table_sizes[3]* table_sizes[4] * 4 / 1024 / 1024, "MiB")
-    print(f"resolution: {(param_ranges[0][1] - param_ranges[0][0]) / table_sizes[0]*180/np.pi:.2f} deg, {(param_ranges[1][1] - param_ranges[1][0]) / table_sizes[1]*180/np.pi:.2f} deg, "
-          f"{(param_ranges[2][1] - param_ranges[2][0]) / table_sizes[2]:.2f}, "
-          f"{(param_ranges[3][1] - param_ranges[3][0]) / table_sizes[3]:.2f}, "
-          f"{(param_ranges[4][1] - param_ranges[4][0]) / table_sizes[4]:.2f}")
-    
+    print(f"resolution: {(param_ranges[0][1] - param_ranges[0][0]) / table_sizes[0]*180/np.pi:.2f} deg, {(param_ranges[1][1] - param_ranges[1][0]) / table_sizes[1]*180/np.pi:.2f} deg, {(param_ranges[2][1] - param_ranges[2][0]) / table_sizes[2]:.2f}, {(param_ranges[3][1] - param_ranges[3][0]) / table_sizes[3]:.2f}, {(param_ranges[4][1] - param_ranges[4][0]) / table_sizes[4]:.2f}")
+    #=============================== Hough Transform ============================
     h_line  = hough_closest_point_cuda(masked_points, table_sizes, param_ranges, dtype=torch.float32, show_dist=0.00, output_n_best=output_n_best, level=h_level, max_it=10000, vote_filter_threshold=vote_filter_threshold, vote_method=vote_method, smooth_kernel=smooth_kernel)
+    # h_line =[]
+    #=============================================================================
+
     time1 = time.time()
-    # print(f"h_line: {len(h_line)} {h_line} ")
+    radars_data[radar_ch]["hough_lines"] = h_line
+    radars_data[radar_ch]["time"] = time1 - time0
     for i in range(len(h_line)):
-        print(f"Line {i+1}: theta={h_line[i]['thetaphi'][0]*180/np.pi:.2f}, phi={h_line[i]['thetaphi'][1]*180/np.pi:.2f}, "
-              f"p0=({h_line[i]['p0'][0]:.2f}, {h_line[i]['p0'][1]:.2f}, {h_line[i]['p0'][2]:.2f}), "
-              f"votes={h_line[i]['votes']:.2f} resolution={h_line[i]['resolution']}")
-    #savet hline to file
-    if False:
-        h_line_file = "/data/palakons/colmap_data/seq_0/"+ f"double_hough_line_colmap_{rat:04d}_{len(masked_points):05d}.json"
-        with open(h_line_file, 'w') as f:
-            # print("saving",[h_line[j]['thetaphi']+ h_line[j]['p0'] for j in range(len(h_line))])
-            import json
-            json.dump({
-                "hough_line": [h_line[j]['thetaphi']+ h_line[j]['p0'] for j in range(len(h_line))],
-                "table_sizes": table_sizes.tolist(),
-                "param_ranges": param_ranges,
-                "masked_points": masked_points.tolist(),
-                "masked_colors": masked_colors.tolist(),
-            }, f, indent=4)
-
-    print("now plotting the lines")
-
-    #lets have 4 plot, in 3 differen viewing plans and perspectives
-
-
-    fig_png_fname = "/data/palakons/colmap_data/seq_0/"+ f"hough_{rat:04d}_{len(masked_points):05d}_{mask_thresh:03.6f}_hlevel_{h_level}_nbest_{output_n_best}_vth_{vote_filter_threshold:.2f}_{smooth_kernel}_{vote_method}_{point_prune_voxel_size:.2f}.png"
-
-    fig,ax = plt.subplots(2, 2, subplot_kw={'projection': '3d'}, figsize=(16, 16))
-
-    fig.suptitle(f"Hough Lines smooth{smooth_kernel}_vote{vote_method}_prune{point_prune_voxel_size:.2f} (rat={rat}, points={len(masked_points)} {h_line[0]['thetaphi'][0]*180/np.pi:.2f}, {h_line[0]['thetaphi'][1]*180/np.pi:.2f} deg, ({h_line[0]['p0'][0]:.2f}, {h_line[0]['p0'][1]:.2f}, {h_line[0]['p0'][2]:.2f}) angle resolution: {h_line[0]['resolution']['theta']*180/np.pi:.4f},{h_line[0]['resolution']['phi']*180/np.pi:.4f}, ({h_line[0]['resolution']['qx']:.4f}, {h_line[0]['resolution']['qy']:.4f}, {h_line[0]['resolution']['qz']:.4f}) time:{time1-time0:.2f} sec)")
-
-
-
-    name =  ["perspective","xy plane","xz plane","yz plane"]
-    views_ele_azm = [
-        (30, -45),  # Perspective view
-        (90, -90),   # Top-down view (XY plane)
-        (0, -90),    # Side view (XZ plane)
-        (0, 0)    # Side view (YZ plane)
-    ]
-    d_plot=20
-    # Get n colors from matplotlib colormap
-    cmap = plt.cm.gist_rainbow  # You can use any colormap: viridis, plasma, tab10, Set1, etc.
+        print(f"Line {i+1}: {h_line[i]['thetaphi'][0]*180/np.pi:.2f}, {h_line[i]['thetaphi'][1]*180/np.pi:.2f} deg, "
+                f"p0:({h_line[i]['p0'][0]:.2f}, {h_line[i]['p0'][1]:.2f}, {h_line[i]['p0'][2]:.2f}), "
+                f"votes:{h_line[i]['votes']:.2f} resolution: {h_line[i]['resolution']['theta']*180/np.pi:.2f}, {h_line[i]['resolution']['phi']*180/np.pi:.2f} deg, ({h_line[i]['resolution']['qx']:.4f}, {h_line[i]['resolution']['qy']:.4f}, {h_line[i]['resolution']['qz']:.4f}) m")
+        
     color_list = [cmap(i / max(1, len(h_line) - 1)) for i in range(len(h_line))]
+
     for i in range(2):
         for j in range(2):
-            ax[i,j].scatter(masked_points[:, 0], masked_points[:, 1], masked_points[:, 2], c=  masked_colors, s=2, alpha=0.5)
+            ax[i,j].scatter(masked_points[:, 0], masked_points[:, 1], masked_points[:, 2], c=  radar_colors[i_rad], s=2, alpha=0.5)
             ax[i, j].set_title(name[i*2+j])
             ax[i, j].set_xlabel('X')
             ax[i, j].set_ylabel('Y')
@@ -412,12 +421,17 @@ for rat in [65]:#np.linspace(131, 645,8, endpoint=False):
             ax[i, j].set_ylim([-d_plot, d_plot])
             ax[i, j].set_zlim([-d_plot, d_plot])    
             ax[i, j].view_init(elev=views_ele_azm[i*2+j][0], azim=views_ele_azm[i*2+j][1])  # Set viewing angle
-            plot_lines_5d_matplot_multi(ax[i,j], h_line, title="", color= color_list)
-            # Add a legend to the first subplot, multiple rows of legend
+            plot_lines_5d_matplot_multi(ax[i,j], h_line, title="", color= color_list, line_style=line_style[i_rad], d_line=max_dist/2)
     ax[0,0].legend(loc='upper right' , fontsize='small', ncol=2, bbox_to_anchor=(1.05, 1), borderaxespad=0.)
 
-            
-    #tight
-    fig.tight_layout(rect=[0, 0.03, 1, 0.95])  # Adjust layout to make room for the title
-    fig.savefig(fig_png_fname, dpi=300)
-    print(f"Figure saved to {fig_png_fname}")
+        
+#tight
+fig.tight_layout(rect=[0, 0.03, 1, 0.95])  # Adjust layout to make room for the title
+fig.savefig(fig_png_fname, dpi=300)
+print(f"Figure saved to {fig_png_fname}")
+
+# save pkl for radar data
+radar_data_pkl = f"/home/palakons/logs/r-r/hough_radars_{table_sizes[0]:04d}_hlevel_{h_level}_nbest_{output_n_best}_vth_{vote_filter_threshold:.2f}_{smooth_kernel:02d}_{vote_method}_{point_prune_voxel_size:.2f}_{seq_id:02d}_{i_frame:02d}.pkl"
+with open(radar_data_pkl, 'wb') as f:
+    pickle.dump(radars_data, f)
+print(f"Radar data saved to {radar_data_pkl}")

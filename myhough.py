@@ -119,13 +119,13 @@ def find_n_peaks(hough_tensor,voted, max_it=10000):
         if value is not None:
             value_set.append(value)
             if peak in added_peaks:
-                print("+", end="")
+                # print("+", end="")
                 continue
             peaks.append((peak, value.item()))
             added_peaks.add(peak)
-            print(f"{value.item():.2f}",end="\t")
-        else:
-            print(".",end="")
+            # print(f"{value.item():.2f}",end="\t")
+        # else:
+        #     print(".",end="")
         
 
     if False and  len(peaks) > 1:
@@ -299,7 +299,7 @@ def process_hough_point_soft_voting(hough_tensor,points_3d, level,d_unit,param_r
         weight = wx * wy * wz
         hough_tensor[theta_idx, phi_idx, qx_ceil, qy_ceil, qz_ceil] += weight
     return voted, None
-def hough_closest_point_cuda(points_3d, table_sizes, param_ranges, dtype=torch.float32,show_dist=0,output_n_best=1,level=0,max_it = 1000,vote_filter_threshold=0.5,vote_method='soft',smooth_kernel=None):
+def hough_closest_point_cuda(points_3d, table_sizes, param_ranges, dtype=torch.float32,show_dist=0,output_n_best=1,level=0,max_it = 1000,vote_filter_threshold=0.5,vote_method='soft',smooth_kernel=0):
     """
      --- float32 / 5 parameters / custom binning / return multiple lines
 
@@ -343,7 +343,7 @@ def hough_closest_point_cuda(points_3d, table_sizes, param_ranges, dtype=torch.f
     elif vote_method == 'soft':
         voted,_ = process_hough_point_soft_voting(hough_tensor,points_3d, level,d_unit,param_ranges,table_sizes, dtype=dtype)
 
-    if smooth_kernel is not None:
+    if smooth_kernel >0:
         hough_tensor = smooth_spatial_dims_conv3d(hough_tensor, kernel_size=smooth_kernel, sigma=1.0)
         
     print(f"len  voted: {len(voted)}")
@@ -365,19 +365,18 @@ def hough_closest_point_cuda(points_3d, table_sizes, param_ranges, dtype=torch.f
 
     if level == 0:
         return output
-    for i in range(len(output)): #refine output with half the param ranges
-        #need to narrow down the range of parameters around the found line
+    for i in range(len(output)): #refine output with one cell of hough param range
         resolutions = [(theta_range[1] - theta_range[0])/ table_sizes[0],
                        (phi_range[1] - phi_range[0]) / table_sizes[1],
                        (qx_range[1] - qx_range[0]) / table_sizes[2],
                        (qy_range[1] - qy_range[0]) / table_sizes[3],
                        (qz_range[1] - qz_range[0]) / table_sizes[4]]
-        sub_param_ranges = [(theta_values[max_idx[0]].item() + np.array([-.5, .5]) * table_sizes[0]/2*resolutions[0]).tolist(),
-                            (phi_values[max_idx[1]].item() + np.array([-.5, .5]) * table_sizes[1]/2* resolutions[1]).tolist(),
-                            (qx_values[max_idx[2]].item() + np.array([-.5, .5]) * table_sizes[2]/2* resolutions[2]).tolist(),
-                            (qy_values[max_idx[3]].item() + np.array([-.5, .5]) * table_sizes[3]/2* resolutions[3]).tolist(),
-                            (qz_values[max_idx[4]].item() + np.array([-.5, .5]) * table_sizes[4]/2* resolutions[4]).tolist()]
-
+        sub_param_ranges = [(output[i]["thetaphi"][0] + np.array([-1, 1]) *resolutions[0]).tolist(),
+                            (output[i]["thetaphi"][1] + np.array([-1, 1]) *resolutions[1]).tolist(),
+                            (output[i]["p0"][0] + np.array([-1, 1]) *resolutions[2]).tolist(),
+                            (output[i]["p0"][1] + np.array([-1, 1]) *resolutions[3]).tolist(),
+                            (output[i]["p0"][2] + np.array([-1, 1]) *resolutions[4]).tolist()]
+        print(f"Refining output {i+1}/{output[i]} with sub_param_ranges: {sub_param_ranges}")
         rehough_output= hough_closest_point_cuda(points_3d, table_sizes, sub_param_ranges, dtype=dtype,show_dist=0,output_n_best=1, level=level-1,max_it=max_it,vote_filter_threshold=vote_filter_threshold,vote_method=vote_method,smooth_kernel=smooth_kernel)
 
         output[i]['thetaphi'] = [ a for a in rehough_output[0]['thetaphi']]
