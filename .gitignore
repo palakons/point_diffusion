@@ -1,1 +1,5 @@
 *.pyc
+*.tar
+*.csv
+*.png
+/plots
