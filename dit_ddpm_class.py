@@ -5,7 +5,7 @@ from diffusers.optimization import get_cosine_schedule_with_warmup
 from torch.utils.data import DataLoader
 import numpy as np
 from tqdm import tqdm, trange
-from man_ddpm import MANDataset
+from man_ddpm import MANDataset, chamfer_distance
 from torch.utils.data import Dataset
 import matplotlib.pyplot as plt
 from datetime import datetime
@@ -644,37 +644,47 @@ class PretrainedPointNeXtEncoderPointAE(nn.Module):
             return resampled
 
 
-def chamfer_distance(pred_uvz, gt_uvz):
-    """
-    Compute bidirectional Chamfer Distance.
+# def chamfer_distance(pred_uvz, gt_uvz):
+#     print("shape of pred_uvz:", pred_uvz.shape)
+#     print("shape of gt_uvz:", gt_uvz.shape)
+#     """
+#     Compute bidirectional Chamfer Distance.
 
-    Args:
-        pred_uvz: (B, N, 3) - predicted UVZ
-        gt_uvz: (B, M, 3) - ground truth UVZ
+#     Args:
+#         pred_uvz: (B, N, 3) - predicted UVZ
+#         gt_uvz: (B, M, 3) - ground truth UVZ
 
-    Returns:
-        chamfer_loss: scalar tensor
-    """
-    # Compute pairwise squared distances
-    # pred: (B, N, 1, 3), gt: (B, 1, M, 3)
-    pred_expanded = pred_uvz.unsqueeze(2)  # (B, N, 1, 3)
-    gt_expanded = gt_uvz.unsqueeze(1)  # (B, 1, M, 3)
+#     Returns:
+#         chamfer_loss: scalar tensor
+#     """
+#     # Compute pairwise squared distances
+#     # pred: (B, N, 1, 3), gt: (B, 1, M, 3)
+#     pred_expanded = pred_uvz.unsqueeze(2)  # (B, N, 1, 3)
+#     gt_expanded = gt_uvz.unsqueeze(1)  # (B, 1, M, 3)
 
-    # dist[b, i, j] = ||pred[b,i] - gt[b,j]||^2
-    dist = torch.sum((pred_expanded - gt_expanded) ** 2, dim=-1)  # (B, N, M)
+#     # dist[b, i, j] = ||pred[b,i] - gt[b,j]||^2
+#     dist = torch.sum((pred_expanded - gt_expanded) ** 2, dim=-1)  # (B, N, M)
 
-    # Forward: nearest GT for each predicted point
-    min_dist_pred_to_gt, _ = torch.min(dist, dim=2)  # (B, N)
-    forward_loss = min_dist_pred_to_gt.mean()
+#     # Forward: nearest GT for each predicted point
+#     try:
+#         min_dist_pred_to_gt, _ = torch.min(dist, dim=2)  # (B, N)
+#         forward_loss = min_dist_pred_to_gt.mean()
+#     except:
+#         print("pred_expanded shape:", pred_expanded.shape)
+#         print(
+#             "gt_expanded shape:", gt_expanded.shape
+#         )  # gt_expanded shape: torch.Size([1, 1, 0, 3])
+#         print(f"dist shape: {dist.shape}")
+#         return None
 
-    # Backward: nearest predicted for each GT point
-    min_dist_gt_to_pred, _ = torch.min(dist, dim=1)  # (B, M)
-    backward_loss = min_dist_gt_to_pred.mean()
+#     # Backward: nearest predicted for each GT point
+#     min_dist_gt_to_pred, _ = torch.min(dist, dim=1)  # (B, M)
+#     backward_loss = min_dist_gt_to_pred.mean()
 
-    # Bidirectional Chamfer
-    chamfer_loss = forward_loss + backward_loss
+#     # Bidirectional Chamfer
+#     chamfer_loss = forward_loss + backward_loss
 
-    return chamfer_loss
+#     return chamfer_loss
 
 
 class DitDDPM:
@@ -1603,7 +1613,7 @@ def parse_args():
         "--num_train_timesteps",
         type=int,
         default=1000,
-        help="Number of DDPM timesteps.",
+        help="Number of diffusion timesteps.",
     )
     parser.add_argument(
         "--eval_every",
@@ -1631,8 +1641,6 @@ def parse_args():
     parser.add_argument(
         "--batch_size", type=int, default=4, help="Batch size for training."
     )
-    # parser.add_argument("--num_epochs", type=int, default=1000, help="Number of training epochs.")
-    # parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate.")
     parser.add_argument(
         "--ae_lr",
         type=float,
@@ -1721,12 +1729,70 @@ def parse_args():
         default=4,
         help="Number of decoder layers for transformer point AE.",
     )
+    # n dit block
+    parser.add_argument(
+        "--num_transformer_blocks",
+        type=int,
+        default=12,
+        help="Number of transformer blocks in DiT model.",
+    )
+    # n head
+    parser.add_argument(
+        "--num_attention_heads",
+        type=int,
+        default=16,
+        help="Number of attention heads in DiT model.",
+    )
 
     parser.add_argument(
         "--max_voxel_grid_depth", type=float, default=250.0, help="Maximum depth value."
     )
     parser.add_argument(
         "--depth_voxel_grid_bins", type=int, default=8, help="Number of depth bins."
+    )
+    parser.add_argument(
+        "--use_global_avg_pool",
+        action="store_true",
+        help="Whether to use global average pooling to process VAE latents.",
+    )
+    # zero_cond
+    parser.add_argument(
+        "--zero_conditioning",
+        action="store_true",
+        help="Whether to use zero conditioning for depth and CLIP features.",
+    )
+    # learn sigma
+    parser.add_argument(
+        "--learn_sigma",
+        action="store_true",
+        help="Whether the DiT model should learn the noise sigma.",
+    )
+    # patch size
+    parser.add_argument(
+        "--patch_size",
+        type=int,
+        default=2,
+        help="Patch size for DiT model.",
+    )
+    # grid_binary_range "0-1" or "neg1-1"
+    parser.add_argument(
+        "--grid_binary_range",
+        type=str,
+        default="0-1",
+        help="Range for grid binary encoding ('0-1' or 'neg1-1').",
+    )
+    # aux_occ_weight , aux_occ_scale
+    parser.add_argument(
+        "--aux_occ_weight",
+        type=float,
+        default=0.0,
+        help="Weight for auxiliary occupancy loss.",
+    )
+    parser.add_argument(
+        "--aux_occ_scale",
+        type=float,
+        default=5.0,
+        help="Scale for auxiliary occupancy loss.",
     )
     return parser.parse_args()
 
@@ -1755,3 +1821,9 @@ def set_seed(seed: int):
         random.seed(worker_seed)
 
     return worker_init_fn
+
+
+def get_runid(config):
+
+    scene_str = "-".join(map(str, sorted(config["scene_ids"])))
+    return f"{config['depth_voxel_grid_bins']}bins_{config['scaled_image_size'][0]}x{config['scaled_image_size'][1]}_{config['dit_epochs']}epochs_batch{config['batch_size']}_scenes{scene_str}_numframes{config['num_input_frames']}_seed{config['seed']}_pool{config['use_global_avg_pool']}_sigma{config['learn_sigma']}_zeroCond{config['zero_conditioning']}_patch{config['patch_size']}_transBlocks{config['num_transformer_blocks']}_attnHeads{config['num_attention_heads']}_latentdim{config['latent_dim']}_grange{config['grid_binary_range']}_auxoccw{config['aux_occ_weight']:.0E}_auxoccs{config['aux_occ_scale']:.1f}"

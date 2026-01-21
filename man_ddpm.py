@@ -14,6 +14,7 @@ from PIL import Image, ImageOps
 from transformers import CLIPVisionModel, CLIPImageProcessor
 from tqdm import tqdm, trange
 import random
+import textwrap
 
 import time
 import sys
@@ -83,6 +84,52 @@ class SimplePerspectiveCamera:
         return uvz, camera_points
 
 
+def chamfer_distance(pred_uvz, gt_uvz):
+    # convert to tensor
+    pred_uvz = torch.tensor(pred_uvz)
+    gt_uvz = torch.tensor(gt_uvz)
+    # print("shape of pred_uvz:", pred_uvz.shape, type(pred_uvz))
+    # print("shape of gt_uvz:", gt_uvz.shape, type(gt_uvz))
+    """
+    Compute bidirectional Chamfer Distance.
+
+    Args:
+        pred_uvz: (B, N, 3) - predicted UVZ
+        gt_uvz: (B, M, 3) - ground truth UVZ
+
+    Returns:
+        chamfer_loss: scalar tensor
+    """
+    # Compute pairwise squared distances
+    # pred: (B, N, 1, 3), gt: (B, 1, M, 3)
+    pred_expanded = pred_uvz.unsqueeze(2)  # (B, N, 1, 3)
+    gt_expanded = gt_uvz.unsqueeze(1)  # (B, 1, M, 3)
+
+    # dist[b, i, j] = ||pred[b,i] - gt[b,j]||^2
+    dist = torch.sum((pred_expanded - gt_expanded) ** 2, dim=-1)  # (B, N, M)
+
+    # Forward: nearest GT for each predicted point
+    try:
+        min_dist_pred_to_gt, _ = torch.min(dist, dim=2)  # (B, N)
+        forward_loss = min_dist_pred_to_gt.mean()
+    except:
+        print("pred_expanded shape:", pred_expanded.shape)
+        print(
+            "gt_expanded shape:", gt_expanded.shape
+        )  # gt_expanded shape: torch.Size([1, 1, 0, 3])
+        print(f"dist shape: {dist.shape}")
+        return None
+
+    # Backward: nearest predicted for each GT point
+    min_dist_gt_to_pred, _ = torch.min(dist, dim=1)  # (B, M)
+    backward_loss = min_dist_gt_to_pred.mean()
+
+    # Bidirectional Chamfer
+    chamfer_loss = forward_loss + backward_loss
+
+    return chamfer_loss
+
+
 class MANDataset(Dataset):
     def __init__(
         self,
@@ -103,6 +150,8 @@ class MANDataset(Dataset):
         wan_vae: bool = False,
         wan_vae_checkpoint: str = "wan2_1_832x480.pth",
         viz_dir: str = "",
+        grid_binary_range: str = "0-1",  # "0-1" or "neg1-1"
+        keep_frames=0,
     ):  # load all frames from scene_id, of data_file, particular radar and camera channel
         self.device = device
         self.data_file = data_file
@@ -127,6 +176,8 @@ class MANDataset(Dataset):
         self.wan_vae = wan_vae
         self.wan_vae_checkpoint = wan_vae_checkpoint
         self.viz_dir = viz_dir
+        self.grid_binary_range = grid_binary_range
+        self.keep_frames = keep_frames
 
         if self.wan_vae:
             print(f"Loading VAE...")
@@ -166,6 +217,8 @@ class MANDataset(Dataset):
 
         self.data_bank = []
         for scene_id in tqdm(self.scene_ids, desc="Loading scenes"):
+            if len(self.data_bank) >= self.keep_frames and self.keep_frames != 0:
+                break
             first_frame_token = trucksc.scene[scene_id]["first_sample_token"]
             temp_token = first_frame_token
             num_frames = 0
@@ -175,7 +228,9 @@ class MANDataset(Dataset):
             frame_token = first_frame_token
             pbar = tqdm(desc=f"Scene {scene_id}", leave=False, total=num_frames)
 
-            while frame_token != "":
+            while frame_token != "" and (
+                len(self.data_bank) < self.keep_frames or self.keep_frames == 0
+            ):
                 self.data_bank.append(
                     {
                         **self.load_data(trucksc, frame_token, self.point_only),
@@ -302,6 +357,7 @@ class MANDataset(Dataset):
                     radar_points_uvz=points_uvz,
                     original_image_size=camera_front.shape[1:],
                     max_depth=self.max_depth,
+                    output_range=self.grid_binary_range,
                 )
                 self.occupancy_grids.append(occupancy_grid)
 
@@ -1131,6 +1187,7 @@ class MANDataset(Dataset):
         radar_points_uvz,
         original_image_size=(943, 1980),
         max_depth=250.0,
+        output_range="0-1",  # or "neg1-1"
     ):
         """
         Create occupancy grid from radar points.
@@ -1142,7 +1199,7 @@ class MANDataset(Dataset):
             max_depth: float - maximum depth value
 
         Returns:
-            occupancy_grid: (D, H, W) - occupancy grid with values in {-1, +1}
+            occupancy_grid: (D, H, W) - occupancy grid with values in {0, +1}
         """
         H_orig, W_orig = original_image_size
         D = depth_bins
@@ -1151,13 +1208,19 @@ class MANDataset(Dataset):
         occupancy_grid = torch.zeros(
             (D, H_orig, W_orig), device=radar_points_uvz.device
         )
+        if output_range == "neg1-1":
+            occupancy_grid -= 1  # initialize to -1
+        elif output_range == "0-1":
+            pass  # initialize to 0
+        else:
+            raise ValueError("output_range must be '0-1' or 'neg1-1'")
 
         if len(radar_points_uvz) == 0:
             return occupancy_grid
 
         # Convert depth to bin index
         depth_normalized = torch.clamp(radar_points_uvz[:, 2] / max_depth, 0, 1)
-        depth_bins = (depth_normalized * (D - 1)).long()
+        depth_bins = (depth_normalized * (D - 1)).long()  #  floor??
 
         # Filter valid coordinates
         u = radar_points_uvz[:, 0].long()
@@ -1222,6 +1285,12 @@ class MANDataset(Dataset):
         reconstructed_uvz,
         title="",
         save_dir="/home/palakons/from_scratch/man_ds_sample/recon_uvz",
+        plotlims={"u": (0, 1980), "v": (0, 943), "z": (0, 250)},
+        marker_config={
+            "original": {"color": "blue", "marker": "o", "size": 10, "alpha": 0.6},
+            "reconstructed": {"color": "red", "marker": "x", "size": 10, "alpha": 0.6},
+        },
+        fig_size=(20, 20),
     ):
         """
         Visualize original vs reconstructed UVZ point clouds.
@@ -1245,165 +1314,124 @@ class MANDataset(Dataset):
             else reconstructed_uvz
         )
 
-        # remove nan from both
-
-        # calculate similarity metrics, maybe chamfer distance
-        def chamfer_distance(pc1o, pc2o):
-            time0 = time.time()
-            # check for nan elements, can remove the rows with nan where either
-            # mask = ~np.isnan(pc1o).any(axis=1) & ~np.isnan(pc2o).any(axis=1)
-            # # print how many nan were removed
-            # n_nan_removed = len(pc1o) - np.sum(mask)
-            # if n_nan_removed > 0:
-            #     print(
-            #         f"Removed {n_nan_removed} NaN points from point clouds for Chamfer Distance calculation."
-            #     )
-            # pc1 = pc1o[mask]
-            # pc2 = pc2o[mask]
-            # if len(pc1) == 0 or len(pc2) == 0:
-            #     return float("inf")
-            # tree1 = cKDTree(pc1)
-            # tree2 = cKDTree(pc2)
-
-            # dist1, _ = tree1.query(pc2)
-            # dist2, _ = tree2.query(pc1)
-
-            # chamfer_dist = np.mean(dist1**2) + np.mean(dist2**2)
-            time1 = time.time()
-
-            openpoint_cd_function = ChamferDistanceL2()
-            pc1 = torch.as_tensor(pc1o).to("cuda", torch.float32).contiguous()
-            pc2 = torch.as_tensor(pc2o).to("cuda", torch.float32).contiguous()
-
-            if pc1.ndim == 2:
-                pc1 = pc1.unsqueeze(0)  # (1,N,3)
-            if pc2.ndim == 2:
-                pc2 = pc2.unsqueeze(0)  # (1,M,3)
-
-            dist = openpoint_cd_function(pc1, pc2)
-            torch.cuda.synchronize()
-
-            time2 = time.time()
-            print("CD:", dist.item())
-            # diff = abs(chamfer_dist - dist.squeeze().item())
-            # print(
-            #     f"cKDTree time: {time1-time0:.4f}s, OpenPoint time: {time2-time1:.4f}s, %diff : {(time2-time1)/(time1-time0)*100:.4f}%"
-            # )
-            # if diff > 1e-4:
-            #     print(
-            #         f"Warning: Chamfer distance mismatch! cKDTree: {chamfer_dist}, OpenPoint: {dist.squeeze().item()}, Diff: {diff}"
-            #     )
-            # else:
-            #     print(f"Chamfer distance check passed. Value: {chamfer_dist}")
-            return dist.item()
-
-        fig = plt.figure(figsize=(20, 10))
+        fig = plt.figure(figsize=fig_size)
 
         # Original point cloud views
-        ax1 = fig.add_subplot(2, 4, 1)
+        ax1 = fig.add_subplot(2, 2, 1)
+
+        # plot actualy and predict in the same plot with different colors
         ax1.scatter(
             orig_np[:, 0],
             orig_np[:, 1],
-            c=orig_np[:, 2],
-            cmap="viridis",
-            s=1,
-            alpha=0.6,
+            color=marker_config["original"]["color"],
+            label="Original",
+            s=marker_config["original"]["size"],
+            alpha=marker_config["original"]["alpha"],
+            marker=marker_config["original"]["marker"],
         )
-        ax1.set_title(f"Original UV View (n={len(orig_np)})")
+        ax1.scatter(
+            recon_np[:, 0],
+            recon_np[:, 1],
+            color=marker_config["reconstructed"]["color"],
+            label="Reconstructed",
+            s=marker_config["reconstructed"]["size"],
+            alpha=marker_config["reconstructed"]["alpha"],
+            marker=marker_config["reconstructed"]["marker"],
+        )
+        ax1.legend()
+        ax1.set_title(
+            f"UV View (n=ori{len(orig_np)}, recon{len(recon_np)}) CD:{chamfer_distance(orig_np[None,:,:] , recon_np[None,:,:]):.4f}"
+        )
         ax1.axis("equal")
+        ax1.set_xlim(plotlims["u"])
+        ax1.set_ylim(plotlims["v"])
 
-        ax2 = fig.add_subplot(2, 4, 2)
+        ax2 = fig.add_subplot(2, 2, 2)
         ax2.scatter(
-            orig_np[:, 0], orig_np[:, 2], c=orig_np[:, 1], cmap="plasma", s=1, alpha=0.6
+            orig_np[:, 0],
+            orig_np[:, 2],
+            color=marker_config["original"]["color"],
+            label="Original",
+            s=marker_config["original"]["size"],
+            alpha=marker_config["original"]["alpha"],
+            marker=marker_config["original"]["marker"],
         )
-        ax2.set_title("Original UZ View")
+        ax2.scatter(
+            recon_np[:, 0],
+            recon_np[:, 2],
+            color=marker_config["reconstructed"]["color"],
+            label="Reconstructed",
+            s=marker_config["reconstructed"]["size"],
+            alpha=marker_config["reconstructed"]["alpha"],
+            marker=marker_config["reconstructed"]["marker"],
+        )
+        ax2.legend()
+        ax2.set_title("UZ View")
+        ax2.set_xlim(plotlims["u"])
+        ax2.set_ylim(plotlims["z"])
 
-        ax3 = fig.add_subplot(2, 4, 3)
+        ax3 = fig.add_subplot(2, 2, 3)
         ax3.scatter(
             orig_np[:, 1],
             orig_np[:, 2],
-            c=orig_np[:, 0],
-            cmap="coolwarm",
-            s=1,
-            alpha=0.6,
+            color=marker_config["original"]["color"],
+            label="Original",
+            s=marker_config["original"]["size"],
+            alpha=marker_config["original"]["alpha"],
+            marker=marker_config["original"]["marker"],
         )
-        ax3.set_title("Original VZ View")
+        ax3.scatter(
+            recon_np[:, 1],
+            recon_np[:, 2],
+            color=marker_config["reconstructed"]["color"],
+            label="Reconstructed",
+            s=marker_config["reconstructed"]["size"],
+            alpha=marker_config["reconstructed"]["alpha"],
+            marker=marker_config["reconstructed"]["marker"],
+        )
+        ax3.legend()
+        ax3.set_title("VZ View")
+        ax3.set_xlim(plotlims["v"])
+        ax3.set_ylim(plotlims["z"])
 
-        ax4 = fig.add_subplot(2, 4, 4, projection="3d")
-        scatter = ax4.scatter(
+        ax4 = fig.add_subplot(2, 2, 4, projection="3d")
+        ax4.scatter(
             orig_np[:, 0],
             orig_np[:, 1],
             orig_np[:, 2],
-            c=orig_np[:, 2],
-            cmap="viridis",
-            s=1,
-            alpha=0.6,
+            color=marker_config["original"]["color"],
+            label="Original",
+            s=marker_config["original"]["size"],
+            alpha=marker_config["original"]["alpha"],
+            marker=marker_config["original"]["marker"],
         )
-        ax4.set_title("Original 3D View")
-        fig.colorbar(scatter, ax=ax4, label="Depth (m)", shrink=0.5)
-
-        # Reconstructed point cloud views
-        ax5 = fig.add_subplot(2, 4, 5)
-        if len(recon_np) > 0:
-            ax5.scatter(
-                recon_np[:, 0],
-                recon_np[:, 1],
-                c=recon_np[:, 2],
-                cmap="viridis",
-                s=1,
-                alpha=0.6,
-            )
-        ax5.set_title(f"Reconstructed UV View (n={len(recon_np)})")
-        ax5.axis("equal")
-
-        ax6 = fig.add_subplot(2, 4, 6)
-        if len(recon_np) > 0:
-            ax6.scatter(
-                recon_np[:, 0],
-                recon_np[:, 2],
-                c=recon_np[:, 1],
-                cmap="plasma",
-                s=1,
-                alpha=0.6,
-            )
-        ax6.set_title("Reconstructed UZ View")
-
-        ax7 = fig.add_subplot(2, 4, 7)
-        if len(recon_np) > 0:
-            ax7.scatter(
-                recon_np[:, 1],
-                recon_np[:, 2],
-                c=recon_np[:, 0],
-                cmap="coolwarm",
-                s=1,
-                alpha=0.6,
-            )
-        ax7.set_title("Reconstructed VZ View")
-
-        ax8 = fig.add_subplot(2, 4, 8, projection="3d")
-        if len(recon_np) > 0:
-            scatter2 = ax8.scatter(
-                recon_np[:, 0],
-                recon_np[:, 1],
-                recon_np[:, 2],
-                c=recon_np[:, 2],
-                cmap="viridis",
-                s=1,
-                alpha=0.6,
-            )
-            fig.colorbar(scatter2, ax=ax8, label="Depth (m)", shrink=0.5)
-        ax8.set_title(
-            f"Reconstructed 3D View CD: {chamfer_distance(orig_np, recon_np):.4f}"
+        ax4.scatter(
+            recon_np[:, 0],
+            recon_np[:, 1],
+            recon_np[:, 2],
+            color=marker_config["reconstructed"]["color"],
+            label="Reconstructed",
+            s=marker_config["reconstructed"]["size"],
+            alpha=marker_config["reconstructed"]["alpha"],
+            marker=marker_config["reconstructed"]["marker"],
         )
+        ax4.legend()
+
+        ax4.set_title(f"3D View")
+        ax4.set_xlim(plotlims["u"])
+        ax4.set_ylim(plotlims["v"])
+        ax4.set_zlim(plotlims["z"])
 
         if title:
-            plt.suptitle(title, fontsize=16)
+            # make sure wrapt he line to 80 characters
+            wrapped_title = "\n".join(textwrap.wrap(title, width=120))
+            plt.suptitle(wrapped_title, fontsize=16)
         plt.tight_layout()
         save_path = os.path.join(save_dir, f"compare_uvz_{frame_token}.png")
         plt.savefig(save_path, dpi=150, bbox_inches="tight")
         plt.close()
 
-        print(f"Saved UVZ comparison plot to {save_path}")
+        # print(f"Saved UVZ comparison plot to {save_path}")
 
 
 def main():
