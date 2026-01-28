@@ -84,10 +84,10 @@ class SimplePerspectiveCamera:
         return uvz, camera_points
 
 
-def chamfer_distance(pred_uvz, gt_uvz):
+def chamfer_distance(pred_uvz, gt_uvz, device):
     # convert to tensor
-    pred_uvz = torch.tensor(pred_uvz)
-    gt_uvz = torch.tensor(gt_uvz)
+    pred_uvz = torch.tensor(pred_uvz, device=device)
+    gt_uvz = torch.tensor(gt_uvz, device=device)
     # print("shape of pred_uvz:", pred_uvz.shape, type(pred_uvz))
     # print("shape of gt_uvz:", gt_uvz.shape, type(gt_uvz))
     """
@@ -152,6 +152,7 @@ class MANDataset(Dataset):
         viz_dir: str = "",
         grid_binary_range: str = "0-1",  # "0-1" or "neg1-1"
         keep_frames=0,
+        get_bb=False,  # whether to get bounding box of radar points
     ):  # load all frames from scene_id, of data_file, particular radar and camera channel
         self.device = device
         self.data_file = data_file
@@ -178,6 +179,7 @@ class MANDataset(Dataset):
         self.viz_dir = viz_dir
         self.grid_binary_range = grid_binary_range
         self.keep_frames = keep_frames
+        self.get_bb = get_bb
 
         if self.wan_vae:
             print(f"Loading VAE...")
@@ -233,7 +235,9 @@ class MANDataset(Dataset):
             ):
                 self.data_bank.append(
                     {
-                        **self.load_data(trucksc, frame_token, self.point_only),
+                        **self.load_data(
+                            trucksc, frame_token, self.point_only, self.get_bb
+                        ),
                         "scene_id": scene_id,
                         "frame_index": pbar.n,
                     }
@@ -863,7 +867,31 @@ class MANDataset(Dataset):
                 clip_path = batch_feature_files[j]
                 torch.save(tokens[j].cpu(), clip_path)  # ([ 257, 1024])
 
-    def load_data(self, trucksc, frame_token, point_only=False):
+    def _get_cam_bboxes_for_sample(
+        self, trucksc, sample, cam_token: str, verbose: bool = False
+    ):
+        """
+        Return a list of (ann_token, bbox) for annotations that belong to the given camera sample_data token.
+
+        Note:
+        MAN/nuScenes annotations live at the sample-level; some datasets include a
+        'sensor_data_token' on the annotation to indicate which sensor it was created for.
+        """
+        out = []
+        ann_tokens = sample["anns"]
+        for ann_token in ann_tokens:
+            ann = trucksc.get("sample_annotation", ann_token)
+
+            if verbose:
+                print(f"ann_token: {ann_token}")
+                for k, v in ann.items():
+                    print(f"  {k}: {v}")
+
+            # trucksc.get_box expects an annotation token
+            out.append((ann_token, trucksc.get_box(ann_token)))
+        return out
+
+    def load_data(self, trucksc, frame_token, point_only=False, get_bb=False):
         time_0 = time.time()
 
         da3_model = None
@@ -871,6 +899,22 @@ class MANDataset(Dataset):
         frame = trucksc.get("sample", frame_token)
         cam = trucksc.get("sample_data", frame["data"][self.camera_channel])
         radar = trucksc.get("sample_data", frame["data"][self.radar_channel])
+
+        # -1) get annotated Bouding Box of this nuScene-like frame
+        if get_bb:
+            cam_token = cam["token"]
+            boxes = self._get_cam_bboxes_for_sample(
+                trucksc, frame, cam_token, verbose=True
+            )  # frame IS my_sample
+
+            print(f"Frame token: {frame_token}")
+            print(f"Camera token: {cam_token}")
+            print(f"Found {len(boxes)} boxes")
+            for i, (ann_token, bbox) in enumerate(boxes):
+                ann = trucksc.get("sample_annotation", ann_token)
+                if ann["num_radar_pts"] > 0:
+                    print(i, ann)
+            exit()
 
         # 0) load CLIP
         time_1 = time.time()
@@ -1014,7 +1058,7 @@ class MANDataset(Dataset):
         points_uvz = image_coord[:, :3]  # N x3
         time_11 = time.time()
 
-        if self.wan_vae:
+        if self.wan_vae and not point_only:
             # infer
 
             w, h = 832, 480
@@ -1160,6 +1204,8 @@ class MANDataset(Dataset):
                 "npoints_filtered": npoints_filtered,
                 "clip_feature": clip_feature,
             }
+            if self.wan_vae:
+                output["wan_vae_latent"] = wan_vae_latent  # add wan vae latent
         else:
             output = {
                 "filtered_radar_data": output_filtered_radar_data,
@@ -1168,8 +1214,6 @@ class MANDataset(Dataset):
                 "npoints_original": npoints_original,
                 "npoints_filtered": npoints_filtered,
             }
-        if self.wan_vae:
-            output["wan_vae_latent"] = wan_vae_latent  # add wan vae latent
         return output
 
     def __len__(self):
@@ -1291,6 +1335,7 @@ class MANDataset(Dataset):
             "reconstructed": {"color": "red", "marker": "x", "size": 10, "alpha": 0.6},
         },
         fig_size=(20, 20),
+        device="cpu",
     ):
         """
         Visualize original vs reconstructed UVZ point clouds.
@@ -1328,6 +1373,7 @@ class MANDataset(Dataset):
             s=marker_config["original"]["size"],
             alpha=marker_config["original"]["alpha"],
             marker=marker_config["original"]["marker"],
+            rasterized=True,
         )
         ax1.scatter(
             recon_np[:, 0],
@@ -1337,14 +1383,17 @@ class MANDataset(Dataset):
             s=marker_config["reconstructed"]["size"],
             alpha=marker_config["reconstructed"]["alpha"],
             marker=marker_config["reconstructed"]["marker"],
+            rasterized=True,
         )
-        ax1.legend()
+        ax1.legend(loc="upper right")  # () is slow
         ax1.set_title(
-            f"UV View (n=ori{len(orig_np)}, recon{len(recon_np)}) CD:{chamfer_distance(orig_np[None,:,:] , recon_np[None,:,:]):.4f}"
+            f"UV View (n=ori{len(orig_np)}, recon{len(recon_np)}) CD:{chamfer_distance(orig_np[None,:,:] , recon_np[None,:,:],device):.4f}"
         )
         ax1.axis("equal")
         ax1.set_xlim(plotlims["u"])
         ax1.set_ylim(plotlims["v"])
+        ax1.set_xlabel("U-Horizontal Pixel")
+        ax1.set_ylabel("V-Vertical Pixel")
 
         ax2 = fig.add_subplot(2, 2, 2)
         ax2.scatter(
@@ -1355,6 +1404,7 @@ class MANDataset(Dataset):
             s=marker_config["original"]["size"],
             alpha=marker_config["original"]["alpha"],
             marker=marker_config["original"]["marker"],
+            rasterized=True,
         )
         ax2.scatter(
             recon_np[:, 0],
@@ -1364,63 +1414,75 @@ class MANDataset(Dataset):
             s=marker_config["reconstructed"]["size"],
             alpha=marker_config["reconstructed"]["alpha"],
             marker=marker_config["reconstructed"]["marker"],
+            rasterized=True,
         )
-        ax2.legend()
+        ax2.legend(loc="upper right")
         ax2.set_title("UZ View")
         ax2.set_xlim(plotlims["u"])
         ax2.set_ylim(plotlims["z"])
+        ax2.set_xlabel("U-Horizontal Pixel")
+        ax2.set_ylabel("Z-Depth (m)")
 
         ax3 = fig.add_subplot(2, 2, 3)
         ax3.scatter(
-            orig_np[:, 1],
             orig_np[:, 2],
+            orig_np[:, 1],
             color=marker_config["original"]["color"],
             label="Original",
             s=marker_config["original"]["size"],
             alpha=marker_config["original"]["alpha"],
             marker=marker_config["original"]["marker"],
+            rasterized=True,
         )
         ax3.scatter(
-            recon_np[:, 1],
             recon_np[:, 2],
+            recon_np[:, 1],
             color=marker_config["reconstructed"]["color"],
             label="Reconstructed",
             s=marker_config["reconstructed"]["size"],
             alpha=marker_config["reconstructed"]["alpha"],
             marker=marker_config["reconstructed"]["marker"],
+            rasterized=True,
         )
-        ax3.legend()
+        ax3.legend(loc="upper right")
         ax3.set_title("VZ View")
-        ax3.set_xlim(plotlims["v"])
-        ax3.set_ylim(plotlims["z"])
+        ax3.set_ylim(plotlims["v"])
+        ax3.set_xlim(plotlims["z"])
+        ax3.set_ylabel("V-Vertical Pixel")
+        ax3.set_xlabel("Z-Depth (m)")
 
         ax4 = fig.add_subplot(2, 2, 4, projection="3d")
         ax4.scatter(
             orig_np[:, 0],
-            orig_np[:, 1],
             orig_np[:, 2],
+            orig_np[:, 1],
             color=marker_config["original"]["color"],
             label="Original",
             s=marker_config["original"]["size"],
             alpha=marker_config["original"]["alpha"],
             marker=marker_config["original"]["marker"],
+            rasterized=True,
         )
         ax4.scatter(
             recon_np[:, 0],
-            recon_np[:, 1],
             recon_np[:, 2],
+            recon_np[:, 1],
             color=marker_config["reconstructed"]["color"],
             label="Reconstructed",
             s=marker_config["reconstructed"]["size"],
             alpha=marker_config["reconstructed"]["alpha"],
             marker=marker_config["reconstructed"]["marker"],
+            rasterized=True,
         )
-        ax4.legend()
+        ax4.legend(loc="upper right")
 
         ax4.set_title(f"3D View")
         ax4.set_xlim(plotlims["u"])
-        ax4.set_ylim(plotlims["v"])
-        ax4.set_zlim(plotlims["z"])
+        ax4.set_zlim(plotlims["v"])
+        ax4.set_ylim(plotlims["z"])
+        ax4.set_xlabel("U-Horizontal Pixel")
+        ax4.set_zlabel("V-Vertical Pixel")
+        ax4.set_ylabel("Z-Depth (m)")
 
         if title:
             # make sure wrapt he line to 80 characters

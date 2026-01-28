@@ -322,7 +322,7 @@ def train_eval_batch(
             ddpm_loss = loss_fn(noise, noise_pred)
             sum_ddpm_loss += ddpm_loss.item()
             total_loss = ddpm_loss
-            bce_loss = None
+            bce_loss = 0
 
             if bce_weight > 0:
                 # Estimate x0 from current x_t and eps_pred
@@ -333,7 +333,11 @@ def train_eval_batch(
                 # BCE targets in {0,1} (since your x0 is {-1,+1})
                 logits = bce_logit_scale * x0_pred
                 bce_loss = F.binary_cross_entropy_with_logits(
-                    logits, (center_occupancy_grid > 0).float()
+                    logits,
+                    (
+                        center_occupancy_grid
+                        > (0 if config["grid_binary_range"] == "neg1-1" else 0.5)
+                    ).float(),
                 )
 
                 total_loss = total_loss + bce_weight * bce_loss

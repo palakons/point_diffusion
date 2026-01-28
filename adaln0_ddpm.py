@@ -23,7 +23,13 @@ import os
 import argparse
 from torch.utils.data import Subset
 import torch.nn.functional as F
-from dit_ddpm_class import parse_args, set_seed, TransformerDenoiser, get_runid
+from dit_ddpm_class import (
+    parse_args,
+    set_seed,
+    TransformerDenoiser,
+    get_runid,
+    query_gpu_stats,
+)
 from torch.utils.tensorboard import SummaryWriter
 from adaln0_import import (
     save_checkpoint,
@@ -156,6 +162,18 @@ def train_vae_voxel_ddpm(
             writer.add_scalar("Loss/val/bce", avg_val_bce_loss, epoch + 1)
             writer.add_scalar("Loss/val/total", avg_val_total_loss, epoch + 1)
 
+        if (epoch + 1) % config["gpu_log_every"] == 0:
+            stats = query_gpu_stats(gpu_index=0)
+            if stats is not None:
+                writer.add_scalar("gpu/utilization_pct", stats["util_gpu"], epoch + 1)
+                writer.add_scalar("gpu/power_w", stats["power_w"], epoch + 1)
+                writer.add_scalar(
+                    "gpu/memory_used_mib", stats["mem_used_mib"], epoch + 1
+                )
+                writer.add_scalar(
+                    "gpu/memory_total_mib", stats["mem_total_mib"], epoch + 1
+                )
+
         if (epoch + 1) % config[
             "save_every"
         ] == 0 or avg_total_train_loss < best_epoch_train_total_loss:
@@ -198,7 +216,7 @@ def train_vae_voxel_ddpm(
 
     tblogHparam(config, writer, {"avg_ddpm_train_loss": avg_ddpm_train_loss})
     writer.close()
-    checkpoint_path = path.join(checkpoint_dir, f"final_vae_voxel_ddpm_{run_id}.pth")
+    checkpoint_path = os.path.join(checkpoint_dir, f"final_vae_voxel_ddpm_{run_id}.pth")
     save_checkpoint(
         ddpm,
         optimizer,
@@ -206,7 +224,7 @@ def train_vae_voxel_ddpm(
         {
             "ddpm_loss": avg_ddpm_train_loss,
         },
-        os.checkpoint_path,
+        checkpoint_path,
         config,
     )
     print(f"Training completed. Final model saved.", checkpoint_path)

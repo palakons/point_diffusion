@@ -19,7 +19,7 @@ from man_ddpm import MANDataset
 from torch.utils.data import Dataset
 import matplotlib.pyplot as plt
 from datetime import datetime
-import os
+import os, time
 import argparse
 from torch.utils.data import Subset
 import torch.nn.functional as F
@@ -179,10 +179,11 @@ def sample_vae_voxel_ddpm(
     for batch in tqdm(dataloader, desc="Sampling DDPM", leave=True):  # stays
         bs = batch["wan_vae_latent"].shape[0]
         frame_tokens = batch["frame_token"]
+        actual_occupancy_grid = batch["occupancy_grid"].to(config["device"])
         center_wan_vae_latent, center_actual_occupancy_grid = (
             get_center_crop_latent_and_grid(
                 batch["wan_vae_latent"].to(config["device"]),
-                batch["occupancy_grid"].to(config["device"]),
+                actual_occupancy_grid,
             )
         )
         batch_size = center_wan_vae_latent.shape[0]
@@ -194,17 +195,47 @@ def sample_vae_voxel_ddpm(
                 model=ddpm,
                 config=config,
             )
+            pad_left = (
+                config["scaled_image_size"][1] - center_actual_occupancy_grid.shape[3]
+            ) // 2
+            pad_right = (
+                config["scaled_image_size"][1]
+                - pad_left
+                - center_actual_occupancy_grid.shape[3]
+            )
+            # print("pad_left, pad_right:", pad_left, pad_right)
+
             # print(
             #     "shape of sampled occupancy grid:", sampled_occupancy_grid.shape
             # )  # [2,  128, 128, 256]
-            for time_step in tqdm(sampled_center_occupancy_grids, leave=False):
-                for i_batch in trange(
-                    bs, desc="Each iteM in batch", leave=False
-                ):  # leave=True (default behavior): The progress bar stays
-                    print("Time step:", time_step)
+            tstq = tqdm(
+                sorted(sampled_center_occupancy_grids.keys()),
+                leave=False,
+                desc="Time steps",
+            )
+            for time_step in tstq:  # this step takes time
+                time_0 = time.time()
+                padded_sampled_occupancy_grids = F.pad(
+                    sampled_center_occupancy_grids[time_step],
+                    (pad_left, pad_right),
+                    mode="constant",
+                    value=0,
+                )  # pad some dimensions of input are described starting from the last dimension
+                # print(
+                #     "sampled_center_occupancy_grids shape:",
+                #     sampled_center_occupancy_grids[time_step].shape,
+                # )
+                # print("padded shape:", padded_sampled_occupancy_grids.shape)
+                time_1 = time.time()
+                trr = trange(bs, desc="Each in batch", leave=False)
+                for (
+                    i_batch
+                ) in trr:  # leave=True (default behavior): The progress bar stays
+                    # print("Time step:", time_step)
+                    time_2 = time.time()
                     reconstructed_uvz = (
-                        dataloader.dataset.dataset.dataset.occupancy_grid_to_uvz(
-                            sampled_center_occupancy_grids[time_step][i_batch, :, :, :],
+                        dataloader.dataset.dataset.occupancy_grid_to_uvz(
+                            padded_sampled_occupancy_grids[i_batch, :, :, :],
                             original_image_size=config["original_image_size"],
                             max_depth=config["max_voxel_grid_depth"],
                             threshold=(
@@ -212,16 +243,16 @@ def sample_vae_voxel_ddpm(
                             ),
                         )
                     )
-                    actual_uvz = (
-                        dataloader.dataset.dataset.dataset.occupancy_grid_to_uvz(
-                            center_actual_occupancy_grid[i_batch, :, :, :],
-                            original_image_size=config["original_image_size"],
-                            max_depth=config["max_voxel_grid_depth"],
-                            threshold=(
-                                0.0 if config["grid_binary_range"] == "neg1-1" else 0.5
-                            ),
-                        )
+                    time_3 = time.time()
+                    actual_uvz = dataloader.dataset.dataset.occupancy_grid_to_uvz(
+                        actual_occupancy_grid[i_batch, :, :, :],
+                        original_image_size=config["original_image_size"],
+                        max_depth=config["max_voxel_grid_depth"],
+                        threshold=(
+                            0.0 if config["grid_binary_range"] == "neg1-1" else 0.5
+                        ),
                     )
+                    time_4 = time.time()
                     # print(
                     #     "min max of reconstructed uvz each dim:",
                     #     reconstructed_uvz.amin(dim=0),
@@ -235,8 +266,8 @@ def sample_vae_voxel_ddpm(
                     # print(
                     #     f'Chamfer Distance: {chamfer_distance(actual_uvz.unsqueeze(0).to(config["device"]),reconstructed_uvz.unsqueeze(0).to(config["device"]),).item():.4f}'
                     # )
-
-                    dataloader.dataset.dataset.dataset.visualize_uvz_comparison(
+                    time_5 = time.time()
+                    dataloader.dataset.dataset.visualize_uvz_comparison(
                         frame_token=frame_tokens[i_batch]
                         + f"_grid_{run_id}_step_{time_step:03d}",
                         title=frame_tokens[i_batch]
@@ -259,8 +290,23 @@ def sample_vae_voxel_ddpm(
                             },
                         },
                         fig_size=(16, 9),  # width, height in inches
+                        plotlims={
+                            "u": (0, config["original_image_size"][1]),
+                            "v": (0, config["original_image_size"][0]),
+                            "z": (0, config["max_voxel_grid_depth"]),
+                        },
+                        device=config["device"],
                     )
-                    # print("saved uvz comparison plot.", plot_dir)
+                    time_6 = time.time()
+                    trr.set_description(
+                        f"recon{time_3 - time_2:.2f}/actual{time_4 - time_3:.2f}/viz{time_6 - time_5:.2f}/pad{time_1 - time_0:.2f}"
+                    )
+                time_7 = time.time()
+                tstq.set_description(
+                    f"pad{time_1 - time_0:.2f}/infer{time_7 - time_1:.2f}:recon{time_3 - time_2:.2f}/actual{time_4 - time_3:.2f}/viz{time_6 - time_5:.2f}"  # pad0.00/infer2.46:recon0.00/actual0.00/viz2.46
+                )  # time for all in batch
+
+                # print("saved uvz comparison plot.", plot_dir)
 
 
 def main():
