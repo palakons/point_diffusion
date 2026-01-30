@@ -6,7 +6,9 @@ import numpy as np
 from torch.utils.data import Dataset
 from matplotlib import pyplot as plt
 from scipy.spatial.transform import Rotation as R
-from depth_anything_3.api import DepthAnything3
+
+if False:
+    from depth_anything_3.api import DepthAnything3
 from datetime import datetime
 
 from scipy.spatial import cKDTree
@@ -19,10 +21,11 @@ import textwrap
 import time
 import sys
 import torchvision.transforms.functional as TF
+from torch.nn import functional as F
 
-sys.path.insert(0, "/home/palakons/PointNeXt")
-from openpoints.cpp.chamfer_dist import ChamferFunction, ChamferDistanceL2
-
+if False:
+    sys.path.insert(0, "/home/palakons/PointNeXt")
+    from openpoints.cpp.chamfer_dist import ChamferFunction, ChamferDistanceL2
 
 sys.path.insert(0, "/home/palakons/Wan2.2")
 from wan.modules.vae2_1 import Wan2_1_VAE
@@ -90,6 +93,10 @@ def chamfer_distance(pred_uvz, gt_uvz, device):
     gt_uvz = torch.tensor(gt_uvz, device=device)
     # print("shape of pred_uvz:", pred_uvz.shape, type(pred_uvz))
     # print("shape of gt_uvz:", gt_uvz.shape, type(gt_uvz))
+
+    # if dim1 is zero, return 0
+    if pred_uvz.shape[1] == 0 or gt_uvz.shape[1] == 0:
+        return np.inf
     """
     Compute bidirectional Chamfer Distance.
 
@@ -112,13 +119,14 @@ def chamfer_distance(pred_uvz, gt_uvz, device):
     try:
         min_dist_pred_to_gt, _ = torch.min(dist, dim=2)  # (B, N)
         forward_loss = min_dist_pred_to_gt.mean()
-    except:
-        print("pred_expanded shape:", pred_expanded.shape)
+    except RuntimeError as e:
+        print("pred_expanded shape:", pred_expanded.shape)  # [1, 495, 1, 3]
         print(
             "gt_expanded shape:", gt_expanded.shape
-        )  # gt_expanded shape: torch.Size([1, 1, 0, 3])
-        print(f"dist shape: {dist.shape}")
-        return None
+        )  # gt_expanded shape: torch.Size([1, 1, 0, 3]) #[1, 1, 0, 3]
+        print(f"dist shape: {dist.shape}")  # [1, 495, 0]
+        print(f"Error in forward chamfer distance computation: {e}")
+        return 0
 
     # Backward: nearest predicted for each GT point
     min_dist_gt_to_pred, _ = torch.min(dist, dim=1)  # (B, M)
@@ -143,6 +151,7 @@ class MANDataset(Dataset):
         depth_bins=96,  # Number of depth bins
         visualize_uvz=False,
         max_depth: float = 250.0,
+        roi=None,  # (min_v, max_v, min_u, max_u) region of interest in pixel coordinates
         scaled_image_size: tuple = None,  # Target size for scaled images
         n_p: int = 0,  # number of point in each radar frame, if  0 no padding, otw, pick random n_p point, if not enough, pad by padding_value
         padding_value=0,
@@ -169,6 +178,7 @@ class MANDataset(Dataset):
         self.depth_bins = depth_bins
         self.max_depth = max_depth
         self.visualize_uvz = visualize_uvz
+        self.roi = roi  # (min_v, max_v, min_u, max_u)
         self.scaled_image_size = scaled_image_size
         self.clip_features = []  # Store CLIP features for each frame
         self.n_p = n_p
@@ -339,10 +349,23 @@ class MANDataset(Dataset):
                 if self.scaled_image_size is not None:
                     original_size = camera_front.shape[1:]  # (H, W)
 
-                    depth_image = self.scale_image(depth_image, self.scaled_image_size)
-                    camera_front = self.scale_image(
-                        camera_front, self.scaled_image_size, is_rgb=True
+                    depth_image, _ = self.crop_and_scale_last2(
+                        depth_image,
+                        self.calc_target_size_hw(
+                            depth_image.shape,
+                            self.scaled_image_size,
+                            self.original_image_size,
+                        ),
+                        self.roi,
+                        self.original_image_size,
                     )
+                    camera_front, camera_front_mid = self.crop_and_scale_last2(
+                        camera_front,
+                        self.scaled_image_size,
+                        self.roi,
+                        self.original_image_size,
+                    )
+
                     points_uvz[:, 0] *= (
                         self.scaled_image_size[1] / original_size[1]
                     )  # scale u
@@ -385,7 +408,7 @@ class MANDataset(Dataset):
                         original_uvz,
                         self.occupancy_grid_to_uvz(
                             occupancy_grid,
-                            original_image_size=self.original_image_size,
+                            image_roi=self.original_image_size,
                             max_depth=self.max_depth,
                             threshold=0.5,
                         ),
@@ -732,7 +755,96 @@ class MANDataset(Dataset):
 
         return
 
-    def scale_image(self, image, target_size, is_rgb=False):
+    def calc_target_size_hw(
+        self, image_size_hw, scaled_image_size, original_image_size
+    ):
+        assert scaled_image_size is not None
+        # print("Calculating target size hw...")
+        # print("image_size_hw:", image_size_hw)
+        # print("scaled_image_size:", scaled_image_size)
+        # print("original_image_size:", original_image_size)
+        return (
+            int(image_size_hw[0] / original_image_size[0] * scaled_image_size[0]),
+            int(image_size_hw[1] / original_image_size[1] * scaled_image_size[1]),
+        )
+
+    def crop_and_scale_last2(
+        self,
+        x: torch.Tensor,
+        target_size_hw,
+        roi=None,
+        original_size_hw=None,
+        mode="bilinear",
+        align_corners=False,
+    ):
+        """
+        Crop + resize where spatial dims are always the last 2: (..., H, W).
+
+        Args:
+            x: torch.Tensor with shape (..., H, W)
+            target_size_hw: (out_h, out_w)
+            roi: (min_v, max_v, min_u, max_u) specified in pixels of original_size_hw
+                 If None, use full extent.
+            original_size_hw: (H0, W0) coordinate system for roi.
+                 If None, roi is assumed to be in x's current (H,W) coordinates.
+            mode: interpolate mode
+            align_corners: for bilinear/bicubic
+
+        Returns:
+            torch.Tensor with shape (..., out_h, out_w)
+        """
+        if x is None:
+            return None
+
+        in_h, in_w = x.shape[-2], x.shape[-1]
+        # print("x shape:", x.shape)
+        # print("roi:", roi)
+        # print("original_size_hw:", original_size_hw)
+        # x shape: torch.Size([3, 943, 1980])
+        # roi: [0, 236, 0, 495]
+        # original_size_hw: torch.Size([943, 1980])
+
+        # --- map ROI into x index space ---
+        H0, W0 = original_size_hw
+
+        min_v, max_v, min_u, max_u = roi
+        h0 = int(min_v * in_h / H0)
+        h1 = int(max_v * in_h / H0)
+        w0 = int(min_u * in_w / W0)
+        w1 = int(max_u * in_w / W0)
+
+        # clamp
+        h0 = max(0, min(in_h, h0))
+        h1 = max(0, min(in_h, h1))
+        w0 = max(0, min(in_w, w0))
+        w1 = max(0, min(in_w, w1))
+
+        # --- crop (view) ---
+        # print("Cropping to h:", h0, h1, "w:", w0, w1, "h w", h1 - h0, w1 - w0)
+        # Cropping to h: 0 236 w: 0 495 h w 236 495
+        x = x[..., h0:h1, w0:w1]
+        if target_size_hw is None:
+            print("No target size provided, skipping resize.")
+            return None, x
+
+        # --- resize via interpolate (expects N,C,H,W) ---
+        h, w = x.shape[-2], x.shape[-1]
+        lead_shape = x.shape[:-2]
+        lead = int(torch.tensor(lead_shape).prod().item()) if len(lead_shape) else 1
+
+        x4 = x.reshape(lead, 1, h, w)  # treat as 1-channel
+        y4 = F.interpolate(
+            x4,
+            size=tuple(target_size_hw),
+            mode=mode,
+            align_corners=align_corners if mode in ("bilinear", "bicubic") else None,
+        )
+        out_h, out_w = y4.shape[-2], y4.shape[-1]
+        # print("Resized to h w:", out_h, out_w)
+        # Resized to h w: 480 832
+        return y4.reshape(*lead_shape, out_h, out_w), x
+
+    def scale_image(self, image, target_size, is_rgb=False, roi=None):
         """
         Scale an image to the given target size.
 
@@ -740,6 +852,7 @@ class MANDataset(Dataset):
             image: torch.Tensor - The image to scale.
             target_size: tuple - The target size (height, width).
             is_rgb: bool - Whether the image is an RGB image.
+            roi: tuple - Region of interest (min_v, max_v, min_u, max_u) to crop before scaling.
 
         Returns:
             torch.Tensor - The scaled image.
@@ -910,10 +1023,56 @@ class MANDataset(Dataset):
             print(f"Frame token: {frame_token}")
             print(f"Camera token: {cam_token}")
             print(f"Found {len(boxes)} boxes")
+            trucksc.render_sample_data(
+                cam_token,
+                out_path=f"/data/palakons/man_vaevoxelmetadit/plots/sample_data_rendered_{frame_token}.jpg",
+            )
             for i, (ann_token, bbox) in enumerate(boxes):
                 ann = trucksc.get("sample_annotation", ann_token)
                 if ann["num_radar_pts"] > 0:
                     print(i, ann)
+                    # 35
+                    # {
+                    #     "token": "f23838566e114745a5dcbf64da702b3e",
+                    #     "sample_token": "32d2bcf46e734dffb14fe2e0a823d059",
+                    #     "instance_token": "fac044e78dbd4ebcaf73dd47f1dfe0b6",
+                    #     "visibility_token": "6adc1826065b452195ae6a76317b8ab5",
+                    #     "attribute_tokens": ["eefd82c9b2f144e2b1c61a432254cff2"],
+                    #     "translation": [
+                    #         571683.6013194472,
+                    #         5367861.168234938,
+                    #         594.2107392291495,
+                    #     ],
+                    #     "size": [2.624609, 12.548973, 1.650928],
+                    #     "rotation": [
+                    #         0.39957834306376744,
+                    #         -1.0842021724855044e-18,
+                    #         0.0,
+                    #         0.9166990497182892,
+                    #     ],
+                    #     "prev": "",
+                    #     "next": "fd6e6d6cc299412a90268145d75ed51f",
+                    #     "num_lidar_pts": 1584,
+                    #     "num_radar_pts": 9,
+                    #     "category_name": "vehicle.trailer",
+                    # }
+                    # get sample token
+                    print("sample", trucksc.get("sample", ann["sample_token"]).keys())
+                    print("instance", trucksc.get("instance", ann["instance_token"]))
+                    print(
+                        "visibility", trucksc.get("visibility", ann["visibility_token"])
+                    )
+                    print(
+                        "attribute",
+                        trucksc.get(
+                            "attribute", ann["attribute_tokens"][0]
+                        ),  # only one attribute
+                    )
+                    # sample dict_keys(['token', 'scene_token', 'timestamp', 'prev', 'next', 'data', 'anns'])
+                    # instance {'token': 'fac044e78dbd4ebcaf73dd47f1dfe0b6', 'category_token': 'fec744eb30e5499ab654c8e9576658b0', 'nbr_annotations': 26, 'first_annotation_token': 'f23838566e114745a5dcbf64da702b3e', 'last_annotation_token': 'd7abb64014b945c0801f7772b905f7f9'}
+                    # visibility {'token': '6adc1826065b452195ae6a76317b8ab5', 'level': 4, 'description': 'The object is 81% to 100% visible in panoramic view of all cameras.'}
+                    # attribute {'token': 'eefd82c9b2f144e2b1c61a432254cff2', 'name': 'vehicle.parked', 'description': 'Vehicle is stationary (usually for longer duration) with no immediate intent to move.'}
+
             exit()
 
         # 0) load CLIP
@@ -1064,24 +1223,81 @@ class MANDataset(Dataset):
             w, h = 832, 480
             F = 5
 
-            img = Image.open(image_rgb_path).convert("RGB")
-            img = TF.to_tensor(img).sub_(0.5).div_(0.5).to(self.device)
+            # temp = torch.nn.functional.interpolate(
+            #     TF.to_tensor(Image.open(image_rgb_path).convert("RGB"))
+            #     .sub_(0.5)
+            #     .div_(0.5)
+            #     .to(self.device)[None]
+            #     .cpu(),
+            #     size=(h, w),
+            #     mode="bicubic",
+            # ).transpose(0, 1)
 
-            # duplicate frame 1 F times
+            # print("temp shape:", temp.shape)  # torch.Size([3, 480, 832])
+            # print(
+            #     "min max temp before norm:",
+            #     TF.to_tensor(Image.open(image_rgb_path).convert("RGB")).min(),
+            #     TF.to_tensor(Image.open(image_rgb_path).convert("RGB")).max(),
+            # )
+            # print("minmax temp norm:", temp.min(), temp.max())
 
-            video0 = torch.concat(
-                [
-                    torch.nn.functional.interpolate(
-                        img[None].cpu(), size=(h, w), mode="bicubic"
-                    ).transpose(0, 1),
-                ]
-                * F,
-                dim=1,
-            )  # F,3,h,w
-            video0 = video0.to(self.device)
-            # print("video0 shape:", video0.shape)  # F,3,h,w
+            # print("hw:", (h, w))
+
+            img, _ = self.crop_and_scale_last2(
+                TF.to_tensor(Image.open(image_rgb_path).convert("RGB"))
+                .to(self.device)
+                .float()
+                .sub_(0.5)
+                .div_(0.5),
+                (h, w),
+                self.roi,
+                self.original_image_size,
+            )
+            img = img.unsqueeze(1)
+            # print("img size after crop and scale:", img.shape)
+            # print("minmax img before norm:", img.min(), img.max())
+            # video0 = torch.concat(
+            #     [
+            #         torch.nn.functional.interpolate(
+            #             TF.to_tensor(Image.open(image_rgb_path).convert("RGB"))
+            #             .sub_(0.5)
+            #             .div_(0.5)
+            #             .to(self.device)[None]
+            #             .cpu(),
+            #             size=(h, w),
+            #             mode="bicubic",
+            #         ).transpose(0, 1),
+            #     ]
+            #     * F,
+            #     dim=1,
+            # )  # F,3,h,w
+            # video0 = video0.to(self.device)
+            video0 = img.repeat(1, F, 1, 1)
+
+            # temp shape: torch.Size([3, 1, 480, 832])
+            # min max temp before norm: tensor(0.) tensor(1.)
+            # minmax temp norm: tensor(-1.1611) tensor(1.1844)
+            # hw: (480, 832)
+            # img size after crop and scale: torch.Size([3, 1, 480, 832])
+            # minmax img before norm: tensor(-0.4431, device='cuda:0') tensor(0.2272, device='cuda:0')
+            # video shape: torch.Size([3, 5, 480, 832])
+            # video0 shape before to device: torch.Size([3, 5, 480, 832])
 
             videos = video0.unsqueeze(0)  # add batch dim
+
+            # save_dir = "/home/palakons/from_scratch/output"
+            # # save eachf frame in videos
+            # for fi in range(video0.shape[1]):
+            #     vframe = video0[:, fi, :, :].unsqueeze(0)
+            #     vframe = (vframe * 0.5 + 0.5).clamp(0, 1)
+            #     vframe_pil = TF.to_pil_image(vframe.squeeze().cpu())
+            #     vframe_pil.save(
+            #         os.path.join(
+            #             save_dir,
+            #             f"{frame_token}_{self.camera_channel.replace('CAMERA_','')}_wanvae_frame{fi}.png",
+            #         )
+            #     )
+            # verified 29-jan-26
 
             wan_vae_latent = self.vae21.encode(videos)[0]
         time_115 = time.time()
@@ -1283,7 +1499,7 @@ class MANDataset(Dataset):
     def occupancy_grid_to_uvz(
         self,
         occupancy_grid,
-        original_image_size=(943, 1980),
+        image_roi=(943, 1980),
         max_depth=250.0,
         threshold=0.5,
     ):
@@ -1292,7 +1508,7 @@ class MANDataset(Dataset):
 
         Args:
             occupancy_grid: (D, H, W) - occupancy grid
-            original_image_size: (H, W) - original image size
+            original_image_size: (H, W) - original image size, if 4 numbers given, it mean the specified ROI (min_v/height, max_v, min_u/width, max_u)
             max_depth: float - maximum depth value
             threshold: float - threshold for occupancy grid values
 
@@ -1300,7 +1516,14 @@ class MANDataset(Dataset):
             uvz_points: (N, 3) - [u, v, depth] point cloud coordinates
         """
         D, H, W = occupancy_grid.shape
-        H_orig, W_orig = original_image_size
+        if len(image_roi) == 4:
+            min_v, max_v, min_u, max_u = image_roi
+        elif len(image_roi) == 2:
+            min_v, min_u = 0, 0
+            max_v, max_u = image_roi
+        else:
+            raise ValueError("image_roi must be of length 2 or 4")
+        W_orig, H_orig = max_u - min_u, max_v - min_v
 
         # Threshold occupancy grid
         binary_grid = (occupancy_grid > threshold).float()
@@ -1315,8 +1538,8 @@ class MANDataset(Dataset):
         u_idx = nonzero_indices[:, 2]
 
         # Convert back to original coordinates
-        u = u_idx.float() / W * W_orig
-        v = v_idx.float() / H * H_orig
+        u = u_idx.float() / W * W_orig + min_u
+        v = v_idx.float() / H * H_orig + min_v
         depth_normalized = depth_bins_idx.float() / (D - 1)
         depth = depth_normalized * max_depth
 
@@ -1329,7 +1552,7 @@ class MANDataset(Dataset):
         reconstructed_uvz,
         title="",
         save_dir="/home/palakons/from_scratch/man_ds_sample/recon_uvz",
-        plotlims={"u": (0, 1980), "v": (0, 943), "z": (0, 250)},
+        plotlims=None,  # {"u": (0, 1980), "v": (0, 943), "z": (0, 250)},
         marker_config={
             "original": {"color": "blue", "marker": "o", "size": 10, "alpha": 0.6},
             "reconstructed": {"color": "red", "marker": "x", "size": 10, "alpha": 0.6},
@@ -1390,8 +1613,9 @@ class MANDataset(Dataset):
             f"UV View (n=ori{len(orig_np)}, recon{len(recon_np)}) CD:{chamfer_distance(orig_np[None,:,:] , recon_np[None,:,:],device):.4f}"
         )
         ax1.axis("equal")
-        ax1.set_xlim(plotlims["u"])
-        ax1.set_ylim(plotlims["v"])
+        if plotlims is not None:
+            ax1.set_xlim(plotlims["u"])
+            ax1.set_ylim(plotlims["v"])
         ax1.set_xlabel("U-Horizontal Pixel")
         ax1.set_ylabel("V-Vertical Pixel")
 
@@ -1418,8 +1642,9 @@ class MANDataset(Dataset):
         )
         ax2.legend(loc="upper right")
         ax2.set_title("UZ View")
-        ax2.set_xlim(plotlims["u"])
-        ax2.set_ylim(plotlims["z"])
+        if plotlims is not None:
+            ax2.set_xlim(plotlims["u"])
+            ax2.set_ylim(plotlims["z"])
         ax2.set_xlabel("U-Horizontal Pixel")
         ax2.set_ylabel("Z-Depth (m)")
 
@@ -1446,8 +1671,9 @@ class MANDataset(Dataset):
         )
         ax3.legend(loc="upper right")
         ax3.set_title("VZ View")
-        ax3.set_ylim(plotlims["v"])
-        ax3.set_xlim(plotlims["z"])
+        if plotlims is not None:
+            ax3.set_ylim(plotlims["v"])
+            ax3.set_xlim(plotlims["z"])
         ax3.set_ylabel("V-Vertical Pixel")
         ax3.set_xlabel("Z-Depth (m)")
 
@@ -1477,9 +1703,10 @@ class MANDataset(Dataset):
         ax4.legend(loc="upper right")
 
         ax4.set_title(f"3D View")
-        ax4.set_xlim(plotlims["u"])
-        ax4.set_zlim(plotlims["v"])
-        ax4.set_ylim(plotlims["z"])
+        if plotlims is not None:
+            ax4.set_xlim(plotlims["u"])
+            ax4.set_zlim(plotlims["v"])
+            ax4.set_ylim(plotlims["z"])
         ax4.set_xlabel("U-Horizontal Pixel")
         ax4.set_zlabel("V-Vertical Pixel")
         ax4.set_ylabel("Z-Depth (m)")

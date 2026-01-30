@@ -34,7 +34,6 @@ from torch.utils.tensorboard import SummaryWriter
 from adaln0_import import (
     save_checkpoint,
     load_checkpoint,
-    get_center_crop_latent_and_grid,
     train_eval_batch,
     find_checkpoint_path,
     makeDiTModel,
@@ -52,7 +51,7 @@ from adaln0_import import (
 
 @torch.no_grad()
 def sample_adaln0(
-    center_wan_vae_latent: torch.Tensor,
+    wan_vae_latent: torch.Tensor,
     model: DiT,
     config,
 ):
@@ -78,24 +77,28 @@ def sample_adaln0(
         prediction_type="epsilon",
     )
 
-    center_wan_vae_latent = center_wan_vae_latent.to(config["device"])
-    B = center_wan_vae_latent.shape[0]
+    wan_vae_latent = wan_vae_latent.to(config["device"])
+    B = wan_vae_latent.shape[0]
 
-    Z, H = (config["depth_voxel_grid_bins"], config["scaled_image_size"][0])
+    Z, H, W = (
+        config["depth_voxel_grid_bins"],
+        config["scaled_image_size"][0],
+        config["scaled_image_size"][1],
+    )
 
     # start from pure noise in voxel space
-    x = torch.randn((B, Z, H, H), device=config["device"], generator=g)
+    x = torch.randn((B, Z, H, W), device=config["device"], generator=g)
 
     if config["zero_conditioning"]:
-        center_wan_vae_latent = torch.zeros(
+        wan_vae_latent = torch.zeros(
             (B, 16, 2, 60, 60),
             device=config["device"],
         )  # [4, 16, 2, 60, 10604]
 
     if config["use_global_avg_pool"]:
-        cond = center_wan_vae_latent
+        cond = wan_vae_latent
     else:
-        cond = center_wan_vae_latent.flatten(1)  # (B,16*2*60*60)
+        cond = wan_vae_latent.flatten(1)  # (B,16*2*60*60)
 
     # eval mode for deterministic dropout etc.
     model.eval()
@@ -112,7 +115,7 @@ def sample_adaln0(
     for t in tqdm(noise_scheduler.timesteps, desc="Sampling", leave=False):
         t_batch = torch.full((B,), int(t), device=config["device"], dtype=torch.long)
 
-        output = model(x, t_batch, cond)  # (B,Z,H,H)
+        output = model(x, t_batch, cond)  # (B,Z,H,W)
         if config["learn_sigma"]:
             eps, log_sigma = torch.chunk(output, 2, dim=1)
             # combine eps and log_sigma into a single tensor for noise scheduler
@@ -180,52 +183,24 @@ def sample_vae_voxel_ddpm(
         bs = batch["wan_vae_latent"].shape[0]
         frame_tokens = batch["frame_token"]
         actual_occupancy_grid = batch["occupancy_grid"].to(config["device"])
-        center_wan_vae_latent, center_actual_occupancy_grid = (
-            get_center_crop_latent_and_grid(
-                batch["wan_vae_latent"].to(config["device"]),
-                actual_occupancy_grid,
-            )
-        )
-        batch_size = center_wan_vae_latent.shape[0]
+        wan_vae_latent = batch["wan_vae_latent"].to(config["device"])
+
+        batch_size = wan_vae_latent.shape[0]
         with torch.no_grad():
 
             # print("center_wan_vae_latent shape:", center_wan_vae_latent.shape)  # [2, 16, 2, 60, 60]
-            sampled_center_occupancy_grids = sample_adaln0(
-                center_wan_vae_latent,
+            sampled_occupancy_grids = sample_adaln0(
+                wan_vae_latent,
                 model=ddpm,
                 config=config,
             )
-            pad_left = (
-                config["scaled_image_size"][1] - center_actual_occupancy_grid.shape[3]
-            ) // 2
-            pad_right = (
-                config["scaled_image_size"][1]
-                - pad_left
-                - center_actual_occupancy_grid.shape[3]
-            )
-            # print("pad_left, pad_right:", pad_left, pad_right)
-
-            # print(
-            #     "shape of sampled occupancy grid:", sampled_occupancy_grid.shape
-            # )  # [2,  128, 128, 256]
             tstq = tqdm(
-                sorted(sampled_center_occupancy_grids.keys()),
+                sorted(sampled_occupancy_grids.keys()),
                 leave=False,
                 desc="Time steps",
             )
             for time_step in tstq:  # this step takes time
                 time_0 = time.time()
-                padded_sampled_occupancy_grids = F.pad(
-                    sampled_center_occupancy_grids[time_step],
-                    (pad_left, pad_right),
-                    mode="constant",
-                    value=0,
-                )  # pad some dimensions of input are described starting from the last dimension
-                # print(
-                #     "sampled_center_occupancy_grids shape:",
-                #     sampled_center_occupancy_grids[time_step].shape,
-                # )
-                # print("padded shape:", padded_sampled_occupancy_grids.shape)
                 time_1 = time.time()
                 trr = trange(bs, desc="Each in batch", leave=False)
                 for (
@@ -235,8 +210,8 @@ def sample_vae_voxel_ddpm(
                     time_2 = time.time()
                     reconstructed_uvz = (
                         dataloader.dataset.dataset.occupancy_grid_to_uvz(
-                            padded_sampled_occupancy_grids[i_batch, :, :, :],
-                            original_image_size=config["original_image_size"],
+                            sampled_occupancy_grids[time_step][i_batch, :, :, :],
+                            image_roi=config["training_roi"],
                             max_depth=config["max_voxel_grid_depth"],
                             threshold=(
                                 0.0 if config["grid_binary_range"] == "neg1-1" else 0.5
@@ -246,7 +221,7 @@ def sample_vae_voxel_ddpm(
                     time_3 = time.time()
                     actual_uvz = dataloader.dataset.dataset.occupancy_grid_to_uvz(
                         actual_occupancy_grid[i_batch, :, :, :],
-                        original_image_size=config["original_image_size"],
+                        image_roi=config["training_roi"],
                         max_depth=config["max_voxel_grid_depth"],
                         threshold=(
                             0.0 if config["grid_binary_range"] == "neg1-1" else 0.5
@@ -268,7 +243,7 @@ def sample_vae_voxel_ddpm(
                     # )
                     time_5 = time.time()
                     dataloader.dataset.dataset.visualize_uvz_comparison(
-                        frame_token=frame_tokens[i_batch]
+                        frame_token=frame_tokens[i_batch][-3:]
                         + f"_grid_{run_id}_step_{time_step:03d}",
                         title=frame_tokens[i_batch]
                         + f"_grid_{run_id}_step_{time_step:03d}",
@@ -290,12 +265,13 @@ def sample_vae_voxel_ddpm(
                             },
                         },
                         fig_size=(16, 9),  # width, height in inches
-                        plotlims={
-                            "u": (0, config["original_image_size"][1]),
-                            "v": (0, config["original_image_size"][0]),
-                            "z": (0, config["max_voxel_grid_depth"]),
-                        },
-                        device=config["device"],
+                        plotlims=None,
+                        # {
+                        #     "u": (0, config["original_image_size"][1]),
+                        #     "v": (0, config["original_image_size"][0]),
+                        #     "z": (0, 250),
+                        # },
+                        device="cpu",  # too alrge for gpu
                     )
                     time_6 = time.time()
                     trr.set_description(

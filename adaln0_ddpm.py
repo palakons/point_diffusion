@@ -34,7 +34,6 @@ from torch.utils.tensorboard import SummaryWriter
 from adaln0_import import (
     save_checkpoint,
     load_checkpoint,
-    get_center_crop_latent_and_grid,
     train_eval_batch,
     makeDataset,
     splitDataset,
@@ -144,8 +143,9 @@ def train_vae_voxel_ddpm(
             )
         )
         writer.add_scalar("Loss/train/ddpm", avg_ddpm_train_loss, epoch + 1)
-        writer.add_scalar("Loss/train/bce", avg_bce_train_loss, epoch + 1)
-        writer.add_scalar("Loss/train/total", avg_total_train_loss, epoch + 1)
+        if config["aux_occ_weight"] > 0:
+            writer.add_scalar("Loss/train/bce", avg_bce_train_loss, epoch + 1)
+            writer.add_scalar("Loss/train/total", avg_total_train_loss, epoch + 1)
         if (epoch + 1) % config["eval_every"] == 0:
             avg_val_ddpm_loss, avg_val_bce_loss, avg_val_total_loss, _ = (
                 train_eval_batch(
@@ -159,8 +159,9 @@ def train_vae_voxel_ddpm(
                 )
             )
             writer.add_scalar("Loss/val/ddpm", avg_val_ddpm_loss, epoch + 1)
-            writer.add_scalar("Loss/val/bce", avg_val_bce_loss, epoch + 1)
-            writer.add_scalar("Loss/val/total", avg_val_total_loss, epoch + 1)
+            if config["aux_occ_weight"] > 0:
+                writer.add_scalar("Loss/val/bce", avg_val_bce_loss, epoch + 1)
+                writer.add_scalar("Loss/val/total", avg_val_total_loss, epoch + 1)
 
         if (epoch + 1) % config["gpu_log_every"] == 0:
             stats = query_gpu_stats(gpu_index=0)
@@ -246,7 +247,6 @@ def main():
     # Load dataset
     dataset_point = makeDataset(
         config,
-        plot_dir=plot_dir,
     )
 
     train_dataset, val_dataset = splitDataset(dataset_point, split=0.5)

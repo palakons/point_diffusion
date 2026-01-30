@@ -20,6 +20,7 @@ from torch.utils.data import Subset
 import torch.nn.functional as F
 from dit_ddpm_class import parse_args, set_seed, TransformerDenoiser, get_runid
 from torch.utils.tensorboard import SummaryWriter
+from math import prod
 
 
 # print(f"Batch keys: {batch.keys()}")
@@ -159,9 +160,70 @@ def load_checkpoint(model: DiT, optimizer, config):
     return epoch, best_epoch_loss
 
 
-def get_center_crop_latent_and_grid(wan_vae_latent, occupancy_grid):
+def get_crop(tensor: torch.Tensor, roi, original_size, dims):
+    """
+    Crop `tensor` along two dimensions given by `dims` using an ROI defined in the
+    coordinate system of `original_size`.
+
+    Args:
+        tensor: torch.Tensor (N-D)
+        roi: tuple (min_v, max_v, min_u, max_u) in pixels of original image space
+        original_size: tuple (H, W) of the original image space used by roi
+        dims: tuple/list of two ints -> which tensor dims correspond to (v/h, u/w).
+              Example: for occupancy_grid (B,Z,H,W), dims=(-2, -1)
+                       for wan_vae_latent   (B,16,2,H,W), dims=(-2, -1)
+
+    Returns:
+        Cropped tensor (a view when possible).
+    """
+    if tensor is None:
+        return None
+    if len(dims) != 2:
+        raise ValueError(f"dims must have length 2, got {dims}")
+
+    dv, du = int(dims[0]), int(dims[1])
+    nd = tensor.ndim
+    if dv < 0:
+        dv += nd
+    if du < 0:
+        du += nd
+    if dv == du or not (0 <= dv < nd) or not (0 <= du < nd):
+        raise ValueError(f"Invalid dims {dims} for tensor.ndim={nd}")
+
+    min_v, max_v, min_u, max_u = roi
+    H, W = original_size
+
+    tv = tensor.shape[dv]
+    tu = tensor.shape[du]
+
+    # map roi from original pixel space -> tensor index space
+    h0 = int(min_v * tv / H)
+    h1 = int(max_v * tv / H)
+    w0 = int(min_u * tu / W)
+    w1 = int(max_u * tu / W)
+
+    # clamp to valid range
+    h0 = max(0, min(tv, h0))
+    h1 = max(0, min(tv, h1))
+    w0 = max(0, min(tu, w0))
+    w1 = max(0, min(tu, w1))
+
+    # ensure non-empty / ordered (optional; you can also allow empty crops)
+    if h1 < h0:
+        h0, h1 = h1, h0
+    if w1 < w0:
+        w0, w1 = w1, w0
+
+    sl = [slice(None)] * nd
+    sl[dv] = slice(h0, h1)
+    sl[du] = slice(w0, w1)
+    return tensor[tuple(sl)]
+
+
+def get_latent_and_grid_crop(wan_vae_latent, occupancy_grid):
     # wan_vae_latent: [B,16,2,60,104]
     # occupancy_grid: (B,Z,H,W)
+
     assert len(wan_vae_latent.shape) == 5
     assert len(occupancy_grid.shape) == 4
     assert (
@@ -173,6 +235,7 @@ def get_center_crop_latent_and_grid(wan_vae_latent, occupancy_grid):
     # lazy centering crop
     vae_left = (wan_vae_latent.shape[4] - wan_vae_latent.shape[3]) // 2
     grid_left = (occupancy_grid.shape[3] - occupancy_grid.shape[2]) // 2
+
     wan_vae_latent = wan_vae_latent[
         :, :, :, :, vae_left : vae_left + wan_vae_latent.shape[3]
     ]
@@ -226,8 +289,10 @@ def train_eval_batch(
                     # TODO: Handle eval batch processing as needed, implement .sample()
 
             occupancy_grid = batch["occupancy_grid"].to(config["device"])  # (B,Z,H,W)
+            # print("occupancy_grid shape:", occupancy_grid.shape)
             batch_size = occupancy_grid.shape[0]
             if config["zero_conditioning"]:
+                # print("zero conditioning!")
                 wan_vae_latent = torch.zeros(
                     (batch_size, 16, 2, 60, 104),
                     device=config["device"],
@@ -236,9 +301,8 @@ def train_eval_batch(
                 wan_vae_latent = batch["wan_vae_latent"].to(
                     config["device"]
                 )  # [4, 16, 2, 60, 104]
-            center_wan_vae_latent, center_occupancy_grid = (
-                get_center_crop_latent_and_grid(wan_vae_latent, occupancy_grid)
-            )
+
+            # print("wan_vae_latent shape:", wan_vae_latent.shape)
 
             # print(
             #     "center_wan_vae_latent shape:", center_wan_vae_latent.shape
@@ -256,17 +320,15 @@ def train_eval_batch(
             ).long()  # random timesteps for each sample in the batch [B,]
 
             # DIFFUSION TRAINING (only this is trainable)
-            noise = torch.randn_like(center_occupancy_grid)
+            noise = torch.randn_like(occupancy_grid)
             noise_center_grid = noise_scheduler.add_noise(
-                center_occupancy_grid, noise, timesteps
+                occupancy_grid, noise, timesteps
             )
             # print("noisy grid shape:", noise_center_grid.shape)  # ([1, 8, 8, 8])
             if config["use_global_avg_pool"]:
-                condition = (
-                    center_wan_vae_latent  # , because will be avg pooled in model
-                )
+                condition = wan_vae_latent  # , because will be avg pooled in model
             else:
-                condition = center_wan_vae_latent.flatten(1)  #
+                condition = wan_vae_latent.flatten(1)  #
 
             # print("condition shape:", condition.shape)  # ([1, 115200])
 
@@ -292,8 +354,8 @@ def train_eval_batch(
                     )
                     # write  center_occupancy_grid
                     writer.add_histogram(
-                        f"{tag_prefix}/center_occupancy_grid",
-                        center_occupancy_grid.detach().float().cpu(),
+                        f"{tag_prefix}/occupancy_grid",
+                        occupancy_grid.detach().float().cpu(),
                         global_step,
                     )
                     writer.add_histogram(
@@ -335,7 +397,7 @@ def train_eval_batch(
                 bce_loss = F.binary_cross_entropy_with_logits(
                     logits,
                     (
-                        center_occupancy_grid
+                        occupancy_grid
                         > (0 if config["grid_binary_range"] == "neg1-1" else 0.5)
                     ).float(),
                 )
@@ -347,7 +409,12 @@ def train_eval_batch(
                 total_loss.backward()
                 optimizer.step()
 
-            pbar.set_postfix({"loss": f"{ddpm_loss:.4f}/{bce_loss:.4f}"})
+            pbar.set_postfix(
+                {
+                    "loss": f"{ddpm_loss:.4f}"
+                    + (f"/{bce_loss:.4f}" if bce_weight > 0 else "")
+                }
+            )
 
     avg_ddpm_loss = sum_ddpm_loss / len(dataloader)
     avg_bce_loss = sum_bce_loss / len(dataloader)
@@ -357,14 +424,16 @@ def train_eval_batch(
 
 def makeDiTModel(config):
     return DiT(
-        input_size=config["scaled_image_size"][0],  # H
+        input_size=config["scaled_image_size"],  # H or H, W
         patch_size=config["patch_size"],
         in_channels=config["depth_voxel_grid_bins"],  # depth bins per patch
         hidden_size=config["latent_dim"],
         depth=config["num_transformer_blocks"],  # n DiT blocks
         num_heads=config["num_attention_heads"],  # DiT block param
         mlp_ratio=4.0,  # DiT block param
-        vae_feature_dim=(16 * 2 * 60 * 60 if not config["use_global_avg_pool"] else 16),
+        vae_feature_dim=(
+            16 * 2 * 60 * 60 if not config["use_global_avg_pool"] else 16
+        ),  # 16 * 2 * 60 * 60 because 832, 480
         class_dropout_prob=0.1,
         learn_sigma=config["learn_sigma"],
     ).to(config["device"])
@@ -414,6 +483,7 @@ def makeDataset(
         n_p=config["num_points"],
         point_only=False,  # False for dit training
         max_depth=config["max_voxel_grid_depth"],
+        roi=config["training_roi"],
         depth_bins=config["depth_voxel_grid_bins"],
         wan_vae=True,  # for vae-based training
         wan_vae_checkpoint="/checkpoints/huggingface_hub/models--Wan-AI--Wan2.2-T2V-A14B/Wan2.1_VAE.pth",
