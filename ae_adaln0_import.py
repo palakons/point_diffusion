@@ -1,7 +1,7 @@
 import sys
 
 sys.path.insert(0, "/home/palakons/DiT")
-from models import DiT
+from models_org import AEDiT
 
 import torch
 import torch.nn as nn
@@ -18,7 +18,14 @@ import os
 import argparse
 from torch.utils.data import Subset
 import torch.nn.functional as F
-from dit_ddpm_class import parse_args, set_seed, TransformerDenoiser, get_runid
+from dit_ddpm_class import (
+    parse_args,
+    set_seed,
+    TransformerDenoiser,
+    get_runid,
+    PretrainedPointNeXtEncoderPointAE,
+    get_pointnextdit_runid,
+)
 from torch.utils.tensorboard import SummaryWriter
 from math import prod
 
@@ -30,7 +37,7 @@ from math import prod
 # 'occupancy_grid' (B,Z,H,H)  --> (B,1,Z,H,H)
 
 
-def save_checkpoint(model: DiT, optimizer, epoch, loss, checkpoint_path, config):
+def save_checkpoint(model: AEDiT, optimizer, epoch, loss, checkpoint_path, config):
 
     checkpoint = {
         "model_state_dict": model.state_dict(),
@@ -44,18 +51,19 @@ def save_checkpoint(model: DiT, optimizer, epoch, loss, checkpoint_path, config)
 
 
 def find_checkpoint_path(checkpoint_dir, config):
-    runid = get_runid(config)
+    runid = get_pointnextdit_runid(config)
     #  f"best_vae_voxel_ddpm_{run_id}_at{best_epoch}.pth"
     #  f"final_vae_voxel_ddpm_{run_id}.pth"
     #  f"vae_voxel_ddpm_{run_id}_at{saved_epoch}.pth"
-    first_pattern = f"best_vae_voxel_ddpm_MetaDiT_{runid}_at"
-    second_pattern = f"final_vae_voxel_ddpm_MetaDiT_{runid}.pth"
-    third_pattern = f"vae_voxel_ddpm_MetaDiT_{runid}_at"
+    print("Looking for checkpoints in:", checkpoint_dir, "with runid:", runid)
+    first_pattern = f"vae_pointae_ddpm_AEDiT_{runid}_at"
+    second_pattern = f"final_vae_pointae_ddpm_AEDiT_{runid}.pth"
+    third_pattern = f"vae_pointae_ddpm_AEDiT_{runid}_at"
 
     # find files in checkpoint dir matches first_pattern, using
     for pattern in [first_pattern, second_pattern, third_pattern]:
         checkpoint_files = os.listdir(f"{checkpoint_dir}")
-        print("Searching:", pattern)
+        # print("Searching:", pattern)
         matched_files = [
             f for f in checkpoint_files if f.startswith(pattern) and f.endswith(".pth")
         ]
@@ -87,7 +95,7 @@ def find_checkpoint_path(checkpoint_dir, config):
     return ""
 
 
-def load_checkpoint(model: DiT, optimizer, config):
+def load_checkpoint(model: AEDiT, optimizer, config):
     if config["dit_checkpoint"] == "":
         return 0, 0
     checkpoint_path = config["dit_checkpoint"]
@@ -95,31 +103,26 @@ def load_checkpoint(model: DiT, optimizer, config):
 
     # check if config matches
     important_fields = [
-        "aux_occ_scale",
-        "aux_occ_weight",
         "batch_size",
         "camera_channel",
         "data_file",
-        "depth_voxel_grid_bins",
         "dit_decay",
         "dit_lr",
-        "grid_binary_range",
         "latent_dim",
         "latent_seq_length",
         "learn_sigma",
-        "max_voxel_grid_depth",
         "num_attention_heads",
         "num_input_frames",
         "num_points",
         "num_train_timesteps",
         "num_transformer_blocks",
-        "patch_size",
         "radar_channel",
-        "scaled_image_size",
         "scene_ids",
         "seed",
         "use_global_avg_pool",
         "zero_conditioning",
+        "ae_latent_normalizing_std",
+        "ddpm_clip_sample",
     ]
     matched = True
     for field in important_fields:
@@ -245,8 +248,10 @@ def get_latent_and_grid_crop(wan_vae_latent, occupancy_grid):
     return wan_vae_latent, occupancy_grid
 
 
-def train_eval_batch(
-    model: DiT,
+def train_eval_batch_pointae_ddpm(
+    model: AEDiT,
+    autoencoder: PretrainedPointNeXtEncoderPointAE,
+    noise_scheduler: DDPMScheduler,
     dataloader: DataLoader,
     optimizer,
     config,
@@ -255,87 +260,84 @@ def train_eval_batch(
     loss_fn=F.mse_loss,
     writer: SummaryWriter = None,
 ):
+    autoencoder.eval()
     if train:
         model.train()
     else:
         model.eval()
 
-    noise_scheduler = DDPMScheduler(
-        num_train_timesteps=config["num_train_timesteps"],
-        beta_schedule="linear",
-        # beta_schedule="squaredcos_cap_v2",
-        clip_sample=True,  # problem
-        clip_sample_range=1,
-        prediction_type="epsilon",
-    )
     bce_weight = float(config["aux_occ_weight"])  # e.g. 0.01
     bce_logit_scale = float(config["aux_occ_scale"])  # e.g. 5 or 10
 
     pbar = tqdm(dataloader, leave=False, desc="Train Batch" if train else "Eval Batch")
     sum_ddpm_loss = 0.0
-    sum_bce_loss = 0.0
-    sum_total_loss = 0.0
     for i_batch, batch in enumerate(pbar):
-        with torch.no_grad() if not train else torch.enable_grad():
-            if train:
-                optimizer.zero_grad()
-            else:
-                if i_batch == 0:
-                    # Sample the first item
-
-                    # Process the first item as needed
-                    # print(f"Eval Batch")
-                    pass
-                    # TODO: Handle eval batch processing as needed, implement .sample()
-
-            occupancy_grid = batch["occupancy_grid"].to(config["device"])  # (B,Z,H,W)
-            # print("occupancy_grid shape:", occupancy_grid.shape)
-            batch_size = occupancy_grid.shape[0]
-            if config["zero_conditioning"]:
-                # print("zero conditioning!")
-                wan_vae_latent = torch.zeros(
-                    (batch_size, 16, 2, 60, 104),
-                    device=config["device"],
-                )  # [4, 16, 2, 60, 104]
-            else:
-                wan_vae_latent = batch["wan_vae_latent"].to(
-                    config["device"]
-                )  # [4, 16, 2, 60, 104]
-
-            # print("wan_vae_latent shape:", wan_vae_latent.shape)
-
-            # print(
-            #     "center_wan_vae_latent shape:", center_wan_vae_latent.shape
-            # )  # [4, 16, 2, 60, 60]
-            # print(
-            #     "center_occupancy_grid shape:", center_occupancy_grid.shape
-            # )  # [ 4,  8,8,8]
-
-            # Make noisy grid
-            timesteps = torch.randint(
-                0,
-                noise_scheduler.config.num_train_timesteps,
-                (batch_size,),
-                device=config["device"],
-            ).long()  # random timesteps for each sample in the batch [B,]
-
-            # DIFFUSION TRAINING (only this is trainable)
-            noise = torch.randn_like(occupancy_grid)
-            noise_center_grid = noise_scheduler.add_noise(
-                occupancy_grid, noise, timesteps
+        if train:
+            optimizer.zero_grad()
+        print("batch keys:", batch.keys())
+        # npoints_original
+        print("npoints_original:", batch["npoints_original"])
+        exit()
+        # if both not equal,
+        filtered_radar_data = batch["filtered_radar_data"].to(config["device"])
+        with torch.no_grad():
+            predicted_radar_7d, confidence, latent = autoencoder(filtered_radar_data)
+            writer.add_scalar(
+                "latent/mean",
+                latent.mean().item(),
+                global_step,
             )
-            # print("noisy grid shape:", noise_center_grid.shape)  # ([1, 8, 8, 8])
-            if config["use_global_avg_pool"]:
-                condition = wan_vae_latent  # , because will be avg pooled in model
-            else:
-                condition = wan_vae_latent.flatten(1)  #
+            writer.add_scalar(
+                "latent/std",
+                latent.std().item(),
+                global_step,
+            )
+            latent = latent / config["ae_latent_normalizing_std"]
+            latent = latent.detach()
+            # print("after normalizing latent std:", latent.std().item())
 
-            # print("condition shape:", condition.shape)  # ([1, 115200])
+            writer.add_scalar(
+                "latent/std-after-norm",
+                latent.std().item(),
+                global_step,
+            )
 
-            output = model(noise_center_grid, timesteps, vae_feature=condition)
+        # print("latent shape:", latent.shape)  # e([1 ,64, 768])
+        batch_size = filtered_radar_data.shape[0]
+        if config["zero_conditioning"]:
+            # print("zero conditioning!")
+            wan_vae_latent = torch.zeros(
+                (batch_size, 16, 2, 60, 104),
+                device=config["device"],
+            )  # [4, 16, 2, 60, 104]
+        else:
+            wan_vae_latent = batch["wan_vae_latent"].to(
+                config["device"]
+            )  # [4, 16, 2, 60, 104]
+
+        timesteps = torch.randint(
+            0,
+            noise_scheduler.config.num_train_timesteps,
+            (batch_size,),
+            device=config["device"],
+        ).long()  # random timesteps for each sample in the batch [B,]
+
+        # DIFFUSION TRAINING (only this is trainable)
+        noise = torch.randn_like(latent)
+        noise_point_latent = noise_scheduler.add_noise(latent, noise, timesteps)
+        # print("noisy grid shape:", noise_center_grid.shape)  # ([1, 8, 8, 8])
+
+        condition = (
+            wan_vae_latent
+            if config["use_global_avg_pool"]
+            else wan_vae_latent.flatten(1)
+        )
+        with torch.set_grad_enabled(train):
+
+            output = model(noise_point_latent, timesteps, vae_feature=condition)
             if config["learn_sigma"]:
-                noise_pred = output[:, : output.shape[1] // 2, ...]  # ([1, 8, 8, 8])
-                sigma_pred = output[:, output.shape[1] // 2 :, ...]  # ([1, 8, 8, 8])
+                # output: (B, T, 2*D) -> split last dim
+                noise_pred, sigma_pred = output.chunk(2, dim=-1)
             else:
                 noise_pred = output  # ([1, 8, 8, 8])
                 sigma_pred = None
@@ -346,94 +348,115 @@ def train_eval_batch(
                 if global_step % config["save_every"] == 0:
                     tag_prefix = "train" if train else "val"
 
-                    # write hist of condition
-                    writer.add_histogram(
-                        f"{tag_prefix}/condition",
-                        condition.detach().float().cpu(),
-                        global_step,
-                    )
-                    # write  center_occupancy_grid
-                    writer.add_histogram(
-                        f"{tag_prefix}/occupancy_grid",
-                        occupancy_grid.detach().float().cpu(),
-                        global_step,
-                    )
-                    writer.add_histogram(
-                        f"{tag_prefix}/noise_pred",
-                        noise_pred.detach().float().cpu(),
-                        global_step,
-                    )
-                    writer.add_histogram(
-                        f"{tag_prefix}/x_t_noisy",
-                        noise_center_grid.detach().float().cpu(),
-                        global_step,
-                    )
-                    # optional quick scalars
-                    writer.add_scalar(
-                        f"{tag_prefix}/noise_pred_mean",
-                        noise_pred.mean().item(),
-                        global_step,
-                    )
-                    writer.add_scalar(
-                        f"{tag_prefix}/noise_pred_std",
-                        noise_pred.std().item(),
-                        global_step,
-                    )
+                    # writer.add_scalar(
+                    #     f"{tag_prefix}/noise_pred_std",
+                    #     noise_pred.std().item(),
+                    #     global_step,
+                    # )
 
-            global_step += 1
+            if train:
+                global_step += 1
+            # print("noise shape:", noise.shape)
+            # print("noise_pred shape:", noise_pred.shape)
             ddpm_loss = loss_fn(noise, noise_pred)
-            sum_ddpm_loss += ddpm_loss.item()
             total_loss = ddpm_loss
-            bce_loss = 0
 
-            if bce_weight > 0:
-                # Estimate x0 from current x_t and eps_pred
-                x0_pred = noise_scheduler.step(
-                    noise_pred, timesteps, noise_center_grid
-                ).pred_original_sample  # (B,Z,H,W)
-
-                # BCE targets in {0,1} (since your x0 is {-1,+1})
-                logits = bce_logit_scale * x0_pred
-                bce_loss = F.binary_cross_entropy_with_logits(
-                    logits,
-                    (
-                        occupancy_grid
-                        > (0 if config["grid_binary_range"] == "neg1-1" else 0.5)
-                    ).float(),
-                )
-
-                total_loss = total_loss + bce_weight * bce_loss
-                sum_bce_loss += bce_loss.item()
-            sum_total_loss += total_loss.item()
             if train:
                 total_loss.backward()
                 optimizer.step()
 
-            pbar.set_postfix(
-                {
-                    "loss": f"{ddpm_loss:.4f}"
-                    + (f"/{bce_loss:.4f}" if bce_weight > 0 else "")
-                }
-            )
+            # -------------------------------
+            # Teacher-forced x0 reconstruction loss (normalized latent space)
+            # -------------------------------
+            with torch.no_grad():
+                step_out = noise_scheduler.step(
+                    noise_pred, timesteps, noise_point_latent
+                )
+                x0_hat = (
+                    step_out.pred_original_sample
+                )  # same space as `latent` (normalized)
+                x0_loss = F.mse_loss(x0_hat, latent)
+
+            if writer is not None and global_step is not None:
+                tag_prefix = "train" if train else "val"
+                writer.add_scalar(
+                    f"{tag_prefix}/ddpm_eps_mse", ddpm_loss.item(), global_step
+                )
+                writer.add_scalar(f"{tag_prefix}/x0_mse", x0_loss.item(), global_step)
+
+            sum_ddpm_loss += ddpm_loss.item()
+
+            pbar.set_postfix({"loss": f"{ddpm_loss:.4f}"})
 
     avg_ddpm_loss = sum_ddpm_loss / len(dataloader)
-    avg_bce_loss = sum_bce_loss / len(dataloader)
-    avg_total_loss = sum_total_loss / len(dataloader)
-    return avg_ddpm_loss, avg_bce_loss, avg_total_loss, global_step
+    return avg_ddpm_loss, global_step
 
 
-def makeDiTModel(config):
-    return DiT(
-        input_size=config["scaled_image_size"],  # H or H, W
-        patch_size=config["patch_size"],
-        in_channels=config["depth_voxel_grid_bins"],  # depth bins per patch
+def loadAECheckpoint(config):
+    """
+    load from pre-trained AE checkpoint
+    pat, config['point_ae_checkpoint']
+    """
+
+    # checkpoint = {
+    #     "model_state_dict": model.state_dict(),
+    #     "optimizer_state_dict": optimizer.state_dict(),
+    #     "epoch": epoch,
+    #     "metrics": metrics,
+    #     "config": config,
+    # }
+    checkpoint_path = config["point_ae_checkpoint"]
+    checkpoint = torch.load(checkpoint_path, map_location=config["device"])
+    assert (
+        checkpoint["config"]["latent_dim"] == config["latent_dim"]
+    ), "latent dim mismatch"
+    assert (
+        checkpoint["config"]["latent_seq_length"] == config["latent_seq_length"]
+    ), "latent seq length mismatch"
+
+    autoencoder = PretrainedPointNeXtEncoderPointAE(
+        d_model=config["latent_dim"],
+        output_points=config["num_points"],
+        seq_length=config["latent_seq_length"],
+        query_latent_pool_nhead=checkpoint["config"]["query_num_heads"],
+        query_latent_pool_dropout=checkpoint["config"]["query_dropout"],
+        device=config["device"],
+        decoder_model=checkpoint["config"]["point_ae_model"][10:],
+        num_decoder_layers=checkpoint["config"]["decoder_num_layers"],
+        num_decoder_head=checkpoint["config"]["decoder_num_heads"],
+        decoder_dropout=checkpoint["config"]["decoder_dropout"],
+        pointnext_config=checkpoint["config"]["pointnext_config"],
+        # 48 nsample, 8 m radius
+        # pointnext_config="scannet/pointnext-s.yaml",
+        output_dim=7,
+    ).to(config["device"])
+    autoencoder.load_state_dict(checkpoint["model_state_dict"])
+    autoencoder.eval()
+    print(f"Loaded AE checkpoint from {checkpoint_path}")
+    return autoencoder, checkpoint["config"]
+
+
+def makeAEDiTModel(config):
+    return AEDiT(
+        n_tokens=64,
         hidden_size=config["latent_dim"],
-        depth=config["num_transformer_blocks"],  # n DiT blocks
-        num_heads=config["num_attention_heads"],  # DiT block param
-        mlp_ratio=4.0,  # DiT block param
+        depth=config["num_transformer_blocks"],  # n AEDiT blocks
+        num_heads=config["num_attention_heads"],  # AEDiT block param
+        mlp_ratio=4.0,  # AEDiT block param
         vae_feature_dim=(
-            16 * 2 * 60 * 60 if not config["use_global_avg_pool"] else 16
-        ),  # 16 * 2 * 60 * 60 because 832, 480
+            16 * 2 * 60 * 104 if not config["use_global_avg_pool"] else 16
+        ),  # 16 * 2 * 60 * 104 because 832, 480
         class_dropout_prob=0.1,
         learn_sigma=config["learn_sigma"],
     ).to(config["device"])
+
+
+def makeDDPMScheduler(config):
+    return DDPMScheduler(
+        num_train_timesteps=config["num_train_timesteps"],
+        beta_schedule="linear",
+        # beta_schedule="squaredcos_cap_v2",
+        clip_sample=config["ddpm_clip_sample"],  # problem
+        clip_sample_range=1,
+        prediction_type="epsilon",
+    )

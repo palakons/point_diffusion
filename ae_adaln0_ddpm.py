@@ -6,7 +6,7 @@ Conditional on RGB image's WAN VAE Latent[B, 16, 2, 60, 104]], outputs pixel-dep
 import sys
 
 sys.path.insert(0, "/home/palakons/DiT")
-from models import DiTSet
+from models_org import AEDiT
 
 import torch
 import torch.nn as nn
@@ -26,7 +26,7 @@ from dit_ddpm_class import (
     parse_args,
     set_seed,
     TransformerDenoiser,
-    get_runid,
+    get_pointnextdit_runid,
     query_gpu_stats,
     makeDataset,
     splitDataset,
@@ -35,11 +35,13 @@ from dit_ddpm_class import (
     tblogHparam,
 )
 from torch.utils.tensorboard import SummaryWriter
-from adaln0_import import (
+from ae_adaln0_import import (
     save_checkpoint,
     load_checkpoint,
-    train_eval_batch,
-    makeDiTModel,
+    train_eval_batch_pointae_ddpm,
+    makeAEDiTModel,
+    loadAECheckpoint,
+    makeDDPMScheduler,
 )
 
 
@@ -50,7 +52,7 @@ from adaln0_import import (
 # 'occupancy_grid' (B,Z,H,H)  --> (B,1,Z,H,H)
 
 
-def train_vae_voxel_ddpm(
+def train_pointae_ddpm(
     dataset,
     val_dataset,
     config,
@@ -75,21 +77,12 @@ def train_vae_voxel_ddpm(
     config["gpu_name"] = torch.cuda.get_device_name(0)
     torch.cuda.reset_peak_memory_stats()
 
-    print("actual image size:", config["original_image_size"])
-    print("scaled image size:", config["scaled_image_size"])
-    print("max voxel grid depth:", config["max_voxel_grid_depth"])
-    print("depth voxel grid bins:", config["depth_voxel_grid_bins"])
-    print("==" * 10)
-    print(
-        f"resolution per depth bin (meters): {config['max_voxel_grid_depth'] / config['depth_voxel_grid_bins']:.4f} m, pixel resolution: y {config['original_image_size'][1] / config['scaled_image_size'][1]:.4f}, x {config['original_image_size'][0] / config['scaled_image_size'][0]:.4f}",
-    )
-    print("FOV 120deg H, 73deg V, One scaled pixel covers:")
-    print(
-        f"@125m h:{125 * np.tan(np.radians(120/2)) / config['scaled_image_size'][1]:.4f}, v:{125 * np.tan(np.radians(73 / 2)) / config['scaled_image_size'][0]:.4f} m",
-    )
-    print("==" * 10)
+    ddpm = makeAEDiTModel(config)
 
-    ddpm = makeDiTModel(config)
+    autoencoder, _ = loadAECheckpoint(config)
+    for param in autoencoder.parameters():
+        param.requires_grad = False
+    ddpm_scheduler = makeDDPMScheduler(config)
 
     # print VRAM usage
     vram_usage = torch.cuda.max_memory_allocated() / (1024**3)
@@ -134,37 +127,31 @@ def train_vae_voxel_ddpm(
     global_step = 0
     for epoch in epoch_bar:
 
-        avg_ddpm_train_loss, avg_bce_train_loss, avg_total_train_loss, global_step = (
-            train_eval_batch(
-                ddpm,
-                dataloader,
-                optimizer,
-                config,
-                global_step,
-                train=True,
-                writer=writer,
-            )
+        avg_ddpm_train_loss, global_step = train_eval_batch_pointae_ddpm(
+            ddpm,
+            autoencoder,
+            ddpm_scheduler,
+            dataloader,
+            optimizer,
+            config,
+            global_step,
+            train=True,
+            writer=writer,
         )
         writer.add_scalar("Loss/train/ddpm", avg_ddpm_train_loss, epoch + 1)
-        if config["aux_occ_weight"] > 0:
-            writer.add_scalar("Loss/train/bce", avg_bce_train_loss, epoch + 1)
-            writer.add_scalar("Loss/train/total", avg_total_train_loss, epoch + 1)
         if (epoch + 1) % config["eval_every"] == 0:
-            avg_val_ddpm_loss, avg_val_bce_loss, avg_val_total_loss, _ = (
-                train_eval_batch(
-                    ddpm,
-                    eval_dataloader,
-                    None,
-                    config,
-                    global_step,
-                    train=False,
-                    writer=writer,
-                )
+            avg_val_ddpm_loss, _ = train_eval_batch_pointae_ddpm(
+                ddpm,
+                autoencoder,
+                ddpm_scheduler,
+                eval_dataloader,
+                None,
+                config,
+                global_step,
+                train=False,
+                writer=writer,
             )
             writer.add_scalar("Loss/val/ddpm", avg_val_ddpm_loss, epoch + 1)
-            if config["aux_occ_weight"] > 0:
-                writer.add_scalar("Loss/val/bce", avg_val_bce_loss, epoch + 1)
-                writer.add_scalar("Loss/val/total", avg_val_total_loss, epoch + 1)
 
         if (epoch + 1) % config["gpu_log_every"] == 0:
             stats = query_gpu_stats(gpu_index=0)
@@ -183,10 +170,10 @@ def train_vae_voxel_ddpm(
         ] == 0 or avg_total_train_loss < best_epoch_train_total_loss:
             if (epoch + 1) % config["save_every"] == 0:
                 checkpoint_path = os.path.join(
-                    checkpoint_dir, f"vae_voxel_ddpm_{run_id}_at{epoch+1}.pth"
+                    checkpoint_dir, f"vae_pointae_ddpm_{run_id}_at{epoch+1}.pth"
                 )
                 prev_path = os.path.join(
-                    checkpoint_dir, f"vae_voxel_ddpm_{run_id}_at{saved_epoch}.pth"
+                    checkpoint_dir, f"vae_pointae_ddpm_{run_id}_at{saved_epoch}.pth"
                 )
                 if os.path.exists(prev_path):
                     os.remove(prev_path)
@@ -195,13 +182,13 @@ def train_vae_voxel_ddpm(
                 best_epoch_train_total_loss = avg_total_train_loss
                 # Remove previous best checkpoint
                 prev_path = os.path.join(
-                    checkpoint_dir, f"best_vae_voxel_ddpm_{run_id}_at{best_epoch}.pth"
+                    checkpoint_dir, f"best_vae_pointae_ddpm_{run_id}_at{best_epoch}.pth"
                 )
                 if os.path.exists(prev_path):
                     os.remove(prev_path)
                 best_epoch = epoch + 1
                 checkpoint_path = os.path.join(
-                    checkpoint_dir, f"best_vae_voxel_ddpm_{run_id}_at{best_epoch}.pth"
+                    checkpoint_dir, f"best_vae_pointae_ddpm_{run_id}_at{best_epoch}.pth"
                 )
 
             save_checkpoint(
@@ -220,7 +207,9 @@ def train_vae_voxel_ddpm(
 
     tblogHparam(config, writer, {"avg_ddpm_train_loss": avg_ddpm_train_loss})
     writer.close()
-    checkpoint_path = os.path.join(checkpoint_dir, f"final_vae_voxel_ddpm_{run_id}.pth")
+    checkpoint_path = os.path.join(
+        checkpoint_dir, f"final_vae_pointae_ddpm_{run_id}.pth"
+    )
     save_checkpoint(
         ddpm,
         optimizer,
@@ -237,12 +226,16 @@ def train_vae_voxel_ddpm(
 def main():
     args = parse_args()
     config = vars(args)
+    assert (
+        config["point_ae_checkpoint"] != ""
+    ), "Provide pretrained PointNeXt-PointAE checkpoint path, point_ae_checkpoint"
     print(f"Setting random seed: {args.seed}")
     set_seed(config["seed"])
 
-    plot_dir = "/data/palakons/man_vaevoxelmetadit/plots"
-    checkpoint_dir = "/data/palakons/man_vaevoxelmetadit/checkpoints"
-    tb_log_dir = "/home/palakons/logs/tb_log/vaevoxelmetadit"
+    exp_set = "man_pointnextmetaditddpm"
+    plot_dir = f"/data/palakons/{exp_set}/plots"
+    checkpoint_dir = f"/data/palakons/{exp_set}/checkpoints"
+    tb_log_dir = f"/home/palakons/logs/tb_log/{exp_set}"
     os.makedirs(plot_dir, exist_ok=True)
     os.makedirs(checkpoint_dir, exist_ok=True)
     os.makedirs(tb_log_dir, exist_ok=True)
@@ -255,8 +248,8 @@ def main():
     train_dataset, val_dataset = splitDataset(dataset_point, split=0.5)
 
     print("Starting training...")
-    runid = f"MetaDiT_{get_runid(config)}"
-    ddpm = train_vae_voxel_ddpm(
+    runid = f"AEDiT_{get_pointnextdit_runid(config)}"
+    ddpm = train_pointae_ddpm(
         train_dataset,
         val_dataset,
         config,

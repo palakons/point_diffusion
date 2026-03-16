@@ -1,4 +1,7 @@
+import time
 import torch
+import sys, subprocess
+import tensorflow as tf
 import torch.nn as nn
 from diffusers import DDPMScheduler
 from diffusers.optimization import get_cosine_schedule_with_warmup
@@ -6,21 +9,235 @@ from torch.utils.data import DataLoader
 import numpy as np
 from tqdm import tqdm, trange
 from man_ddpm import MANDataset, chamfer_distance
-from torch.utils.data import Dataset
+from geomloss import SamplesLoss
+from torch_cluster import knn_graph
+from pytorch3d.loss import chamfer_distance   as  pt3d_chamfer_distance # Import here for clarity
+from torch.utils.data import Dataset, Subset
 import matplotlib.pyplot as plt
 from datetime import datetime
 import os
 import random
 import argparse
-import sys
+# from pytorch3d.loss import chamfer_distance
 
 sys.path.insert(0, "/home/palakons/PointNeXt")
 from openpoints.models import build_model_from_cfg
 from openpoints.utils import EasyConfig, load_checkpoint
 from torch.utils.tensorboard import SummaryWriter
+from typing import Dict, Optional
 
 # import F
 from torch.nn import functional as F
+from scipy.optimize import linear_sum_assignment
+
+
+def hungarian_l2_with_attr_loss(
+    pred: torch.Tensor,
+    gt: torch.Tensor,
+    w_xyz: float = 1.0,
+    w_velocity: float = 0.1,
+    w_rcs: float = 0.01,
+    xyz_slice=slice(0, 3),
+    vel_slice=slice(3, 6),
+    rcs_slice=slice(6, 7),
+    use_greedy: bool = False,
+):
+    """
+    One-to-one matching loss using Hungarian assignment.
+
+    Matching is done using xyz only.
+    After matching, compute xyz + velocity + rcs losses on the matched pairs.
+    
+    Args:
+        use_greedy: If True, use fast greedy matching instead of Hungarian (10-50x faster)
+                   For N > 200 points, this is highly recommended
+    """
+    assert pred.dim() == 3 and gt.dim() == 3
+    B, Np, Dp = pred.shape
+    Bg, Ng, Dg = gt.shape
+    assert B == Bg, (pred.shape, gt.shape)
+    assert (
+        Np == Ng
+    ), f"Hungarian matching requires same number of points, got {Np} vs {Ng}"
+    assert Dp >= 7 and Dg >= 7
+
+    total_loss = pred.new_zeros(())
+    xyz_loss_total = 0.0
+    vel_loss_total = 0.0
+    rcs_loss_total = 0.0
+
+    # Extract point coordinates and attributes once (avoid repeated slicing)
+    pred_xyz = pred[:, :, xyz_slice]  # (B, N, 3)
+    pred_vel = pred[:, :, vel_slice]  # (B, N, 3)
+    pred_rcs = pred[:, :, rcs_slice]  # (B, N, 1)
+    
+    gt_xyz = gt[:, :, xyz_slice]      # (B, N, 3)
+    gt_vel = gt[:, :, vel_slice]      # (B, N, 3)
+    gt_rcs = gt[:, :, rcs_slice]      # (B, N, 1)
+
+    for b in range(B):
+        if use_greedy:
+            row_ind, col_ind = _greedy_matching_gpu(pred_xyz[b], gt_xyz[b])
+        else:
+            # Standard Hungarian algorithm
+            xyz_cost = torch.cdist(pred_xyz[b], gt_xyz[b], p=2) ** 2
+            
+            # OPTIMIZATION: Use float32 for assignment if needed
+            if xyz_cost.dtype == torch.float64:
+                xyz_cost = xyz_cost.float()
+            
+            # Transfer to CPU only once
+            cost_np = xyz_cost.detach().cpu().numpy()
+            row_ind, col_ind = linear_sum_assignment(cost_np)
+            
+            row_ind = torch.as_tensor(row_ind, device=pred.device, dtype=torch.long)
+            col_ind = torch.as_tensor(col_ind, device=pred.device, dtype=torch.long)
+
+        # Compute losses on matched pairs
+        xyz_l = (pred_xyz[b, row_ind] - gt_xyz[b, col_ind]).pow(2).mean()
+        vel_l = (pred_vel[b, row_ind] - gt_vel[b, col_ind]).pow(2).mean()
+        rcs_l = (pred_rcs[b, row_ind] - gt_rcs[b, col_ind]).pow(2).mean()
+
+        loss_b = (w_xyz * xyz_l) + (w_velocity * vel_l) + (w_rcs * rcs_l)
+        total_loss = total_loss + loss_b
+
+        # Avoid repeated CPU transfers - accumulate as tensors first
+        xyz_loss_total += xyz_l.detach().item()
+        vel_loss_total += vel_l.detach().item()
+        rcs_loss_total += rcs_l.detach().item()
+
+    total_loss = total_loss / B
+    details = {
+        "xyz": xyz_loss_total / B,
+        "velocity": vel_loss_total / B,
+        "rcs": rcs_loss_total / B,
+    }
+    return total_loss, details
+
+
+def _greedy_matching_gpu(pred_xyz, gt_xyz):
+    """
+    PROPER greedy matching that enforces one-to-one assignment.
+    
+    Algorithm:
+    1. Compute all pairwise distances
+    2. Repeatedly pick the smallest distance pair
+    3. Remove both matched points
+    4. Repeat until all matched
+    
+    This is O(N^3) in worst case (same as Hungarian) BUT:
+    - Simpler implementation
+    - Still GPU-native
+    - More intuitive
+    
+    Returns one-to-one assignment like Hungarian.
+    """
+    N = pred_xyz.shape[0]
+    
+    # Compute all pairwise distances: (N, N)
+    dist = torch.cdist(pred_xyz, gt_xyz, p=2)  # L2 distance
+    
+    row_ind = []
+    col_ind = []
+    
+    # Track which points are already matched
+    unmatched_pred = set(range(N))
+    unmatched_gt = set(range(N))
+    
+    # O(N^2) greedy matching: sort all distances, assign pairs greedily
+    # 1. Flatten distance matrix and sort
+    pairs = [(i, j) for i in range(N) for j in range(N)]
+    flat_dist = dist.flatten()
+    sorted_indices = torch.argsort(flat_dist)
+    assigned_pred = set()
+    assigned_gt = set()
+    row_ind = []
+    col_ind = []
+    for idx in sorted_indices:
+        i = idx // N
+        j = idx % N
+        if i not in assigned_pred and j not in assigned_gt:
+            row_ind.append(i)
+            col_ind.append(j)
+            assigned_pred.add(i)
+            assigned_gt.add(j)
+            if len(row_ind) == N:
+                break
+    
+    row_ind = torch.tensor(row_ind, device=pred_xyz.device, dtype=torch.long)
+    col_ind = torch.tensor(col_ind, device=pred_xyz.device, dtype=torch.long)
+    
+    return row_ind, col_ind
+
+
+def chamfer_with_attr_loss(
+    pred: torch.Tensor,
+    gt: torch.Tensor,
+    device: str,
+    attr_slice=slice(3, 7),
+    w_xyz: float = 1.0,
+    w_velocity: float = 0.1,
+    w_rcs: float = 0.01,
+):
+    """
+    pred, gt: (B, N, D) and (B, M, D); D>=7 assumed
+    Uses Chamfer on xyz plus attribute loss on NN-matched pairs.
+    """
+    pred_xyz = pred[:, :, :3]
+    gt_xyz = gt[:, :, :3]
+
+    # (B, N, M)
+    dist = torch.cdist(pred_xyz, gt_xyz)
+
+    # forward: each pred -> nearest gt
+    nn_gt_idx = dist.argmin(dim=2)  # (B, N)
+    forward_xyz = dist.min(dim=2).values.mean()
+
+    # backward: each gt -> nearest pred
+    nn_pred_idx = dist.argmin(dim=1)  # (B, M)
+    backward_xyz = dist.min(dim=1).values.mean()
+
+    xyz_cd = forward_xyz + backward_xyz
+
+    # attributes matched using the same NN assignment
+    pred_attr = pred[:, :, attr_slice]
+    gt_attr = gt[:, :, attr_slice]
+
+    # gather matched attributes
+    gt_attr_for_pred = gt_attr.gather(
+        dim=1,
+        index=nn_gt_idx.unsqueeze(-1).expand(-1, -1, gt_attr.shape[-1]),
+    )  # (B, N, A)
+    pred_attr_for_gt = pred_attr.gather(
+        dim=1,
+        index=nn_pred_idx.unsqueeze(-1).expand(-1, -1, pred_attr.shape[-1]),
+    )  # (B, M, A)
+
+    # --- SPLIT: velocity (first 3) and RCS (last 1) ---
+    pred_vel = pred_attr[:, :, :3]
+    gt_vel_for_pred = gt_attr_for_pred[:, :, :3]
+    gt_vel = gt_attr[:, :, :3]
+    pred_vel_for_gt = pred_attr_for_gt[:, :, :3]
+
+    pred_rcs = pred_attr[:, :, 3:4]
+    gt_rcs_for_pred = gt_attr_for_pred[:, :, 3:4]
+    gt_rcs = gt_attr[:, :, 3:4]
+    pred_rcs_for_gt = pred_attr_for_gt[:, :, 3:4]
+
+    vel_fwd = (pred_vel - gt_vel_for_pred).pow(2).mean()
+    vel_bwd = (gt_vel - pred_vel_for_gt).pow(2).mean()
+    vel_loss = 0.5 * (vel_fwd + vel_bwd)
+
+    rcs_fwd = (pred_rcs - gt_rcs_for_pred).pow(2).mean()
+    rcs_bwd = (gt_rcs - pred_rcs_for_gt).pow(2).mean()
+    rcs_loss = 0.5 * (rcs_fwd + rcs_bwd)
+
+    total = (w_xyz * xyz_cd) + (w_velocity * vel_loss) + (w_rcs * rcs_loss)
+    return total, {
+        "xyz": xyz_cd.item(),
+        "velocity": vel_loss.item(),
+        "rcs": rcs_loss.item(),
+    }
 
 
 class TransformerPointAE(nn.Module):
@@ -179,6 +396,7 @@ class TransformerPointDecoder(nn.Module):
         num_decoder_layers=6,
         nhead=8,
         hidden_dim=None,
+        output_dim=3,
     ):
         super().__init__()
         if hidden_dim is None:
@@ -209,7 +427,7 @@ class TransformerPointDecoder(nn.Module):
             nn.GELU(),
             nn.Linear(latent_dim // 2, latent_dim // 4),
             nn.GELU(),
-            nn.Linear(latent_dim // 4, 3),
+            nn.Linear(latent_dim // 4, output_dim),
         )
         self.confidence_head = nn.Sequential(
             nn.Linear(latent_dim, 64),
@@ -224,7 +442,7 @@ class TransformerPointDecoder(nn.Module):
             latent: (B, seq_length, latent_dim) - Encoder output
 
         Returns:
-            uvz: (B, output_points, 3)
+            radar_7d: (B, output_points, output_dim)
             confidence: (B, output_points, 1)
         """
         B = latent.shape[0]
@@ -237,10 +455,10 @@ class TransformerPointDecoder(nn.Module):
         decoded_features = self.transformer_decoder(tgt=queries, memory=latent)
 
         # Project to final outputs
-        uvz = self.coord_head(decoded_features)
+        radar_7d = self.coord_head(decoded_features)
         confidence = self.confidence_head(decoded_features)
 
-        return uvz, confidence
+        return radar_7d, confidence
 
 
 class AttentionPointDecoder(nn.Module):
@@ -249,7 +467,15 @@ class AttentionPointDecoder(nn.Module):
     Uses cross-attention mechanism similar to DETR/Point-E.
     """
 
-    def __init__(self, latent_dim=1024, output_points=500, hidden_dim=512):
+    def __init__(
+        self,
+        latent_dim=1024,
+        output_points=500,
+        hidden_dim=512,
+        output_dim=3,
+        num_attention_heads=8,
+        attention_dropout=0.1,
+    ):
         super().__init__()
 
         self.latent_dim = latent_dim
@@ -264,7 +490,10 @@ class AttentionPointDecoder(nn.Module):
 
         # Cross-attention: queries attend to latent features
         self.cross_attn = nn.MultiheadAttention(
-            embed_dim=latent_dim, num_heads=8, dropout=0.1, batch_first=True
+            embed_dim=latent_dim,
+            num_heads=num_attention_heads,
+            dropout=attention_dropout,
+            batch_first=True,
         )
 
         # Layer normalization for stability
@@ -276,11 +505,11 @@ class AttentionPointDecoder(nn.Module):
             nn.Linear(latent_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
-            nn.Dropout(0.1),
+            nn.Dropout(attention_dropout),
             nn.Linear(hidden_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
-            nn.Dropout(0.1),
+            nn.Dropout(attention_dropout),
         )
 
         # Output heads
@@ -289,7 +518,7 @@ class AttentionPointDecoder(nn.Module):
             nn.GELU(),
             nn.Linear(256, 128),
             nn.GELU(),
-            nn.Linear(128, 3),  # Output (u, v, z) coordinates
+            nn.Linear(128, output_dim),  # Output (u, v, z)  + etc.
         )
 
         # Optional: confidence head (for weighted loss during training)
@@ -309,7 +538,7 @@ class AttentionPointDecoder(nn.Module):
                     e.g., (B, 256, 1024) - denoised latent from diffusion
 
         Returns:
-            uvz: (B, output_points, 3) - UVZ coordinates
+            radar_7d: (B, output_points, output_dim) - UVZ coordinates
             confidence: (B, output_points, 1) - optional confidence scores
         """
         B = latent.shape[0]
@@ -334,12 +563,12 @@ class AttentionPointDecoder(nn.Module):
         refined = self.norm2(refined)
 
         # Predict UVZ coordinates
-        uvz = self.coord_head(refined)  # (B, output_points, 3)
+        radar_7d = self.coord_head(refined)  # (B, output_points, output_dim)
 
         # Optional: predict confidence scores
         confidence = self.confidence_head(refined)  # (B, output_points, 1)
 
-        return uvz, confidence
+        return radar_7d, confidence
 
 
 class DA3DepthTokenizer(nn.Module):
@@ -512,10 +741,18 @@ class PretrainedPointNeXtEncoderPointAE(nn.Module):
         d_model=1024,
         output_points=500,
         seq_length=256,
+        query_latent_pool_nhead=8,
+        query_latent_pool_dropout=0.1,
         device="cuda",
         pointnext_home="/home/palakons/PointNeXt",
-        decoder_model="attention",  # "transformer" or "attention"
+        decoder_model="attention",  # "transformer" or "attention", "mlp"s
         num_decoder_layers=6,
+        num_decoder_head=8,
+        decoder_dropout=0.1,
+        pointnext_config="shapenetpart/pointnext-s_c64.yaml",
+        output_dim=3,
+        ball_query_nsample=48,
+        ball_query_radius=8,
     ):
         super().__init__()
         self.d_model = d_model
@@ -523,62 +760,201 @@ class PretrainedPointNeXtEncoderPointAE(nn.Module):
         self.seq_length = seq_length
         self.device = device
 
-        # --- 1. Load and Freeze PointNeXt Encoder ---
+        # --- 1. Load PointNeXt Encoder ---
         cfg = EasyConfig()
-        cfg.load(
-            f"{pointnext_home}/cfgs/shapenetpart/pointnext-s_c64.yaml", recursive=True
+        cfg.load(f"{pointnext_home}/cfgs/{pointnext_config}", recursive=True)
+
+        cfg.model.encoder_args.nsample = ball_query_nsample  # was 48
+        cfg.model.encoder_args.radius = (
+            ball_query_radius  # example; tune to your xyz scale
         )
+
         full_model = build_model_from_cfg(cfg.model)
-        pretrained_path = f"{pointnext_home}/pretrained/shapenetpart/pointnext-s-c64/checkpoint/shapenetpart-train-pointnext-s_c64-ngpus4-seed7798-20220822-024210-ZcJ8JwCgc7yysEBWzkyAaE_ckpt_best.pth"
-        load_checkpoint(full_model, pretrained_path=pretrained_path)
+        if False:  # only pointnext_config="shapenetpart/pointnext-s_c64.yaml"
+            pretrained_path = f"{pointnext_home}/pretrained/shapenetpart/pointnext-s-c64/checkpoint/shapenetpart-train-pointnext-s_c64-ngpus4-seed7798-20220822-024210-ZcJ8JwCgc7yysEBWzkyAaE_ckpt_best.pth"
+            load_checkpoint(full_model, pretrained_path=pretrained_path)
 
         self.pointnext_encoder = full_model.encoder.to(device)
-        for param in self.pointnext_encoder.parameters():
-            param.requires_grad = False
+        # print("model: ", self.pointnext_encoder)
 
-        encoder_dim = cfg.model.encoder_args.width * (
-            2 ** (len(cfg.model.encoder_args.blocks) - 1)
+        # (encoder): PointNextEncoder(
+        #     (encoder): Sequential(
+        #     (0): Sequential(
+        #         (0): SetAbstraction(
+        #         (convs): Sequential(
+        #             (0): Sequential(
+        #             (0): Conv1d(7, 32, kernel_size=(1,), stride=(1,))
+        #             )
+        #         )
+        #         )
+        #     )
+        #     (1): Sequential(
+        #         (0): SetAbstraction(
+        #         (convs): Sequential(
+        #             (0): Sequential(
+        #             (0): Conv2d(35, 32, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        #             (1): BatchNorm2d(32, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        #             (2): ReLU(inplace=True)
+        #             )
+        #             (1): Sequential(
+        #             (0): Conv2d(32, 32, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        #             (1): BatchNorm2d(32, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        #             (2): ReLU(inplace=True)
+        #             )
+        #             (2): Sequential(
+        #             (0): Conv2d(32, 64, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        #             (1): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        #             (2): ReLU(inplace=True)
+        #             )
+        #         )
+        #         (grouper): QueryAndGroup()
+        #         )
+        #     )
+        #     (2): Sequential(
+        #         (0): SetAbstraction(
+        #         (convs): Sequential(
+        #             (0): Sequential(
+        #             (0): Conv2d(67, 64, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        #             (1): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        #             (2): ReLU(inplace=True)
+        #             )
+        #             (1): Sequential(
+        #             (0): Conv2d(64, 64, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        #             (1): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        #             (2): ReLU(inplace=True)
+        #             )
+        #             (2): Sequential(
+        #             (0): Conv2d(64, 128, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        #             (1): BatchNorm2d(128, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        #             (2): ReLU(inplace=True)
+        #             )
+        #         )
+        #         (grouper): QueryAndGroup()
+        #         )
+        #     )
+        #     (3): Sequential(
+        #         (0): SetAbstraction(
+        #         (convs): Sequential(
+        #             (0): Sequential(
+        #             (0): Conv2d(131, 128, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        #             (1): BatchNorm2d(128, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        #             (2): ReLU(inplace=True)
+        #             )
+        #             (1): Sequential(
+        #             (0): Conv2d(128, 128, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        #             (1): BatchNorm2d(128, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        #             (2): ReLU(inplace=True)
+        #             )
+        #             (2): Sequential(
+        #             (0): Conv2d(128, 256, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        #             (1): BatchNorm2d(256, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        #             (2): ReLU(inplace=True)
+        #             )
+        #         )
+        #         (grouper): QueryAndGroup()
+        #         )
+        #     )
+        #     (4): Sequential(
+        #         (0): SetAbstraction(
+        #         (convs): Sequential(
+        #             (0): Sequential(
+        #             (0): Conv2d(259, 256, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        #             (1): BatchNorm2d(256, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        #             (2): ReLU(inplace=True)
+        #             )
+        #             (1): Sequential(
+        #             (0): Conv2d(256, 256, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        #             (1): BatchNorm2d(256, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        #             (2): ReLU(inplace=True)
+        #             )
+        #             (2): Sequential(
+        #             (0): Conv2d(256, 512, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        #             (1): BatchNorm2d(512, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        #             (2): ReLU(inplace=True)
+        #             )
+        #         )
+        #         (grouper): QueryAndGroup()
+        #         )
+        #     )
+        #     )
+        # )
+
+        # singularity/home/palakons/PointNeXt/cfgs/scannet/pointnext-s.yaml
+        encoder_dim = cfg.model.encoder_args.width * (  # 32
+            2 ** (len(cfg.model.encoder_args.blocks) - 1)  # [1, 1, 1, 1, 1]
         )
 
         # --- 2. Define Trainable Components ---
         self.encoder_proj = nn.Linear(encoder_dim, d_model)
+
+        # NEW: learnable latent queries + cross-attention pooling to fixed seq_length
+        self.latent_queries = nn.Parameter(torch.randn(1, seq_length, d_model) * 0.02)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=query_latent_pool_nhead,
+            dropout=query_latent_pool_dropout,
+            batch_first=True,
+        )
+        self.latent_norm = nn.LayerNorm(d_model)
+
         if decoder_model == "transformer":
             self.pointcloud_decoder = TransformerPointDecoder(
                 latent_dim=d_model,
                 output_points=output_points,
                 num_decoder_layers=num_decoder_layers,
+                output_dim=output_dim,
             )
         elif decoder_model == "attention":
             self.pointcloud_decoder = AttentionPointDecoder(
-                latent_dim=d_model, output_points=output_points
+                latent_dim=d_model,
+                output_points=output_points,
+                output_dim=output_dim,
+                num_attention_heads=num_decoder_head,
+                attention_dropout=decoder_dropout,
             )
 
-    def encode(self, uvz, training=True):
-        """Converts a UVZ point cloud to a latent representation."""
-        # Pad UVZ for PointNeXt
-        uvz_padded = torch.cat(
-            [uvz, torch.zeros(uvz.shape[0], uvz.shape[1], 4, device=uvz.device)], dim=-1
-        )
+    def encode(self, radar_7d_data, training=True):
+        """Converts a radar_7d_data to a latent representation."""
 
+        # print("radar_7d_data shape:", radar_7d_data.shape)
+        # print("5 samples of radar_7d_data:", radar_7d_data[0, :5, :])
         point_data = {
-            "pos": uvz_padded[:, :, :3].contiguous(),
-            "x": uvz_padded.transpose(1, 2).contiguous(),
+            "pos": radar_7d_data[:, :, :3].contiguous(),  # (B,N,3)
+            "x": radar_7d_data[:, :, 3:]
+            .transpose(1, 2)
+            .contiguous(),  # (B,4,N): vx,vy,vz,rcs
         }
 
-        # Get features from frozen encoder
-        with torch.no_grad():
-            encoder_output = self.pointnext_encoder(point_data)
-            features = (
-                encoder_output[1][-1]
-                if isinstance(encoder_output, tuple)
-                else encoder_output
-            )
-            if features.shape[1] > features.shape[2]:
-                features = features.transpose(1, 2)
+        encoder_output = self.pointnext_encoder(point_data)
+        # (positions_per_stage, features_per_stage),
+
+        features = encoder_output[1][-1]
+        # for i, layer in enumerate(encoder_output[1]):
+        #     print("layer shape:", i, layer.shape)
+        # layer shape: 0 torch.Size([1, 7, 800])
+        # layer shape: 1 torch.Size([1, 32, 800])
+        # layer shape: 2 torch.Size([1, 64, 200])
+        # layer shape: 3 torch.Size([1, 128, 50])
+        # layer shape: 4 torch.Size([1, 256, 12])
+        # layer shape: 5 torch.Size([1, 512, 3])
+
+        features = features.transpose(1, 2)  # [1, 3, 512]
 
         # Project and resample to the correct sequence length
-        latent = self.encoder_proj(features)
-        latent = self.resample_to_seq_length(latent, training=training)
+        tokens = self.encoder_proj(features)  # (B, N, d_model)
+
+        # Cross-attention pooling: (B, N, d_model) -> (B, seq_length, d_model)
+        B, N, _ = tokens.shape
+        if N == 0:
+            # safety fallback (shouldn't happen in normal PointNeXt outputs)
+            latent = tokens.new_zeros((B, self.seq_length, self.d_model))
+            return latent
+
+        queries = self.latent_queries.expand(B, -1, -1)  # (B, seq_length, d_model)
+        latent, _ = self.cross_attn(query=queries, key=tokens, value=tokens)
+        latent = self.latent_norm(latent)
+        # print("latent shape:", latent.shape) #([1, 64, 768])
+
         return latent
 
     def decode(self, latent):
@@ -588,8 +964,11 @@ class PretrainedPointNeXtEncoderPointAE(nn.Module):
     def forward(self, uvz):
         """Full autoencoder pass for reconstruction."""
         latent = self.encode(uvz, training=self.training)
-        predicted_uvz, confidence = self.decode(latent)
-        return predicted_uvz, confidence, latent
+        predicted_radar_7d, confidence = self.decode(latent)
+        # print("predicted_radar_7d shape:", predicted_radar_7d.shape)
+        # print("confidence shape:", confidence.shape)
+        # print("latent shape:", latent.shape)
+        return predicted_radar_7d, confidence, latent
 
     def resample_to_seq_length(self, pointnext_embedding, training=True):
         """
@@ -1128,26 +1507,499 @@ class DitDDPM:
         return epoch
 
 
+def train_eval_ae_epoch(
+    autoencoder, dataloader, optimizer,lr_scheduler, config, writer, global_step, train=True
+):
+    if train:
+        autoencoder.train()
+    else:
+        autoencoder.eval()  
+    pbar = tqdm(dataloader, leave=False, desc="Batches")
+    epoch_loss = 0.0
+    epoch_7d_cd = 0.0
+    epoch_xyz_cd = 0.0
+    num_samples = 0
+    time_records ={}
+    for batch in pbar:
+        with torch.no_grad() if not train else torch.enable_grad():
+            time0 = time.time()
+            if train:
+                optimizer.zero_grad()
+
+            filtered_radar_data = batch["filtered_radar_data"].to(config["device"])
+            batch_size = filtered_radar_data.shape[0] 
+            # normalize the whole data
+
+            man_dataset = dataloader
+            while not isinstance(man_dataset, MANDataset):
+                man_dataset = man_dataset.dataset
+
+            data_mean = man_dataset.data_mean.to(config["device"])
+            data_std = man_dataset.data_std.to(config["device"])
+            # print("during training, using data mean and std from MANDataset:")
+            # print(f"Data mean: {data_mean.cpu().numpy()}, Data std: {data_std.cpu().numpy()}")
+
+            normalized_filtered_radar_data = (
+                filtered_radar_data - data_mean
+            ) / data_std
+            time1 = time.time()
+            predicted_normalized_filtered_radar_data, confidence, latent = autoencoder(
+                normalized_filtered_radar_data
+            )
+            time2 = time.time()
+            predicted_filtered_radar_data = (
+                predicted_normalized_filtered_radar_data * data_std + data_mean
+            )
+
+            # print("min max of filtered_radar_data:", np.min(filtered_radar_data.cpu().numpy(), axis=(0,1)), np.max(filtered_radar_data.cpu().numpy(), axis=(0,1))) # min max of filtered_radar_data: [0. 0. 0.] [1980. 943. 250.]
+            # print("min max of normalized_filtered_radar_data", np.min(normalized_filtered_radar_data.cpu().numpy(), axis=(0,1)), np.max(normalized_filtered_radar_data.cpu().numpy(), axis=(0,1))) # min max of normalized_filtered_radar_data: [-2.5 -2.5 -2.5 ...] [2.5 2.5 2.5 ...]
+            # print("min max of predicted_normalized_filtered_radar_data", np.min(predicted_normalized_filtered_radar_data.detach().cpu().numpy(), axis=(0,1)), np.max(predicted_normalized_filtered_radar_data.detach().cpu().numpy(), axis=(0,1))) # min max of normalized_predicted_filtered_radar_data: [-2.5 -2.5 -2.5 ...] [2.5 2.5 2.5 ...]
+            # print("min max of predicted_filtered_radar_data:", np.min(predicted_filtered_radar_data.detach().cpu().numpy(), axis=(0,1)), np.max(predicted_filtered_radar_data.detach().cpu().numpy(), axis=(0,1))) # min max of pred_xyz: [0. 0. 0.] [1980. 943. 250.]
+
+            time3 = time.time()
+
+            # print(
+            #     "predicted_filtered_radar_data shape:", predicted_filtered_radar_data.shape
+            # )#[1, 800, 7])
+            # print("filtered_radar_data shape:", filtered_radar_data.shape)#[1, 800, 7])
+
+            # filter point only with confidence > 0.5
+
+
+            # RECONSTRUCTION LOSS ONLY
+            if config["ae_loss_type"] == "mse":
+                loss = nn.functional.mse_loss(
+                    predicted_filtered_radar_data, filtered_radar_data
+                )
+            elif config["ae_loss_type"] == "good":
+                # 1.	Normalize cost matrix
+                # 2.	Tune ε 
+                # 3.	Combine with Chamfer
+                # 4.	Detach transport plan
+                # 5.	KNN regularization
+                # 6.	Singkhorn Clip gradients
+                # 7.    Balanced OT
+                
+                # Use all 7D points for both Chamfer and Sinkhorn losses
+                P = predicted_normalized_filtered_radar_data  # (B, N, 7)
+                G = normalized_filtered_radar_data           # (B, M, 7)
+
+                # Combine losses
+                loss = 0
+                cd_weight, ot_weight, knn_weight = config["ae_weight_good_loss"]
+                if cd_weight > 0:
+
+                    # Chamfer Distance (uses first 3 dims for geometry)
+                    loss_cd, _ = pt3d_chamfer_distance(P[:, :, :3], G[:, :, :3], batch_reduction ="mean")
+
+                    # ^ Chamfer on xyz only
+                    loss += cd_weight * loss_cd
+                
+                if ot_weight > 0:
+
+                    # Sinkhorn OT on all 7 dims
+                    singkhorn = SamplesLoss("sinkhorn", p=2, blur=config["sk_eps"])  # ε regularization
+                    # Detach transport plan if desired
+                    loss_ot = singkhorn(P, G)
+                    # print("loss_ot:", loss_ot   )#tensor([3.3298], device='cuda:0', grad_fn=<AddBackward0>)
+                    # print("loss:", loss, ot_weight, loss_ot)
+                    if config["ot_clip"]:
+                        # Clip gradients for Sinkhorn loss
+                        torch.nn.utils.clip_grad_norm_([loss_ot], max_norm=1.0)
+                    if config["sk_detach"]:
+                        loss_ot = loss_ot.detach()
+                    loss += ot_weight * loss_ot[0]
+
+                if knn_weight > 0:
+                    # KNN regularization (example: mean distance to kNN in P)
+                    edge_index = knn_graph(P[:, :, :3].reshape(-1, 3), k=5, batch=None)
+                    knn_loss = ((P[:, :, :3].reshape(-1, 3)[edge_index[0]] - P[:, :, :3].reshape(-1, 3)[edge_index[1]])**2).sum(-1).mean()
+                
+                    loss += knn_weight * knn_loss
+
+            elif config["ae_loss_type"] == "chamfer":
+                loss = chamfer_distance(
+                    predicted_filtered_radar_data[:, :, :3],
+                    filtered_radar_data[:, :, :3],
+                    config["device"],
+                )
+            elif config["ae_loss_type"] == "chamfer-attr":
+                ae_weight_attr_loss = config["ae_weight_attr_loss"]
+                attr_loss = chamfer_with_attr_loss(
+                    predicted_filtered_radar_data,
+                    filtered_radar_data,
+                    config["device"],
+                    w_xyz=ae_weight_attr_loss[0],
+                    w_velocity=ae_weight_attr_loss[1],
+                    w_rcs=ae_weight_attr_loss[2],
+                )
+                loss = attr_loss[0]
+                loss_details = attr_loss[1]
+                # {
+                #     "xyz": xyz_cd.item(),
+                #     "velocity": vel_loss.item(),
+                #     "rcs": rcs_loss.item(),
+                # }
+                writer.add_scalar(
+                    f"ae_pretrain/loss_details/xyz_cd",
+                    loss_details["xyz"],
+                    global_step,
+                )
+                writer.add_scalar(
+                    f"ae_pretrain/loss_details/velocity_loss",
+                    loss_details["velocity"],
+                    global_step,
+                )
+                writer.add_scalar(
+                    f"ae_pretrain/loss_details/rcs_loss",
+                    loss_details["rcs"],
+                    global_step,
+                )
+            elif config["ae_loss_type"] == "hungarian":
+                ae_weight_attr_loss = config["ae_weight_attr_loss"]
+
+                # attr_loss = chamfer_with_attr_loss(
+                #     predicted_filtered_radar_data,
+                #     filtered_radar_data,
+                #     config["device"],
+                #     w_xyz=ae_weight_attr_loss[0],
+                #     w_velocity=ae_weight_attr_loss[1],
+                #     w_rcs=ae_weight_attr_loss[2],
+                # )
+                hungarian_loss = hungarian_l2_with_attr_loss(
+                    predicted_filtered_radar_data,
+                    filtered_radar_data,
+                    w_xyz=ae_weight_attr_loss[0],
+                    w_velocity=ae_weight_attr_loss[1],
+                    w_rcs=ae_weight_attr_loss[2],use_greedy=config["hungarian_use_greedy"]
+
+                )
+                # print("hungarian_loss:", hungarian_loss[1]["xyz"])
+                # print("chamfer_loss:", attr_loss[1]["xyz"])
+                loss = hungarian_loss[0]
+                loss_details = hungarian_loss[1]
+                # {
+                #     "xyz": xyz_cd.item(),
+                #     "velocity": vel_loss.item(),
+                #     "rcs": rcs_loss.item(),
+                # }
+                writer.add_scalar(
+                    f"ae_pretrain/loss_details/xyz_cd",
+                    loss_details["xyz"],
+                    global_step,
+                )
+                writer.add_scalar(
+                    f"ae_pretrain/loss_details/velocity_loss",
+                    loss_details["velocity"],
+                    global_step,
+                )
+                writer.add_scalar(
+                    f"ae_pretrain/loss_details/rcs_loss",
+                    loss_details["rcs"],
+                    global_step,
+                )
+            else:
+                raise ValueError(f"Unknown ae_loss_type: {config['ae_loss_type']}")
+            time4 = time.time()
+            # Backprop
+            if train:
+                loss.backward()
+                optimizer.step()
+                lr_scheduler.step()
+                if True:
+                    # After loss.backward()
+                    for name, param in autoencoder.named_parameters():
+                        if param.grad is not None:
+                            writer.add_scalar(f'grad_norm/{name}', param.grad.norm().item(), global_step)
+            time5 = time.time()
+            batch_loss = loss.item()
+            num_samples += batch_size
+            epoch_loss += batch_loss* batch_size #support last non-full batch
+
+            batch_xyz_cd  = pt3d_chamfer_distance(predicted_filtered_radar_data[:, :, :3], filtered_radar_data[:, :, :3])[0].item()
+            batch_7d_cd = pt3d_chamfer_distance(predicted_filtered_radar_data, filtered_radar_data)[0].item()
+
+            epoch_7d_cd += batch_7d_cd* batch_size
+            epoch_xyz_cd += batch_xyz_cd* batch_size
+            
+            pbar.set_description(f"CD" f"{batch_loss:.4f}")
+            
+            time_records_batch = {
+                "data_prep_time": time1 - time0,
+                "forward_time": time2 - time1,
+                "denormalize_time": time3 - time2,
+                "loss_time": time4 - time3,
+                "backward_time": time5 - time4,
+            }
+            time_records = {k: time_records.get(k, 0) + time_records_batch[k]* batch_size for k in time_records_batch}
+
+            global_step += 1
+    time_records = {k: v / num_samples for k, v in time_records.items()}
+    avg_loss = epoch_loss / num_samples
+    avg_xyz_cd = epoch_xyz_cd / num_samples
+    avg_7d_cd = epoch_7d_cd / num_samples
+
+    # print(
+    #     "epoch_loss",
+    #     epoch_loss,
+    #     "len(dataloader)",
+    #     len(dataloader),
+    #     "avg_loss",
+    #     avg_loss,
+    # )
+    return avg_loss, global_step, time_records, avg_xyz_cd, avg_7d_cd
+
+
+def load_ae_checkpoint(model, optimizer, lr_scheduler,config):
+    if config["point_ae_checkpoint"] == "":
+        print("No checkpoint path provided, training from scratch.")
+        return 0
+    checkpoint_path = config["point_ae_checkpoint"]
+    checkpoint = torch.load(checkpoint_path, map_location=config["device"])
+
+    # check if config matches
+    important_fields = [
+        "scene_ids",
+        "data_file",
+        "num_points",
+        "num_input_frames",
+        "point_ae_model",
+        "seed",
+        "latent_dim",
+        "latent_seq_length",
+        "ae_decay",
+        "ae_lr",
+        "batch_size",
+        "query_num_heads",
+        "query_dropout",
+        "decoder_num_layers",
+        "decoder_num_heads",
+        "decoder_dropout",
+        "pointnext_config",
+        "hungarian_use_greedy",
+        "ae_loss_type",
+        "ae_weight_attr_loss",
+        "ddpm_clip_sample",
+        "ae_lr_decay_step",
+        "ae_lr_decay_gamma",
+        "ae_weight_good_loss","sk_eps","sk_detach","ot_clip","ae_lr_clr_factor","ae_lr_clr_mode"
+    ]
+    matched = True
+    for field in important_fields:
+        # if its a list
+        if field not in checkpoint["config"]:
+            print(f"Field {field} not in checkpoint config.")
+            matched = False
+            continue
+        if isinstance(checkpoint["config"][field], list):
+
+            if len(checkpoint["config"][field]) != len(config[field]):
+                print(field, "length >", checkpoint["config"][field], config[field])
+                matched = False
+            else:
+                for a, b in zip(checkpoint["config"][field], config[field]):
+                    if a != b:
+                        print(field, ">", a, b)
+                        matched = False
+                        break
+
+        # if its not a list
+        else:
+            if checkpoint["config"][field] != config[field]:
+                matched = False
+                print(field, ">", checkpoint["config"][field], config[field])
+
+    if not matched:
+        print(
+            "Warning: Checkpoint config does not match current config. NOT loaded check point."
+        )
+        exit()
+
+    model.load_state_dict(checkpoint["model_state_dict"])
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    lr_scheduler.load_state_dict(checkpoint["lr_scheduler_state_dict"])
+    epoch = checkpoint["epoch"]
+    print(f"Loaded checkpoint from {checkpoint_path}, epoch {epoch}")
+    return epoch
+
+
+import hashlib
+
+
+def _short_tag(s: str, max_len: int = 80) -> str:
+    """Make a filesystem-safe short tag. Keeps prefix + adds stable hash."""
+    s = str(s)
+    if len(s) <= max_len:
+        return s
+    h = hashlib.sha1(s.encode("utf-8")).hexdigest()[:10]
+    keep = max_len - (1 + len(h))
+    return f"{s[:keep]}_{h}"
+
+
+def _short_last_segments(s: str, num_underscore_segments: int = 17) -> str:
+    """e.g. full fname: pretrain_ae_target_e150000_sc0_mini_np800_fr2_modelpointnext-attention_sd42_latdim768_latseq64_decay1E-04_lr3E-05_bs1_qnh8_qdrop0E+00_dnl24_dnh4_ddrop0E+00_scannet_untitled_ltypechamfer-attr_wattr1E+00-1E-01-1E-02_bqn24_bqr64.0
+
+    this function hash the last num_underscore_segments segments, while keep the rest the same
+    """
+    segments = s.split("_")
+    if len(segments) <= num_underscore_segments:
+        return s
+    h = (
+        hashlib.sha1(("_".join(segments[-num_underscore_segments:]))
+        .encode("utf-8"))
+        .hexdigest()[:10]
+    )
+
+    return f"{'_'.join(segments[:-num_underscore_segments])}_{h}"
+
+
+def save_ae_checkpoint(model, optimizer, lr_scheduler, epoch, metrics, path, config):
+    """Save autoencoder checkpoint"""
+    checkpoint = {
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "lr_scheduler_state_dict": lr_scheduler.state_dict(),
+        "epoch": epoch,
+        "metrics": metrics,
+        "config": config,
+    }
+    torch.save(checkpoint, path)
+
+
+def plot_ae(
+    dsname: str,
+    ds: torch.utils.data.Dataset,
+    autoencoder: PretrainedPointNeXtEncoderPointAE,
+    config: dict,
+    plot_dir: str,
+    run_id: str,
+    epoch: int,
+):
+
+    assert plot_dir is not None, "plot_dir must be provided for plotting"
+    autoencoder.eval()
+    cds = []
+    paths = []
+    man_dataset = ds
+    while not isinstance(man_dataset, MANDataset):
+        man_dataset = man_dataset.dataset
+
+    data_mean = man_dataset.data_mean.to(config["device"])
+    data_std = man_dataset.data_std.to(config["device"])
+    for i in range(len(ds)):
+        sample_data = ds[i]
+        filtered_radar_data = (
+            sample_data["filtered_radar_data"].to(config["device"]).unsqueeze(0)
+        )
+        normalized_filtered_radar_data = (
+                filtered_radar_data - data_mean
+            ) / data_std
+        
+        with torch.no_grad():
+            normalized_predicted_filtered_radar_data, confidence, latent = autoencoder(
+                normalized_filtered_radar_data
+            )
+
+            predicted_filtered_radar_data = (
+                normalized_predicted_filtered_radar_data * data_std + data_mean
+            )
+
+            # cd_tensor = chamfer_distance(
+            #     predicted_filtered_radar_data[:, :, :3],
+            #     filtered_radar_data[:, :, :3],
+            #     config["device"],
+            # )
+        gt_xyz = filtered_radar_data[0, :, :3].cpu().numpy()
+        pred_xyz = predicted_filtered_radar_data[0, :, :3].cpu().numpy()
+
+        # print(f"{cd_tensor.item():.2f}", end=", ")
+
+        cd, save_path = ds.dataset.visualize_uvz_comparison(
+            title=f"{dsname}_s{i}_"
+            + sample_data["frame_token"][-5:]
+            + f"_ae_e{epoch+1}_{run_id}",
+            frame_token=f"{dsname}_s{i}_"
+            + sample_data["frame_token"][-5:]
+            + f"_ae_e{epoch+1}_{run_id}",
+            original_uvz=gt_xyz,
+            reconstructed_uvz=pred_xyz,
+            save_dir=plot_dir,
+            plotlims= {"u": (-50, 200), "v": (-100, 150), "z": (-25, 25)},
+            marker_config={
+                "original": {
+                    "color": "blue",
+                    "marker": "o",
+                    "size": 10,
+                    "alpha": 0.6,
+                },
+                "reconstructed": {
+                    "color": "red",
+                    "marker": "x",
+                    "size": 10,
+                    "alpha": 0.6,
+                },
+            },
+            fig_size=(16, 9),  # width, height in inches
+            device="cpu",
+        )
+
+        cd_wthattr = chamfer_with_attr_loss(
+            predicted_filtered_radar_data,
+            filtered_radar_data,
+            config["device"],
+            w_xyz=1.0,
+            w_velocity=0.10,
+            w_rcs=0.01,
+        )
+        # assert (
+        #     np.abs(cd - cd_wthattr[1]["xyz"]) < 1e-3
+        # ), f"Chamfer distance mismatch: {cd} vs {cd_wthattr[1]['xyz']}"
+        cds.append(cd_wthattr)
+        paths.append(save_path)
+    return cds,paths
+
+
 def pretrain_autoencoder(
-    dataset, config, autoencoder, checkpoint_path=None, run_id=None, tb_dir=None
+    dataset,
+    val_dataset,
+    config,
+    checkpoint_dir=None,
+    run_id=None,
+    tb_dir=None,
+    plot_dir=None,
 ):
     """
-    Pre-train PointNeXt encoder projection + decoder separately.
-    This learns a good UVZ ↔ Latent mapping.
+    Pre-train PointNeXt from scratch as an autoencoder on UVZ point clouds.
     """
     worker_init_fn = set_seed(config["seed"])
-    writer = SummaryWriter(f"{tb_dir}/{run_id}/ae_pretraining")
+    writer = SummaryWriter(f"{tb_dir}/{_short_last_segments(run_id, num_underscore_segments=29)}")
+    writer.add_text("run_id", run_id)
 
     # Log hyperparameters
-    writer.add_text("config/ae_lr", str(config["ae_lr"]))
-    writer.add_text("config/ae_epochs", str(config["ae_epochs"]))
-    writer.add_text("config/batch_size", str(config["batch_size"]))
-    writer.add_text("config/latent_dim", str(config["latent_dim"]))
-    writer.add_text("config/latent_seq_length", str(config["latent_seq_length"]))
-    writer.add_text("config/num_points", str(config["num_points"]))
-    writer.add_text("config/point_ae_model", str(config["point_ae_model"]))
-    writer.add_text("config/dataset_size", str(len(dataset)))
+    config["train_size"] = len(dataset)
+    config["node_name"] = os.uname().nodename
+    config["gpu_name"] = torch.cuda.get_device_name(0)
+    config["run_id"] = run_id
     torch.cuda.reset_peak_memory_stats()
+
+    autoencoder = PretrainedPointNeXtEncoderPointAE(
+        d_model=config["latent_dim"],
+        output_points=config["num_points"],
+        seq_length=config["latent_seq_length"],
+        query_latent_pool_nhead=config["query_num_heads"],
+        query_latent_pool_dropout=config["query_dropout"],
+        device=config["device"],
+        decoder_model=config["point_ae_model"][10:],
+        num_decoder_layers=config["decoder_num_layers"],
+        num_decoder_head=config["decoder_num_heads"],
+        decoder_dropout=config["decoder_dropout"],
+        pointnext_config=config["pointnext_config"],
+        ball_query_nsample=config["ae_ball_query_nsample"],
+        ball_query_radius=config["ae_ball_query_radius"],
+        # 48 nsample, 8 m radius
+        # pointnext_config="scannet/pointnext-s.yaml",
+        output_dim=7,
+    ).to(config["device"])
 
     optimizer = torch.optim.AdamW(
         autoencoder.parameters(),  # Much simpler!
@@ -1155,109 +2007,150 @@ def pretrain_autoencoder(
         weight_decay=config["ae_decay"],
     )
 
-    dataloader = DataLoader(
+    #need to add LR scheduler
+    if config["ae_lr_scheduler_type"] == "step":
+        lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=config["ae_lr_decay_step"], gamma=config["ae_lr_decay_gamma"])
+    elif config["ae_lr_scheduler_type"] == "cyclic":
+        lr_scheduler = torch.optim.lr_scheduler.CyclicLR(optimizer, base_lr=config["ae_lr"]/config['ae_lr_clr_factor'], max_lr=config["ae_lr"]*config['ae_lr_clr_factor'], step_size_up=config["ae_lr_decay_step"], mode=config["ae_lr_clr_mode"], cycle_momentum=False)
+    else:
+        # Default to no scheduler (constant LR)
+        lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda epoch: 1.0)
+
+    dataloader = makeDataloaders(
         dataset,
-        batch_size=config["batch_size"],
-        shuffle=True,
-        # collate_fn=collate_fn,
-        worker_init_fn=worker_init_fn,
-        num_workers=config["num_workers"],
+        config,
+        is_train=True,
     )
-
-    num_epochs = config["ae_epochs"]  # Separate epoch count
-
+    eval_dataloader = makeDataloaders(
+        val_dataset,
+        config,
+        is_train=False,
+    )
+    start_epoch = load_ae_checkpoint(autoencoder, optimizer,lr_scheduler, config)
+    num_epochs = config["ae_epochs"]
+    print(f"Starting autoencoder pretraining from epoch {start_epoch + 1} to {num_epochs}...")
     global_step = 0
-    epoch_trange = trange(num_epochs, desc="Autoencoder Pretraining")
+    # set start epoch, as start_epoch
+    epoch_trange = trange(
+        start_epoch, num_epochs, desc="AE Pretrain", unit="epoch", initial=start_epoch
+    )
+    saved_epoch = 0
+    eval_loss = 0
+    prev_paths = None
     for epoch in epoch_trange:
-        epoch_loss = 0
-        batch_losses = []
 
-        for batch in tqdm(dataloader, leave=False, desc="Batches"):
-            uvz = batch["uvz"].to(config["device"])
+        avg_train_loss, global_step,time_records,avg_xyz_cd,avg_7d_cd = train_eval_ae_epoch(
+            autoencoder, dataloader, optimizer, lr_scheduler, config, writer, global_step, train=True
+        )
 
-            predicted_uvz, confidence, latent = autoencoder(uvz)
-
-            # RECONSTRUCTION LOSS ONLY
-            loss = chamfer_distance(predicted_uvz, uvz)
-
-            # Backprop
-            optimizer.zero_grad()
-            loss.backward()
-            # Track gradient norm
-            grad_norm = torch.nn.utils.clip_grad_norm_(autoencoder.parameters(), 1.0)
-
-            optimizer.step()
-
-            batch_loss = loss.item()
-            epoch_loss += batch_loss
-            batch_losses.append(batch_loss)
-
-            # ✅ LOG BATCH METRICS TO TENSORBOARD
-            writer.add_scalar("ae/batch_loss", batch_loss, global_step)
-            writer.add_scalar("ae/grad_norm", grad_norm.item(), global_step)
-            writer.add_scalar(
-                "ae/learning_rate", optimizer.param_groups[0]["lr"], global_step
-            )
-
-            # Log latent statistics
-            if global_step % 10 == 0:
-                writer.add_scalar("ae/latent_mean", latent.mean().item(), global_step)
-                writer.add_scalar("ae/latent_std", latent.std().item(), global_step)
-                writer.add_scalar(
-                    "ae/confidence_mean", confidence.mean().item(), global_step
-                )
-
-            global_step += 1
-
-        # Epoch metrics
-        avg_loss = epoch_loss / len(dataloader)
-        std_loss = np.std(batch_losses)
-
-        epoch_trange.set_postfix({"Chamfer Loss": f"{avg_loss:.6f}"})
+        epoch_trange.set_postfix(
+            {"tr": f"{avg_train_loss:.4f}", "val": f"{eval_loss:.4f}"}
+        )
 
         # ✅ LOG EPOCH METRICS
-        writer.add_scalar("ae/epoch_loss_mean", avg_loss, epoch)
-        writer.add_scalar("ae/epoch_loss_std", std_loss, epoch)
-        epoch_peak = torch.cuda.max_memory_allocated() / 1024**3
-        writer.add_scalar("gpu/epoch_peak_gb", epoch_peak, epoch)
+        writer.add_scalar("ae/loss/train", avg_train_loss, epoch + 1)
+        writer.add_scalar("ae/lr", lr_scheduler.get_last_lr()[0], epoch + 1)
+        writer.add_scalar("ae/avg_xyz_cd/train", avg_xyz_cd, epoch + 1)
+        writer.add_scalar("ae/avg_7d_cd/train", avg_7d_cd, epoch + 1)
 
-        # ✅ VISUALIZE RECONSTRUCTION EVERY 5 EPOCHS
-        if (epoch + 1) % 5 == 0:
-            with torch.no_grad():
-                # Take first sample from batch
-                sample_uvz = uvz[:1]
-                sample_latent = latent[:1]
-                sample_pred = predicted_uvz[:1]  # Autoencoder prediction
+            
+        if True:
+            sum_time = sum(time_records.values())
+            for k in time_records:
+                writer.add_scalar(f"train/time/{k}", time_records[k]/sum_time, epoch + 1)
+        if (epoch + 1) % config["eval_every"] == 0:
+            eval_loss, _,time_recordsm,avg_xyz_cd,avg_7d_cd = train_eval_ae_epoch(
+                autoencoder,
+                eval_dataloader,
+                optimizer,
+                lr_scheduler,
+                config,
+                writer,
+                global_step,
+                train=False,
+            )
+            writer.add_scalar("ae/loss/val", eval_loss, epoch + 1)
+            writer.add_scalar("ae/avg_xyz_cd/val", avg_xyz_cd, epoch + 1)
+            writer.add_scalar("ae/avg_7d_cd/val", avg_7d_cd, epoch + 1)
 
-                # Create visualization
-                fig = create_uvz_comparison_plot(
-                    sample_uvz[0].cpu().numpy(),
-                    sample_pred[0].cpu().numpy(),
-                    title=f"Epoch {epoch+1}",
+
+            # time_records_batch = {
+            #     "data_prep_time": time1 - time0,
+            #     "forward_time": time2 - time1,
+            #     "denormalize_time": time3 - time2,
+            #     "loss_time": time4 - time3,
+            #     "backward_time": time5 - time4,
+            # }
+            if True:
+                sum_time = sum(time_records.values())
+                for k in time_records:
+                    writer.add_scalar(f"val/time/{k}", time_records[k]/sum_time, epoch + 1)
+
+        if (epoch + 1) % config["gpu_log_every"] == 0:
+            stats = query_gpu_stats(gpu_index=0)
+            if stats is not None:
+                writer.add_scalar("gpu/utilization_pct", stats["util_gpu"], epoch + 1)
+                writer.add_scalar("gpu/power_w", stats["power_w"], epoch + 1)
+                writer.add_scalar(
+                    "gpu/memory_used_mib", stats["mem_used_mib"], epoch + 1
+                )
+                writer.add_scalar(
+                    "gpu/memory_total_mib", stats["mem_total_mib"], epoch + 1
                 )
 
-                # Log figure to TensorBoard
-                writer.add_figure("ae/reconstruction", fig, epoch)
-                plt.close(fig)
+        if (
+            config["plot_every"] != 0 and (epoch + 1) % config["plot_every"] == 0
+        ) or epoch == num_epochs - 1:
+            if prev_paths is not None:
+                for path in prev_paths:
+                    if os.path.exists(path):
+                        os.remove(path)
+            cds,prev_tr_paths = plot_ae(
+                "train",
+                dataset,
+                autoencoder,
+                config,
+                plot_dir,
+                run_id,
+                epoch,
+            )
+            cds,prev_val_paths = plot_ae(
+                "val",
+                val_dataset,
+                autoencoder,
+                config,
+                plot_dir,
+                run_id,
+                epoch,
+            )
+            # prev_paths = prev_tr_paths + prev_val_paths
 
-                # Log Chamfer distance for this sample
-                sample_chamfer = chamfer_distance(sample_pred, sample_uvz).item()
-                writer.add_scalar("ae/sample_chamfer", sample_chamfer, epoch)
+        if (epoch + 1) % config["save_every"] == 0 or epoch == num_epochs - 1:
+            _short_last_segments(run_id, num_underscore_segments=29)
+            checkpoint_path = os.path.join(checkpoint_dir, f"{_short_last_segments(run_id, num_underscore_segments=29)}_at{epoch+1}.pth")
+            prev_path = os.path.join(checkpoint_dir, f"{_short_last_segments(run_id, num_underscore_segments=29)}_at{saved_epoch+1}.pth")
+            if os.path.exists(prev_path):
+                os.remove(prev_path)
+            saved_epoch = epoch
 
-        # ✅ LOG HISTOGRAMS EVERY 10 EPOCHS
-        # if (epoch + 1) % 10 == 0:
-        #     for name, param in autoencoder.encoder_proj.named_parameters():
-        #         writer.add_histogram(f"ae/encoder_proj/{name}", param, epoch)
-        #         if param.grad is not None:
-        #             writer.add_histogram(
-        #                 f"ae/encoder_proj/{name}.grad", param.grad, epoch
-        #             )
+            save_ae_checkpoint(
+                autoencoder,
+                optimizer,
+                lr_scheduler,
+                epoch + 1,
+                {
+                    "train_loss": avg_train_loss,
+                },
+                checkpoint_path,
+                config,
+            )
 
-        #     for name, param in autoencoder.pointcloud_decoder.named_parameters():
-        #         writer.add_histogram(f"ae/decoder/{name}", param, epoch)
-        #         if param.grad is not None:
-        #             writer.add_histogram(f"ae/decoder/{name}.grad", param.grad, epoch)
-
+    tblogHparam(
+        config,
+        writer,
+        {"ae_train_loss": avg_train_loss, "ae_val_loss": eval_loss},
+    )
+    writer.flush()
     writer.close()
     print("\n✅ Autoencoder pretraining complete!")
     return autoencoder
@@ -1638,6 +2531,14 @@ def parse_args():
     parser.add_argument(
         "--latent_dim", type=int, default=1024, help="Latent dimension for DiT."
     )
+    # ae altent normalizning std
+    parser.add_argument(
+        "--ae_latent_normalizing_std",
+        type=float,
+        default=1.5e-4,
+        help="Standard deviation for latent normalization in autoencoder.",
+    )
+
     parser.add_argument(
         "--batch_size", type=int, default=4, help="Batch size for training."
     )
@@ -1659,7 +2560,18 @@ def parse_args():
         default=50,
         help="Number of epochs for autoencoder pretraining.",
     )
-
+    parser.add_argument(
+        "--ae_ball_query_nsample",
+        type=int,
+        default=48,
+        help="Number of samples for ball query in autoencoder.",
+    )
+    parser.add_argument(
+        "--ae_ball_query_radius",
+        type=float,
+        default=8.0,
+        help="Radius for ball query in autoencoder.",
+    )
     parser.add_argument(
         "--dit_lr", type=float, default=1e-4, help="Learning rate for DiT training."
     )
@@ -1681,7 +2593,17 @@ def parse_args():
         help="Number of warmup steps for learning rate scheduler.",
     )
     parser.add_argument(
+        "--plot_every", type=int, default=100, help="Plot samples every N epochs."
+    )
+    parser.add_argument(
         "--save_every", type=int, default=1000, help="Save checkpoint every N epochs."
+    )
+    # gpu_log_every
+    parser.add_argument(
+        "--gpu_log_every",
+        type=int,
+        default=100,
+        help="Log GPU memory usage every N epochs.",
     )
     parser.add_argument(
         "--num_workers", type=int, default=0, help="Number of workers for data loading."
@@ -1718,17 +2640,20 @@ def parse_args():
         "--seed", type=int, default=42, help="Random seed for reproducibility."
     )
     parser.add_argument(
-        "--num_encoder_layers",
-        type=int,
-        default=4,
-        help="Number of encoder layers for transformer point AE.",
+        "--seed_model", type=int, default=42, help="Random seed for model initialization."
     )
-    parser.add_argument(
-        "--num_decoder_layers",
-        type=int,
-        default=4,
-        help="Number of decoder layers for transformer point AE.",
-    )
+    # parser.add_argument(
+    #     "--num_encoder_layers",
+    #     type=int,
+    #     default=4,
+    #     help="Number of encoder layers for transformer point AE.",
+    # )
+    # parser.add_argument(
+    #     "--num_decoder_layers",
+    #     type=int,
+    #     default=4,
+    #     help="Number of decoder layers for transformer point AE.",
+    # )
     # n dit block
     parser.add_argument(
         "--num_transformer_blocks",
@@ -1747,6 +2672,15 @@ def parse_args():
     parser.add_argument(
         "--max_voxel_grid_depth", type=float, default=250.0, help="Maximum depth value."
     )
+    # mn max u and v pixel roi for training
+    parser.add_argument(
+        "--training_roi",
+        type=int,
+        nargs=4,
+        default=[0, 943, 0, 1860],
+        help="Region of interest for training (min_v/height, max_v, min_u/width, max_u).",
+    )
+
     parser.add_argument(
         "--depth_voxel_grid_bins", type=int, default=8, help="Number of depth bins."
     )
@@ -1794,6 +2728,152 @@ def parse_args():
         default=5.0,
         help="Scale for auxiliary occupancy loss.",
     )
+    # query_num_heads
+    parser.add_argument(
+        "--query_num_heads",
+        type=int,
+        default=8,
+        help="Number of attention heads for query latent pooling in point AE.",
+    )
+    # query_dropout
+    parser.add_argument(
+        "--query_dropout",
+        type=float,
+        default=0.0,
+        help="Dropout rate for query latent pooling in point AE.",
+    )
+    # decoder_num_layers
+    parser.add_argument(
+        "--decoder_num_layers",
+        type=int,
+        default=6,
+        help="Number of decoder layers in point AE.",
+    )
+    # decoder_num_heads
+    parser.add_argument(
+        "--decoder_num_heads",
+        type=int,
+        default=8,
+        help="Number of attention heads in decoder of point AE.",
+    )
+    # decoder_dropout
+    parser.add_argument(
+        "--decoder_dropout",
+        type=float,
+        default=0.0,
+        help="Dropout rate in decoder of point AE.",
+    )
+    # pointnext_config
+    parser.add_argument(
+        "--pointnext_config",
+        type=str,
+        default="scannet/untitled.yaml",
+        help="Path to PointNeXt configuration file.",
+    )
+    # loss_type
+    parser.add_argument(
+        "--ae_loss_type",
+        type=str,
+        default="chamfer",
+        help="Type of loss function for autoencoder ('chamfer' or 'chamfer-attr').",
+    )
+    # w attr loss, tripple, weight for position, velocity,and rcs
+    parser.add_argument(
+        "--ae_weight_attr_loss",
+        type=float,
+        nargs=3,
+        default=[1.0, 0.1, 0.01],
+        help="Weights for attribute loss components (position, velocity, RCS).",
+    )
+    parser.add_argument(
+        "--ddpm_clip_sample",
+        action="store_true",
+        help="Whether to clip DDPM samples to valid range.",
+    )
+    # exp_name
+    parser.add_argument(
+        "--exp_name",
+        type=str,
+        default="",
+        help="tag, used for mainly filter tensorboard runs",
+    )
+    parser.add_argument(    
+        "--hungarian_use_greedy",
+        action="store_true",
+        help="Whether to use greedy matching instead of Hungarian algorithm for point cloud matching in attribute loss.",
+    )
+    parser.add_argument(
+        "--sk_eps",
+        type=float,
+        default=0.05,
+        help="Epsilon value for Sinkhorn distance in attribute loss.",
+    )   
+    parser.add_argument(
+        "--sk_detach",
+        action="store_true",
+        help="Whether to detach the cost matrix in Sinkhorn distance computation for attribute loss.",
+    )
+    parser.add_argument(
+        "--ot_clip",
+        action="store_true",
+        help="Whether to clip the optimal transport cost in attribute loss to prevent exploding gradients.",
+    )
+
+    parser.add_argument("--ae_weight_good_loss", type=float,
+        nargs=3,
+        default=[1.0, 0.1, 0.01],
+        help="Weight for good point loss in autoencoder: CD, OT, and KNN losses.")
+
+
+    parser.add_argument(
+        "--ae_lr_decay_step",
+        type=int,
+        default=100000,
+        help="Step size for AE learning rate decay or if Cyclic LR, number of steps to reach max learning rate (i.e., half cycle length).",
+    )
+    parser.add_argument(
+        "--ae_lr_decay_gamma",
+        type=float,
+        default=0.5,
+        help="Gamma for AE learning rate decay.",
+    )
+    parser.add_argument(
+        "--ae_lr_clr_factor",
+        type=float,
+        default=10.0,
+        help="Factor to determine base learning rate for triangular cyclic learning rate scheduler (base_lr = ae_lr / ae_lr_clr_factor), max learning rate is ae_lr * ae_lr_factor.",
+    )
+    parser.add_argument(        "--ae_lr_scheduler_type",  
+        type=str, 
+        default="cyclic",  #step. clr,none
+        help="Type of learning rate scheduler for autoencoder training (e.g., 'step', 'clr', 'none'). If 'step', uses StepLR with ae_lr_decay_step and ae_lr_decay_gamma. If 'clr', uses CyclicLR with base_lr = ae_lr / ae_lr_clr_factor and max_lr = ae_lr * ae_lr_clr_factor. If 'none', no learning rate scheduler is used."
+    )
+    # ae_lr_clr_mode
+    parser.add_argument(
+        "--ae_lr_clr_mode",
+        type=str,
+        default="triangular",
+        help="Mode for CyclicLR if ae_lr_scheduler_type is 'clr' (e.g., 'triangular', 'triangular2', 'exp_range').",
+    )   
+    parser.add_argument(
+        "--lr_scheduler",
+        type=str,
+        default="cosine",
+        help="Type of learning rate scheduler ('cosine' or 'step' or 'constant') to use for DiT training.",
+    )
+    parser.add_argument(
+        "--lr_step_size",
+        type=int,
+        default=30,
+        help="Step size for StepLR if lr_scheduler is 'step'.",
+    )
+    parser.add_argument(
+        "--lr_gamma",
+        type=float,
+        default=0.5,
+        help="Gamma for StepLR if lr_scheduler is 'step'.",
+    )
+
     return parser.parse_args()
 
 
@@ -1823,7 +2903,156 @@ def set_seed(seed: int):
     return worker_init_fn
 
 
+def get_pointnextdit_runid(config):
+
+    scene_str = "-".join(map(str, sorted(config["scene_ids"])))
+
+    return f"{config['exp_name']}_e{config['dit_epochs']}_sc{scene_str}_{config['data_file'].replace('man-','')}_np{config['num_points']}_fr{config['num_input_frames']}_sd{config['seed']}_latdim{config['latent_dim']}_latseq{config['latent_seq_length']}_decay{config['dit_decay']:.2E}_lr{config['dit_lr']:.2E}_bs{config['batch_size']}_hd{config['num_attention_heads']}_blk{config['num_transformer_blocks']}_latstd{config['ae_latent_normalizing_std']:.2E}_clip{int(config['ddpm_clip_sample'])}_pl{config['use_global_avg_pool']}_sig{config['learn_sigma']}_zc{config['zero_conditioning']}"
+
+
+def get_pointnext_runid(config):
+
+    scene_str = "-".join(map(str, sorted(config["scene_ids"])))
+    good_loss_str = '-'.join([f'{w:.2E}' for w in config['ae_weight_good_loss']])
+
+    return f"{config['exp_name']}_e{config['ae_epochs']}_sc{scene_str}_{config['data_file'].replace('man-','')}_np{config['num_points']}_fr{config['num_input_frames']}_model{config['point_ae_model'].replace('modelpointnext-','')}_sd{config['seed']}_latdim{config['latent_dim']}_latseq{config['latent_seq_length']}_decay{config['ae_decay']:.2E}_lr{config['ae_lr']:.2E}_bs{config['batch_size']}_qnh{config['query_num_heads']}_qdrop{config['query_dropout']:.2E}_dnl{config['decoder_num_layers']}_dnh{config['decoder_num_heads']}_ddrop{config['decoder_dropout']:.2E}_{config['pointnext_config'].replace('/', '_').replace('.yaml','')}_ltype{config['ae_loss_type']}_wattr{'-'.join([f'{w:.2E}' for w in config['ae_weight_attr_loss']])}_bqn{config['ae_ball_query_nsample']}_bqr{config['ae_ball_query_radius']}_greedy{int(config['hungarian_use_greedy'])}_clip{int(config['ddpm_clip_sample'])}_lrdec{config['ae_lr_decay_step']}_{config['ae_lr_decay_gamma']:.2E}_skeps{config['sk_eps']}_skdetach{int(config['sk_detach'])}_otclip{int(config['ot_clip'])}_goodloss{good_loss_str}_aeclr{config['ae_lr_clr_factor']:.2E}_aels{config['ae_lr_scheduler_type']}_clrmde{config['ae_lr_clr_mode']}"
+
+
 def get_runid(config):
 
     scene_str = "-".join(map(str, sorted(config["scene_ids"])))
-    return f"{config['depth_voxel_grid_bins']}bins_{config['scaled_image_size'][0]}x{config['scaled_image_size'][1]}_{config['dit_epochs']}epochs_batch{config['batch_size']}_scenes{scene_str}_numframes{config['num_input_frames']}_seed{config['seed']}_pool{config['use_global_avg_pool']}_sigma{config['learn_sigma']}_zeroCond{config['zero_conditioning']}_patch{config['patch_size']}_transBlocks{config['num_transformer_blocks']}_attnHeads{config['num_attention_heads']}_latentdim{config['latent_dim']}_grange{config['grid_binary_range']}_auxoccw{config['aux_occ_weight']:.0E}_auxoccs{config['aux_occ_scale']:.1f}"
+    roi_text = f"{config['training_roi'][0]}-{config['training_roi'][1]}_{config['training_roi'][2]}-{config['training_roi'][3]}"
+    return f"{config['depth_voxel_grid_bins']}_{config['scaled_image_size'][0]}x{config['scaled_image_size'][1]}_e{config['dit_epochs']}_b{config['batch_size']}_sc{scene_str}_fr{config['num_input_frames']}_sd{config['seed']}_pl{config['use_global_avg_pool']}_sig{config['learn_sigma']}_zc{config['zero_conditioning']}_pat{config['patch_size']}_blk{config['num_transformer_blocks']}_hd{config['num_attention_heads']}_lat{config['latent_dim']}_{config['grid_binary_range']}_w{config['aux_occ_weight']:.2E}_scal{config['aux_occ_scale']:.1f}_roi{roi_text}_mxd{config['max_voxel_grid_depth']:.0f}"
+    # return f"{config['depth_voxel_grid_bins']}bins_{config['scaled_image_size'][0]}x{config['scaled_image_size'][1]}_{config['dit_epochs']}epochs_batch{config['batch_size']}_scenes{scene_str}_numframes{config['num_input_frames']}_seed{config['seed']}_pool{config['use_global_avg_pool']}_sigma{config['learn_sigma']}_zeroCond{config['zero_conditioning']}_patch{config['patch_size']}_transBlocks{config['num_transformer_blocks']}_attnHeads{config['num_attention_heads']}_latentdim{config['latent_dim']}_grange{config['grid_binary_range']}_auxoccw{config['aux_occ_weight']:.2E}_auxoccs{config['aux_occ_scale']:.1f}_roi{roi_text}"
+
+
+def query_gpu_stats(gpu_index: int = 0) -> Optional[Dict[str, float]]:
+    """
+    Returns dict with utilization.gpu (%), power.draw (W), memory.used (MiB), memory.total (MiB)
+    using nvidia-smi. Returns None if nvidia-smi is unavailable.
+    """
+    try:
+        cmd = [
+            "nvidia-smi",
+            f"--id={gpu_index}",
+            "--query-gpu=utilization.gpu,power.draw,memory.used,memory.total",
+            "--format=csv,noheader,nounits",
+        ]
+        out = subprocess.check_output(cmd, text=True).strip()
+        if not out:
+            return None
+        util_str, power_str, mem_used_str, mem_total_str = [
+            x.strip() for x in out.split(",")
+        ]
+        return {
+            "util_gpu": float(util_str),
+            "power_w": float(power_str),
+            "mem_used_mib": float(mem_used_str),
+            "mem_total_mib": float(mem_total_str),
+        }
+    except Exception as e:
+        print("Could not query GPU stats via nvidia-smi.", e)  # noqa: T201
+        return None
+
+
+def makeOptimizer(model, config):
+    return torch.optim.AdamW(
+        model.parameters(),
+        lr=config["dit_lr"],
+        weight_decay=config["dit_decay"],
+    )
+
+
+def tblogHparam(
+    config, writer: SummaryWriter, metrics: dict, run_name="", global_step=None
+):
+    # keep only simple types (tensorboard hparams plugin likes scalars/strings/bools)
+    hparams = {}
+    for k, v in config.items():
+        if isinstance(v, (list, tuple)):
+            for i in range(len(v)):
+                hparams[f"{k}_{i}"] = v[i]
+        elif isinstance(v, (int, float, str, bool)):
+            hparams[k] = v
+        else:
+            print(f"Warning: skipping hparam {k} with type {type(v)}")
+
+
+    # metrics must be scalar numbers, prepend "hparam/" to avoid conflicts with other metrics
+    hmetrics = {f"hparam/{k}": v for k, v in metrics.items() if isinstance(v, (int, float)) and not isinstance(v, bool)}
+
+    # IMPORTANT: do this exactly once
+    writer.add_hparams(hparams, hmetrics)
+    print(f"Logged hyperparameters and metrics to TensorBoard:")
+    print("Hyperparameters:")
+    for k, v in hparams.items():
+        print(f"  {k}: {v}")
+
+    print("Metrics:")
+    for k, v in hmetrics.items():
+        print(f"  {k}: {v}")
+    # make sure it hits disk
+    writer.flush()
+
+
+def makeDataset(
+    config,
+    plot_dir: str = None,
+    get_occ_grid=True,
+    get_camera=True,
+    get_wan_vae=True,
+):
+    """
+    return train and val dataloaders
+    """
+    dataset = MANDataset(
+        scene_ids=config["scene_ids"],
+        data_file=config["data_file"],
+        device=config["device"],
+        radar_channel=config["radar_channel"],
+        camera_channel=config["camera_channel"],
+        double_flip_images=False,
+        coord_only=False,  # not providing vel and rcs
+        visualize_uvz=False,  # plotting, slow
+        scaled_image_size=config["scaled_image_size"],  # 512 1024 dead
+        n_p=config["num_points"],
+        max_depth=config["max_voxel_grid_depth"],
+        roi=config["training_roi"],
+        depth_bins=config["depth_voxel_grid_bins"],
+        get_clip=False,
+        get_depth=False,
+        get_occ_grid=get_occ_grid,
+        get_camera=get_camera,
+        wan_vae=get_wan_vae,  # for vae-based training
+        wan_vae_checkpoint="/checkpoints/huggingface_hub/models--Wan-AI--Wan2.2-T2V-A14B/Wan2.1_VAE.pth",
+        viz_dir=plot_dir,
+        grid_binary_range=config["grid_binary_range"],  # "0-1" or "neg1-1"
+        keep_frames=config["num_input_frames"],
+    )
+    assert (
+        len(dataset) == config["num_input_frames"]
+    ), f"Dataset length {len(dataset)} does not match num_input_frames {config['num_input_frames']}"
+    return dataset
+
+
+def splitDataset(dataset: Dataset, split: float = 0.8):
+
+    val_split = int(split * len(dataset))
+    train_dataset = Subset(dataset, range(0, val_split))
+    val_dataset = Subset(dataset, range(val_split, len(dataset)))
+    print(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
+
+    return train_dataset, val_dataset
+
+
+def makeDataloaders(
+    dataset: Dataset,
+    config,
+    is_train: bool = True,
+):
+    return DataLoader(
+        dataset,
+        batch_size=config["batch_size"],
+        shuffle=is_train,
+        num_workers=config["num_workers"],
+    )
