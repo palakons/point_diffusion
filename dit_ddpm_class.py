@@ -1,7 +1,8 @@
 import time
 import torch
 import sys, subprocess
-import tensorflow as tf
+if False:
+    import tensorflow as tf
 import torch.nn as nn
 from diffusers import DDPMScheduler
 from diffusers.optimization import get_cosine_schedule_with_warmup
@@ -10,7 +11,8 @@ import numpy as np
 from tqdm import tqdm, trange
 from man_ddpm import MANDataset, chamfer_distance
 from geomloss import SamplesLoss
-from torch_cluster import knn_graph
+if False:
+    from torch_cluster import knn_graph
 from pytorch3d.loss import chamfer_distance   as  pt3d_chamfer_distance # Import here for clarity
 from torch.utils.data import Dataset, Subset
 import matplotlib.pyplot as plt
@@ -20,9 +22,10 @@ import random
 import argparse
 # from pytorch3d.loss import chamfer_distance
 
-sys.path.insert(0, "/home/palakons/PointNeXt")
-from openpoints.models import build_model_from_cfg
-from openpoints.utils import EasyConfig, load_checkpoint
+if False: #later
+    sys.path.insert(0, "/home/palakons/PointNeXt")
+    from openpoints.models import build_model_from_cfg
+    from openpoints.utils import EasyConfig, load_checkpoint
 from torch.utils.tensorboard import SummaryWriter
 from typing import Dict, Optional
 

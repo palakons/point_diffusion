@@ -280,6 +280,9 @@ def train_mono_ddpm( config, checkpoint_dir,  tb_dir, plot_dir
 ):
     train_dataset, val_dataset = splitDataset(makeDataset(
         config,
+    get_occ_grid=False,
+    get_camera=True,
+    get_wan_vae=True,
     ), split=0.5)
     data_mean = train_dataset.dataset.data_mean.to(config["device"])
     data_std = train_dataset.dataset.data_std.to(config["device"])

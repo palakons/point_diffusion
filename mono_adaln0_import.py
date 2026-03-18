@@ -1,7 +1,8 @@
 import sys
 
-sys.path.insert(0, "/home/palakons/DiT")
-from models import TimestepEmbedder,VAEFeatureEmbedder, DiTBlock, modulate
+if False: #later
+    sys.path.insert(0, "/home/palakons/DiT")
+    from models import TimestepEmbedder,VAEFeatureEmbedder, DiTBlock, modulate
 
 import torch
 import torch.nn as nn

@@ -155,7 +155,12 @@ class MANDataset(Dataset):
         scaled_image_size: tuple = None,  # Target size for scaled images
         n_p: int = 0,  # number of point in each radar frame, if  0 no padding, otw, pick random n_p point, if not enough, pad by padding_value
         padding_value=0,
-        point_only: bool = False,
+
+        get_clip=False,
+        get_depth=False,
+        get_occ_grid=False,
+        get_camera=True,
+
         wan_vae: bool = False,
         wan_vae_checkpoint: str = "wan2_1_832x480.pth",
         viz_dir: str = "",
@@ -173,7 +178,7 @@ class MANDataset(Dataset):
         self.depth_model = "da3nested-giant-large"  # depth model name
         self.clip_model = "openai/clip-vit-large-patch14"  # clip model name
         self.original_image_size = (
-            None  # (943, 1980)  # original image size (height, width)
+             (943, 1980)  # original image size (height, width)
         )
         self.depth_bins = depth_bins
         self.max_depth = max_depth
@@ -183,13 +188,17 @@ class MANDataset(Dataset):
         self.clip_features = []  # Store CLIP features for each frame
         self.n_p = n_p
         self.padding_value = padding_value
-        self.point_only = point_only
         self.wan_vae = wan_vae
         self.wan_vae_checkpoint = wan_vae_checkpoint
         self.viz_dir = viz_dir
         self.grid_binary_range = grid_binary_range
         self.keep_frames = keep_frames
         self.get_bb = get_bb
+
+        self.get_clip = get_clip
+        self.get_depth = get_depth
+        self.get_occ_grid = get_occ_grid
+        self.get_camera = get_camera
 
         if self.wan_vae:
             print(f"Loading VAE...")
@@ -214,12 +223,13 @@ class MANDataset(Dataset):
             self.scene_ids = list(range(len(trucksc.scene)))
         print("Using all scene_ids:", self.scene_ids)
 
-        if not self.point_only:
+        if self.get_clip:
             img_files, feature_files = self.gather_missing_clip_features(
                 self.scene_ids, trucksc
             )
             print("Processing CLIP features for missing frames...", len(img_files))
             self.process_clip(img_files, feature_files, batch_size=40)
+        if self.get_depth:
 
             img_files, depth_files = self.gather_missing_depth_files(
                 self.scene_ids, trucksc
@@ -246,7 +256,7 @@ class MANDataset(Dataset):
                 self.data_bank.append(
                     {
                         **self.load_data(
-                            trucksc, frame_token, self.point_only, self.get_bb
+                            trucksc, frame_token, self.get_bb
                         ),
                         "scene_id": scene_id,
                         "frame_index": pbar.n,
@@ -337,7 +347,7 @@ class MANDataset(Dataset):
         # rcs_mean tensor([-2.3594]) rcs_std tensor([7.6742])
 
         # Precompute histograms and visualize UVZ comparison
-        if not self.point_only:
+        if self.get_occ_grid:
             self.occupancy_grids = []
             for data in self.data_bank:
                 depth_image = data["depth_image"]
@@ -1004,7 +1014,7 @@ class MANDataset(Dataset):
             out.append((ann_token, trucksc.get_box(ann_token)))
         return out
 
-    def load_data(self, trucksc, frame_token, point_only=False, get_bb=False):
+    def load_data(self, trucksc, frame_token, get_bb=False):
         time_0 = time.time()
 
         da3_model = None
@@ -1077,7 +1087,7 @@ class MANDataset(Dataset):
 
         # 0) load CLIP
         time_1 = time.time()
-        if not point_only:
+        if self.get_clip:
             clip_path = os.path.join(
                 self.data_root,
                 "clip_features",
@@ -1096,7 +1106,7 @@ class MANDataset(Dataset):
         # 1) load depth image
 
         time_2 = time.time()
-        if not point_only:
+        if self.get_depth:
             depth_image_path = os.path.join(
                 self.data_root,
                 "depth_images",
@@ -1116,7 +1126,7 @@ class MANDataset(Dataset):
 
         # print("depth_image shape:", depth_image.shape)  # depth_image shape: torch.Size([238, 504])
         time_3 = time.time()
-        if not point_only:
+        if self.get_depth:
 
             if self.double_flip_images:
                 # rotate 180 degrees
@@ -1166,7 +1176,7 @@ class MANDataset(Dataset):
 
         # 4) load camera
         time_7 = time.time()
-        if not point_only:
+        if self.get_camera:
             image_rgb_path = os.path.join(self.data_root, cam["filename"])
 
             camera_front = plt.imread(image_rgb_path).transpose(
@@ -1176,7 +1186,7 @@ class MANDataset(Dataset):
             camera_front = torch.tensor(camera_front, dtype=torch.float32)
             # print("camera_front: ", camera_front.shape) #camera_front:  torch.Size([3, 618, 2048])
         time_8 = time.time()
-        if not point_only:
+        if self.get_camera:
             if self.double_flip_images:
                 # rotate 180 degrees
                 camera_front = torch.flip(camera_front, [1])
@@ -1185,7 +1195,7 @@ class MANDataset(Dataset):
             # upscale depth image to match camera size
             # [238, 504, 4] depth_image
         time_9 = time.time()
-        if not point_only:
+        if self.get_depth:
             if (
                 depth_image.shape[0] != camera_front.shape[1]
                 or depth_image.shape[1] != camera_front.shape[2]
@@ -1217,7 +1227,7 @@ class MANDataset(Dataset):
         points_uvz = image_coord[:, :3]  # N x3
         time_11 = time.time()
 
-        if self.wan_vae and not point_only:
+        if self.wan_vae :
             # infer
 
             w, h = 832, 480
@@ -1408,38 +1418,32 @@ class MANDataset(Dataset):
         # print time percentages
         # for k, v in time_diff.items():
         #     print(f"{k}: {v/total_time*100:.2f}%")
-        if not point_only:
-            output = {
-                "depth_image": depth_image,
-                "filtered_radar_data": output_filtered_radar_data,
-                "uvz": output_uvz,
-                # "cam_calib_obj": cam_calib_obj, #trun off for dit, turn on for simple dddpm
-                "camera_front": camera_front,
-                "frame_token": frame_token,
-                "npoints_original": npoints_original,
-                "npoints_filtered": npoints_filtered,
-                "clip_feature": clip_feature,
-            }
-            if self.wan_vae:
-                output["wan_vae_latent"] = wan_vae_latent  # add wan vae latent
-        else:
-            output = {
+
+        output = {
                 "filtered_radar_data": output_filtered_radar_data,
                 "uvz": output_uvz,
                 "frame_token": frame_token,
                 "npoints_original": npoints_original,
                 "npoints_filtered": npoints_filtered,
             }
+        if self.wan_vae:
+            output["wan_vae_latent"] = wan_vae_latent  # add wan vae latent
+        if self.get_clip:
+            output["clip_feature"] = clip_feature  # add clip feature
+        if self.get_camera:
+            output["camera_front"] = camera_front  # add camera image
+        if self.get_depth:
+            output["depth_image"] = depth_image  # add depth image
         return output
 
     def __len__(self):
         return len(self.data_bank)
 
     def __getitem__(self, idx):
-        if self.point_only:
-            return self.data_bank[idx]
+        if self.get_occ_grid:
+            return {**self.data_bank[idx], "occupancy_grid": self.occupancy_grids[idx]}
 
-        return {**self.data_bank[idx], "occupancy_grid": self.occupancy_grids[idx]}
+        return self.data_bank[idx]
 
     def create_occupancy_grid(
         self,
