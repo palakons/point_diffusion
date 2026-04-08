@@ -155,18 +155,18 @@ class MANDataset(Dataset):
         scaled_image_size: tuple = None,  # Target size for scaled images
         n_p: int = 0,  # number of point in each radar frame, if  0 no padding, otw, pick random n_p point, if not enough, pad by padding_value
         padding_value=0,
-
         get_clip=False,
         get_depth=False,
         get_occ_grid=False,
         get_camera=True,
-
         wan_vae: bool = False,
         wan_vae_checkpoint: str = "wan2_1_832x480.pth",
         viz_dir: str = "",
         grid_binary_range: str = "0-1",  # "0-1" or "neg1-1"
         keep_frames=0,
         get_bb=False,  # whether to get bounding box of radar points
+        uniform_points=False,  # whether to assign radar points to uniform grid and only keep one point in each grid cell, if multiple points in one grid cell, keep the one with highest rcs
+        normalize_type="std",  # "std" or "minmax", if "std", return mean, std, if "minmax", return mean(min,max), range
     ):  # load all frames from scene_id, of data_file, particular radar and camera channel
         self.device = device
         self.data_file = data_file
@@ -177,9 +177,7 @@ class MANDataset(Dataset):
         self.coord_only = coord_only  # if True, only return coordinates of points
         self.depth_model = "da3nested-giant-large"  # depth model name
         self.clip_model = "openai/clip-vit-large-patch14"  # clip model name
-        self.original_image_size = (
-             (943, 1980)  # original image size (height, width)
-        )
+        self.original_image_size = (943, 1980)  # original image size (height, width)
         self.depth_bins = depth_bins
         self.max_depth = max_depth
         self.visualize_uvz = visualize_uvz
@@ -199,6 +197,8 @@ class MANDataset(Dataset):
         self.get_depth = get_depth
         self.get_occ_grid = get_occ_grid
         self.get_camera = get_camera
+        self.uniform_points = uniform_points
+        self.normalize_type = normalize_type
 
         if self.wan_vae:
             print(f"Loading VAE...")
@@ -253,11 +253,39 @@ class MANDataset(Dataset):
             while frame_token != "" and (
                 len(self.data_bank) < self.keep_frames or self.keep_frames == 0
             ):
+                loaded_data = self.load_data(trucksc, frame_token, self.get_bb)
+                if (
+                    self.uniform_points
+                ):  # assign grid of x [0-200] y [-100, 100] z [-20, 20] to radar points, and only keep one point in each grid cell, if multiple points in one grid cell, keep the one with highest rcs
+                    # mesh grid
+                    n_point_axis = int(self.n_p ** (1 / 3)) + 1
+                    x = np.linspace(0, 200, n_point_axis)
+                    y = np.linspace(-100, 100, n_point_axis)
+                    z = np.linspace(-20, 20, n_point_axis)
+                    xx, yy, zz = np.meshgrid(x, y, z)
+                    # reassign xx,yy zz to  loaded_data["filtered_radar_data"]
+                    points = []
+                    for i in range(self.n_p):
+                        points.append(
+                            [
+                                0 + xx.flatten()[i],
+                                -100 + yy.flatten()[i],
+                                -20 + zz.flatten()[i],
+                            ]
+                        )
+                    assert (
+                        len(points) == self.n_p
+                    ), f"n_p is too large, please reduce n_p to less than {len(points)}"
+                    assert len(points) == len(
+                        loaded_data["filtered_radar_data"]
+                    ), f"n_p is too large, please reduce n_p to less than {len(points)}"
+                    loaded_data["filtered_radar_data"] = torch.tensor(
+                        points, dtype=torch.float32, device=self.device
+                    )
+
                 self.data_bank.append(
                     {
-                        **self.load_data(
-                            trucksc, frame_token, self.get_bb
-                        ),
+                        **loaded_data,
                         "scene_id": scene_id,
                         "frame_index": pbar.n,
                     }
@@ -303,20 +331,53 @@ class MANDataset(Dataset):
         # calculate means
         dims = all_radar_positions.shape
 
-        self.data_mean = all_radar_positions.mean(axis=0)
-        self.data_std = all_radar_positions.std(axis=0)
-        # std are 1s, same shape of data_mean
-        if all_radar_positions.shape[0] == 1 or (self.data_std == 0).any():
-            self.data_std = torch.where(
-                self.data_std == 0, torch.ones_like(self.data_std), self.data_std
+        if self.normalize_type == "std":
+            self.data_mean = all_radar_positions.mean(axis=0)
+            raw_std = all_radar_positions.std(axis=0)
+            self.data_std = torch.ones_like(raw_std)
+
+            # 1. XYZ (0:3): Use uniform scale (max of X,Y,Z std) to preserve geometry
+            xyz_max_std = raw_std[:3].max()
+            self.data_std[:3] = xyz_max_std if xyz_max_std > 0 else 1.0
+
+            # 2. Doppler (3:6): Use uniform scale for velocity vectors if they exist
+            if len(raw_std) >= 6:
+                doppler_max_std = raw_std[3:6].max()
+                self.data_std[3:6] = doppler_max_std if doppler_max_std > 0 else 1.0
+
+            # 3. RCS (6): Use individual scale if it exists
+            if len(raw_std) >= 7:
+                self.data_std[6] = raw_std[6] if raw_std[6] > 0 else 1.0
+
+        elif self.normalize_type == "minmax":
+            min_vals = all_radar_positions.min(axis=0).values
+            max_vals = all_radar_positions.max(axis=0).values
+            self.data_mean = (min_vals + max_vals) / 2
+            raw_range = (max_vals - min_vals) / 2
+            self.data_std = torch.ones_like(raw_range)
+            xyz_max_range = raw_range[:3].max()
+            self.data_std[:3] = xyz_max_range
+            if len(raw_range) >= 6:
+                doppler_max_range = raw_range[3:6].max()
+                self.data_std[3:6] = doppler_max_range
+            if len(raw_range) >= 7:
+                self.data_std[6] = raw_range[6]
+        else:
+            raise ValueError(
+                f"Unknown normalize_type: {self.normalize_type}, must be 'std' or 'minmax'"
             )
 
+        # Avoid divide-by-zero
+        self.data_std = torch.where(
+            self.data_std == 0, torch.ones_like(self.data_std), self.data_std
+        )
+
         print(
-            "data_mean",
+            "all_radar_positions data_mean",
             self.data_mean,
         )
         print(
-            "data_std",
+            "all_radar_positions data_std",
             self.data_std,
         )
 
@@ -330,14 +391,6 @@ class MANDataset(Dataset):
             self.uvz_std = torch.where(
                 self.uvz_std == 0, torch.ones_like(self.uvz_std), self.uvz_std
             )
-        print(
-            "uvz_mean",
-            self.uvz_mean,
-        )
-        print(
-            "uvz_std",
-            self.uvz_std,
-        )
 
         # all_radar_positions torch.Size([1, 128, 3])
         # all_vrel torch.Size([1, 128, 3])
@@ -1227,7 +1280,7 @@ class MANDataset(Dataset):
         points_uvz = image_coord[:, :3]  # N x3
         time_11 = time.time()
 
-        if self.wan_vae :
+        if self.wan_vae:
             # infer
 
             w, h = 832, 480
@@ -1377,24 +1430,12 @@ class MANDataset(Dataset):
         ), "Filtered radar data and UVZ points must have the same number of points"
         if self.n_p == 0:
             pass
-        elif output_uvz.shape[0] < self.n_p:  # pad with self.uvz_padding_value
-            padding_size = self.n_p - output_uvz.shape[0]
-            # padding the to copy  the self.padding_value for (padding_size , output_uvz.shape[1])
-            uvz_padding = torch.full(
-                (padding_size, output_uvz.shape[1]),
-                self.padding_value,
-                device=output_uvz.device,
-            )
-            output_uvz = torch.cat((output_uvz, uvz_padding), dim=0)
-
-            radar_padding = torch.full(
-                (padding_size, output_filtered_radar_data.shape[1]),
-                self.padding_value,
-                device=output_filtered_radar_data.device,
-            )
-            output_filtered_radar_data = torch.cat(
-                (output_filtered_radar_data, radar_padding), dim=0
-            )
+        elif output_uvz.shape[0] < self.n_p:
+            # RANDOM RESAMPLING (Replacement)
+            # This maintains the true distribution of the radar data instead of clustering at zero
+            indices = torch.randint(0, output_uvz.shape[0], (self.n_p,))
+            output_uvz = output_uvz[indices]
+            output_filtered_radar_data = output_filtered_radar_data[indices]
         elif output_uvz.shape[0] > self.n_p:  # randomly pick self.n_p points
             indices = torch.randperm(output_uvz.shape[0])[: self.n_p]
             output_uvz = output_uvz[indices]
@@ -1420,12 +1461,12 @@ class MANDataset(Dataset):
         #     print(f"{k}: {v/total_time*100:.2f}%")
 
         output = {
-                "filtered_radar_data": output_filtered_radar_data,
-                "uvz": output_uvz,
-                "frame_token": frame_token,
-                "npoints_original": npoints_original,
-                "npoints_filtered": npoints_filtered,
-            }
+            "filtered_radar_data": output_filtered_radar_data,
+            "uvz": output_uvz,
+            "frame_token": frame_token,
+            "npoints_original": npoints_original,
+            "npoints_filtered": npoints_filtered,
+        }
         if self.wan_vae:
             output["wan_vae_latent"] = wan_vae_latent  # add wan vae latent
         if self.get_clip:

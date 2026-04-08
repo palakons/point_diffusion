@@ -1,6 +1,7 @@
 import time
 import torch
 import sys, subprocess
+
 if False:
     import tensorflow as tf
 import torch.nn as nn
@@ -11,18 +12,22 @@ import numpy as np
 from tqdm import tqdm, trange
 from man_ddpm import MANDataset, chamfer_distance
 from geomloss import SamplesLoss
+
 if False:
     from torch_cluster import knn_graph
-from pytorch3d.loss import chamfer_distance   as  pt3d_chamfer_distance # Import here for clarity
+from pytorch3d.loss import (
+    chamfer_distance as pt3d_chamfer_distance,
+)  # Import here for clarity
 from torch.utils.data import Dataset, Subset
 import matplotlib.pyplot as plt
 from datetime import datetime
 import os
 import random
 import argparse
+
 # from pytorch3d.loss import chamfer_distance
 
-if False: #later
+if False:  # later
     sys.path.insert(0, "/home/palakons/PointNeXt")
     from openpoints.models import build_model_from_cfg
     from openpoints.utils import EasyConfig, load_checkpoint
@@ -50,7 +55,7 @@ def hungarian_l2_with_attr_loss(
 
     Matching is done using xyz only.
     After matching, compute xyz + velocity + rcs losses on the matched pairs.
-    
+
     Args:
         use_greedy: If True, use fast greedy matching instead of Hungarian (10-50x faster)
                    For N > 200 points, this is highly recommended
@@ -73,10 +78,10 @@ def hungarian_l2_with_attr_loss(
     pred_xyz = pred[:, :, xyz_slice]  # (B, N, 3)
     pred_vel = pred[:, :, vel_slice]  # (B, N, 3)
     pred_rcs = pred[:, :, rcs_slice]  # (B, N, 1)
-    
-    gt_xyz = gt[:, :, xyz_slice]      # (B, N, 3)
-    gt_vel = gt[:, :, vel_slice]      # (B, N, 3)
-    gt_rcs = gt[:, :, rcs_slice]      # (B, N, 1)
+
+    gt_xyz = gt[:, :, xyz_slice]  # (B, N, 3)
+    gt_vel = gt[:, :, vel_slice]  # (B, N, 3)
+    gt_rcs = gt[:, :, rcs_slice]  # (B, N, 1)
 
     for b in range(B):
         if use_greedy:
@@ -84,15 +89,15 @@ def hungarian_l2_with_attr_loss(
         else:
             # Standard Hungarian algorithm
             xyz_cost = torch.cdist(pred_xyz[b], gt_xyz[b], p=2) ** 2
-            
+
             # OPTIMIZATION: Use float32 for assignment if needed
             if xyz_cost.dtype == torch.float64:
                 xyz_cost = xyz_cost.float()
-            
+
             # Transfer to CPU only once
             cost_np = xyz_cost.detach().cpu().numpy()
             row_ind, col_ind = linear_sum_assignment(cost_np)
-            
+
             row_ind = torch.as_tensor(row_ind, device=pred.device, dtype=torch.long)
             col_ind = torch.as_tensor(col_ind, device=pred.device, dtype=torch.long)
 
@@ -121,32 +126,32 @@ def hungarian_l2_with_attr_loss(
 def _greedy_matching_gpu(pred_xyz, gt_xyz):
     """
     PROPER greedy matching that enforces one-to-one assignment.
-    
+
     Algorithm:
     1. Compute all pairwise distances
     2. Repeatedly pick the smallest distance pair
     3. Remove both matched points
     4. Repeat until all matched
-    
+
     This is O(N^3) in worst case (same as Hungarian) BUT:
     - Simpler implementation
     - Still GPU-native
     - More intuitive
-    
+
     Returns one-to-one assignment like Hungarian.
     """
     N = pred_xyz.shape[0]
-    
+
     # Compute all pairwise distances: (N, N)
     dist = torch.cdist(pred_xyz, gt_xyz, p=2)  # L2 distance
-    
+
     row_ind = []
     col_ind = []
-    
+
     # Track which points are already matched
     unmatched_pred = set(range(N))
     unmatched_gt = set(range(N))
-    
+
     # O(N^2) greedy matching: sort all distances, assign pairs greedily
     # 1. Flatten distance matrix and sort
     pairs = [(i, j) for i in range(N) for j in range(N)]
@@ -166,10 +171,10 @@ def _greedy_matching_gpu(pred_xyz, gt_xyz):
             assigned_gt.add(j)
             if len(row_ind) == N:
                 break
-    
+
     row_ind = torch.tensor(row_ind, device=pred_xyz.device, dtype=torch.long)
     col_ind = torch.tensor(col_ind, device=pred_xyz.device, dtype=torch.long)
-    
+
     return row_ind, col_ind
 
 
@@ -1511,18 +1516,25 @@ class DitDDPM:
 
 
 def train_eval_ae_epoch(
-    autoencoder, dataloader, optimizer,lr_scheduler, config, writer, global_step, train=True
+    autoencoder,
+    dataloader,
+    optimizer,
+    lr_scheduler,
+    config,
+    writer,
+    global_step,
+    train=True,
 ):
     if train:
         autoencoder.train()
     else:
-        autoencoder.eval()  
+        autoencoder.eval()
     pbar = tqdm(dataloader, leave=False, desc="Batches")
     epoch_loss = 0.0
     epoch_7d_cd = 0.0
     epoch_xyz_cd = 0.0
     num_samples = 0
-    time_records ={}
+    time_records = {}
     for batch in pbar:
         with torch.no_grad() if not train else torch.enable_grad():
             time0 = time.time()
@@ -1530,7 +1542,7 @@ def train_eval_ae_epoch(
                 optimizer.zero_grad()
 
             filtered_radar_data = batch["filtered_radar_data"].to(config["device"])
-            batch_size = filtered_radar_data.shape[0] 
+            batch_size = filtered_radar_data.shape[0]
             # normalize the whole data
 
             man_dataset = dataloader
@@ -1568,7 +1580,6 @@ def train_eval_ae_epoch(
 
             # filter point only with confidence > 0.5
 
-
             # RECONSTRUCTION LOSS ONLY
             if config["ae_loss_type"] == "mse":
                 loss = nn.functional.mse_loss(
@@ -1576,16 +1587,16 @@ def train_eval_ae_epoch(
                 )
             elif config["ae_loss_type"] == "good":
                 # 1.	Normalize cost matrix
-                # 2.	Tune ε 
+                # 2.	Tune ε
                 # 3.	Combine with Chamfer
                 # 4.	Detach transport plan
                 # 5.	KNN regularization
                 # 6.	Singkhorn Clip gradients
                 # 7.    Balanced OT
-                
+
                 # Use all 7D points for both Chamfer and Sinkhorn losses
                 P = predicted_normalized_filtered_radar_data  # (B, N, 7)
-                G = normalized_filtered_radar_data           # (B, M, 7)
+                G = normalized_filtered_radar_data  # (B, M, 7)
 
                 # Combine losses
                 loss = 0
@@ -1593,15 +1604,19 @@ def train_eval_ae_epoch(
                 if cd_weight > 0:
 
                     # Chamfer Distance (uses first 3 dims for geometry)
-                    loss_cd, _ = pt3d_chamfer_distance(P[:, :, :3], G[:, :, :3], batch_reduction ="mean")
+                    loss_cd, _ = pt3d_chamfer_distance(
+                        P[:, :, :3], G[:, :, :3], batch_reduction="mean"
+                    )
 
                     # ^ Chamfer on xyz only
                     loss += cd_weight * loss_cd
-                
+
                 if ot_weight > 0:
 
                     # Sinkhorn OT on all 7 dims
-                    singkhorn = SamplesLoss("sinkhorn", p=2, blur=config["sk_eps"])  # ε regularization
+                    singkhorn = SamplesLoss(
+                        "sinkhorn", p=2, blur=config["sk_eps"]
+                    )  # ε regularization
                     # Detach transport plan if desired
                     loss_ot = singkhorn(P, G)
                     # print("loss_ot:", loss_ot   )#tensor([3.3298], device='cuda:0', grad_fn=<AddBackward0>)
@@ -1616,8 +1631,18 @@ def train_eval_ae_epoch(
                 if knn_weight > 0:
                     # KNN regularization (example: mean distance to kNN in P)
                     edge_index = knn_graph(P[:, :, :3].reshape(-1, 3), k=5, batch=None)
-                    knn_loss = ((P[:, :, :3].reshape(-1, 3)[edge_index[0]] - P[:, :, :3].reshape(-1, 3)[edge_index[1]])**2).sum(-1).mean()
-                
+                    knn_loss = (
+                        (
+                            (
+                                P[:, :, :3].reshape(-1, 3)[edge_index[0]]
+                                - P[:, :, :3].reshape(-1, 3)[edge_index[1]]
+                            )
+                            ** 2
+                        )
+                        .sum(-1)
+                        .mean()
+                    )
+
                     loss += knn_weight * knn_loss
 
             elif config["ae_loss_type"] == "chamfer":
@@ -1674,8 +1699,8 @@ def train_eval_ae_epoch(
                     filtered_radar_data,
                     w_xyz=ae_weight_attr_loss[0],
                     w_velocity=ae_weight_attr_loss[1],
-                    w_rcs=ae_weight_attr_loss[2],use_greedy=config["hungarian_use_greedy"]
-
+                    w_rcs=ae_weight_attr_loss[2],
+                    use_greedy=config["hungarian_use_greedy"],
                 )
                 # print("hungarian_loss:", hungarian_loss[1]["xyz"])
                 # print("chamfer_loss:", attr_loss[1]["xyz"])
@@ -1713,20 +1738,28 @@ def train_eval_ae_epoch(
                     # After loss.backward()
                     for name, param in autoencoder.named_parameters():
                         if param.grad is not None:
-                            writer.add_scalar(f'grad_norm/{name}', param.grad.norm().item(), global_step)
+                            writer.add_scalar(
+                                f"grad_norm/{name}",
+                                param.grad.norm().item(),
+                                global_step,
+                            )
             time5 = time.time()
             batch_loss = loss.item()
             num_samples += batch_size
-            epoch_loss += batch_loss* batch_size #support last non-full batch
+            epoch_loss += batch_loss * batch_size  # support last non-full batch
 
-            batch_xyz_cd  = pt3d_chamfer_distance(predicted_filtered_radar_data[:, :, :3], filtered_radar_data[:, :, :3])[0].item()
-            batch_7d_cd = pt3d_chamfer_distance(predicted_filtered_radar_data, filtered_radar_data)[0].item()
+            batch_xyz_cd = pt3d_chamfer_distance(
+                predicted_filtered_radar_data[:, :, :3], filtered_radar_data[:, :, :3]
+            )[0].item()
+            batch_7d_cd = pt3d_chamfer_distance(
+                predicted_filtered_radar_data, filtered_radar_data
+            )[0].item()
 
-            epoch_7d_cd += batch_7d_cd* batch_size
-            epoch_xyz_cd += batch_xyz_cd* batch_size
-            
+            epoch_7d_cd += batch_7d_cd * batch_size
+            epoch_xyz_cd += batch_xyz_cd * batch_size
+
             pbar.set_description(f"CD" f"{batch_loss:.4f}")
-            
+
             time_records_batch = {
                 "data_prep_time": time1 - time0,
                 "forward_time": time2 - time1,
@@ -1734,7 +1767,10 @@ def train_eval_ae_epoch(
                 "loss_time": time4 - time3,
                 "backward_time": time5 - time4,
             }
-            time_records = {k: time_records.get(k, 0) + time_records_batch[k]* batch_size for k in time_records_batch}
+            time_records = {
+                k: time_records.get(k, 0) + time_records_batch[k] * batch_size
+                for k in time_records_batch
+            }
 
             global_step += 1
     time_records = {k: v / num_samples for k, v in time_records.items()}
@@ -1753,7 +1789,7 @@ def train_eval_ae_epoch(
     return avg_loss, global_step, time_records, avg_xyz_cd, avg_7d_cd
 
 
-def load_ae_checkpoint(model, optimizer, lr_scheduler,config):
+def load_ae_checkpoint(model, optimizer, lr_scheduler, config):
     if config["point_ae_checkpoint"] == "":
         print("No checkpoint path provided, training from scratch.")
         return 0
@@ -1785,7 +1821,12 @@ def load_ae_checkpoint(model, optimizer, lr_scheduler,config):
         "ddpm_clip_sample",
         "ae_lr_decay_step",
         "ae_lr_decay_gamma",
-        "ae_weight_good_loss","sk_eps","sk_detach","ot_clip","ae_lr_clr_factor","ae_lr_clr_mode"
+        "ae_weight_good_loss",
+        "sk_eps",
+        "sk_detach",
+        "ot_clip",
+        "ae_lr_clr_factor",
+        "ae_lr_clr_mode",
     ]
     matched = True
     for field in important_fields:
@@ -1847,11 +1888,9 @@ def _short_last_segments(s: str, num_underscore_segments: int = 17) -> str:
     segments = s.split("_")
     if len(segments) <= num_underscore_segments:
         return s
-    h = (
-        hashlib.sha1(("_".join(segments[-num_underscore_segments:]))
-        .encode("utf-8"))
-        .hexdigest()[:10]
-    )
+    h = hashlib.sha1(
+        ("_".join(segments[-num_underscore_segments:])).encode("utf-8")
+    ).hexdigest()[:10]
 
     return f"{'_'.join(segments[:-num_underscore_segments])}_{h}"
 
@@ -1894,10 +1933,8 @@ def plot_ae(
         filtered_radar_data = (
             sample_data["filtered_radar_data"].to(config["device"]).unsqueeze(0)
         )
-        normalized_filtered_radar_data = (
-                filtered_radar_data - data_mean
-            ) / data_std
-        
+        normalized_filtered_radar_data = (filtered_radar_data - data_mean) / data_std
+
         with torch.no_grad():
             normalized_predicted_filtered_radar_data, confidence, latent = autoencoder(
                 normalized_filtered_radar_data
@@ -1927,7 +1964,7 @@ def plot_ae(
             original_uvz=gt_xyz,
             reconstructed_uvz=pred_xyz,
             save_dir=plot_dir,
-            plotlims= {"u": (-50, 200), "v": (-100, 150), "z": (-25, 25)},
+            plotlims={"u": (-50, 200), "v": (-100, 150), "z": (-25, 25)},
             marker_config={
                 "original": {
                     "color": "blue",
@@ -1959,7 +1996,7 @@ def plot_ae(
         # ), f"Chamfer distance mismatch: {cd} vs {cd_wthattr[1]['xyz']}"
         cds.append(cd_wthattr)
         paths.append(save_path)
-    return cds,paths
+    return cds, paths
 
 
 def pretrain_autoencoder(
@@ -1975,7 +2012,9 @@ def pretrain_autoencoder(
     Pre-train PointNeXt from scratch as an autoencoder on UVZ point clouds.
     """
     worker_init_fn = set_seed(config["seed"])
-    writer = SummaryWriter(f"{tb_dir}/{_short_last_segments(run_id, num_underscore_segments=29)}")
+    writer = SummaryWriter(
+        f"{tb_dir}/{_short_last_segments(run_id, num_underscore_segments=29)}"
+    )
     writer.add_text("run_id", run_id)
 
     # Log hyperparameters
@@ -2010,14 +2049,27 @@ def pretrain_autoencoder(
         weight_decay=config["ae_decay"],
     )
 
-    #need to add LR scheduler
+    # need to add LR scheduler
     if config["ae_lr_scheduler_type"] == "step":
-        lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=config["ae_lr_decay_step"], gamma=config["ae_lr_decay_gamma"])
+        lr_scheduler = torch.optim.lr_scheduler.StepLR(
+            optimizer,
+            step_size=config["ae_lr_decay_step"],
+            gamma=config["ae_lr_decay_gamma"],
+        )
     elif config["ae_lr_scheduler_type"] == "cyclic":
-        lr_scheduler = torch.optim.lr_scheduler.CyclicLR(optimizer, base_lr=config["ae_lr"]/config['ae_lr_clr_factor'], max_lr=config["ae_lr"]*config['ae_lr_clr_factor'], step_size_up=config["ae_lr_decay_step"], mode=config["ae_lr_clr_mode"], cycle_momentum=False)
+        lr_scheduler = torch.optim.lr_scheduler.CyclicLR(
+            optimizer,
+            base_lr=config["ae_lr"] / config["ae_lr_clr_factor"],
+            max_lr=config["ae_lr"] * config["ae_lr_clr_factor"],
+            step_size_up=config["ae_lr_decay_step"],
+            mode=config["ae_lr_clr_mode"],
+            cycle_momentum=False,
+        )
     else:
         # Default to no scheduler (constant LR)
-        lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda epoch: 1.0)
+        lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
+            optimizer, lr_lambda=lambda epoch: 1.0
+        )
 
     dataloader = makeDataloaders(
         dataset,
@@ -2029,9 +2081,11 @@ def pretrain_autoencoder(
         config,
         is_train=False,
     )
-    start_epoch = load_ae_checkpoint(autoencoder, optimizer,lr_scheduler, config)
+    start_epoch = load_ae_checkpoint(autoencoder, optimizer, lr_scheduler, config)
     num_epochs = config["ae_epochs"]
-    print(f"Starting autoencoder pretraining from epoch {start_epoch + 1} to {num_epochs}...")
+    print(
+        f"Starting autoencoder pretraining from epoch {start_epoch + 1} to {num_epochs}..."
+    )
     global_step = 0
     # set start epoch, as start_epoch
     epoch_trange = trange(
@@ -2042,8 +2096,17 @@ def pretrain_autoencoder(
     prev_paths = None
     for epoch in epoch_trange:
 
-        avg_train_loss, global_step,time_records,avg_xyz_cd,avg_7d_cd = train_eval_ae_epoch(
-            autoencoder, dataloader, optimizer, lr_scheduler, config, writer, global_step, train=True
+        avg_train_loss, global_step, time_records, avg_xyz_cd, avg_7d_cd = (
+            train_eval_ae_epoch(
+                autoencoder,
+                dataloader,
+                optimizer,
+                lr_scheduler,
+                config,
+                writer,
+                global_step,
+                train=True,
+            )
         )
 
         epoch_trange.set_postfix(
@@ -2056,13 +2119,14 @@ def pretrain_autoencoder(
         writer.add_scalar("ae/avg_xyz_cd/train", avg_xyz_cd, epoch + 1)
         writer.add_scalar("ae/avg_7d_cd/train", avg_7d_cd, epoch + 1)
 
-            
         if True:
             sum_time = sum(time_records.values())
             for k in time_records:
-                writer.add_scalar(f"train/time/{k}", time_records[k]/sum_time, epoch + 1)
+                writer.add_scalar(
+                    f"train/time/{k}", time_records[k] / sum_time, epoch + 1
+                )
         if (epoch + 1) % config["eval_every"] == 0:
-            eval_loss, _,time_recordsm,avg_xyz_cd,avg_7d_cd = train_eval_ae_epoch(
+            eval_loss, _, time_recordsm, avg_xyz_cd, avg_7d_cd = train_eval_ae_epoch(
                 autoencoder,
                 eval_dataloader,
                 optimizer,
@@ -2076,7 +2140,6 @@ def pretrain_autoencoder(
             writer.add_scalar("ae/avg_xyz_cd/val", avg_xyz_cd, epoch + 1)
             writer.add_scalar("ae/avg_7d_cd/val", avg_7d_cd, epoch + 1)
 
-
             # time_records_batch = {
             #     "data_prep_time": time1 - time0,
             #     "forward_time": time2 - time1,
@@ -2087,7 +2150,9 @@ def pretrain_autoencoder(
             if True:
                 sum_time = sum(time_records.values())
                 for k in time_records:
-                    writer.add_scalar(f"val/time/{k}", time_records[k]/sum_time, epoch + 1)
+                    writer.add_scalar(
+                        f"val/time/{k}", time_records[k] / sum_time, epoch + 1
+                    )
 
         if (epoch + 1) % config["gpu_log_every"] == 0:
             stats = query_gpu_stats(gpu_index=0)
@@ -2108,7 +2173,7 @@ def pretrain_autoencoder(
                 for path in prev_paths:
                     if os.path.exists(path):
                         os.remove(path)
-            cds,prev_tr_paths = plot_ae(
+            cds, prev_tr_paths = plot_ae(
                 "train",
                 dataset,
                 autoencoder,
@@ -2117,7 +2182,7 @@ def pretrain_autoencoder(
                 run_id,
                 epoch,
             )
-            cds,prev_val_paths = plot_ae(
+            cds, prev_val_paths = plot_ae(
                 "val",
                 val_dataset,
                 autoencoder,
@@ -2130,8 +2195,14 @@ def pretrain_autoencoder(
 
         if (epoch + 1) % config["save_every"] == 0 or epoch == num_epochs - 1:
             _short_last_segments(run_id, num_underscore_segments=29)
-            checkpoint_path = os.path.join(checkpoint_dir, f"{_short_last_segments(run_id, num_underscore_segments=29)}_at{epoch+1}.pth")
-            prev_path = os.path.join(checkpoint_dir, f"{_short_last_segments(run_id, num_underscore_segments=29)}_at{saved_epoch+1}.pth")
+            checkpoint_path = os.path.join(
+                checkpoint_dir,
+                f"{_short_last_segments(run_id, num_underscore_segments=29)}_at{epoch+1}.pth",
+            )
+            prev_path = os.path.join(
+                checkpoint_dir,
+                f"{_short_last_segments(run_id, num_underscore_segments=29)}_at{saved_epoch+1}.pth",
+            )
             if os.path.exists(prev_path):
                 os.remove(prev_path)
             saved_epoch = epoch
@@ -2643,7 +2714,10 @@ def parse_args():
         "--seed", type=int, default=42, help="Random seed for reproducibility."
     )
     parser.add_argument(
-        "--seed_model", type=int, default=42, help="Random seed for model initialization."
+        "--seed_model",
+        type=int,
+        default=42,
+        help="Random seed for model initialization.",
     )
     # parser.add_argument(
     #     "--num_encoder_layers",
@@ -2800,7 +2874,7 @@ def parse_args():
         default="",
         help="tag, used for mainly filter tensorboard runs",
     )
-    parser.add_argument(    
+    parser.add_argument(
         "--hungarian_use_greedy",
         action="store_true",
         help="Whether to use greedy matching instead of Hungarian algorithm for point cloud matching in attribute loss.",
@@ -2810,7 +2884,7 @@ def parse_args():
         type=float,
         default=0.05,
         help="Epsilon value for Sinkhorn distance in attribute loss.",
-    )   
+    )
     parser.add_argument(
         "--sk_detach",
         action="store_true",
@@ -2822,11 +2896,13 @@ def parse_args():
         help="Whether to clip the optimal transport cost in attribute loss to prevent exploding gradients.",
     )
 
-    parser.add_argument("--ae_weight_good_loss", type=float,
+    parser.add_argument(
+        "--ae_weight_good_loss",
+        type=float,
         nargs=3,
         default=[1.0, 0.1, 0.01],
-        help="Weight for good point loss in autoencoder: CD, OT, and KNN losses.")
-
+        help="Weight for good point loss in autoencoder: CD, OT, and KNN losses.",
+    )
 
     parser.add_argument(
         "--ae_lr_decay_step",
@@ -2846,10 +2922,11 @@ def parse_args():
         default=10.0,
         help="Factor to determine base learning rate for triangular cyclic learning rate scheduler (base_lr = ae_lr / ae_lr_clr_factor), max learning rate is ae_lr * ae_lr_factor.",
     )
-    parser.add_argument(        "--ae_lr_scheduler_type",  
-        type=str, 
-        default="cyclic",  #step. clr,none
-        help="Type of learning rate scheduler for autoencoder training (e.g., 'step', 'clr', 'none'). If 'step', uses StepLR with ae_lr_decay_step and ae_lr_decay_gamma. If 'clr', uses CyclicLR with base_lr = ae_lr / ae_lr_clr_factor and max_lr = ae_lr * ae_lr_clr_factor. If 'none', no learning rate scheduler is used."
+    parser.add_argument(
+        "--ae_lr_scheduler_type",
+        type=str,
+        default="cyclic",  # step. clr,none
+        help="Type of learning rate scheduler for autoencoder training (e.g., 'step', 'clr', 'none'). If 'step', uses StepLR with ae_lr_decay_step and ae_lr_decay_gamma. If 'clr', uses CyclicLR with base_lr = ae_lr / ae_lr_clr_factor and max_lr = ae_lr * ae_lr_clr_factor. If 'none', no learning rate scheduler is used.",
     )
     # ae_lr_clr_mode
     parser.add_argument(
@@ -2857,7 +2934,7 @@ def parse_args():
         type=str,
         default="triangular",
         help="Mode for CyclicLR if ae_lr_scheduler_type is 'clr' (e.g., 'triangular', 'triangular2', 'exp_range').",
-    )   
+    )
     parser.add_argument(
         "--lr_scheduler",
         type=str,
@@ -2876,7 +2953,82 @@ def parse_args():
         default=0.5,
         help="Gamma for StepLR if lr_scheduler is 'step'.",
     )
+    parser.add_argument(
+        "--ptv3_grid_size",
+        type=float,
+        default=0.01,
+        help="Grid size for Point Transformer V3 autoencoder.",
+    )
 
+    parser.add_argument(
+        "--ptv3_serialized_inverse",
+        action="store_true",
+        help="Whether to use serialized inverse for Point Transformer V3 autoencoder, which reduces memory usage at the cost of increased computation time.",
+    )
+
+    parser.add_argument(
+        "--ptv3_shuffle_orders",
+        action="store_true",
+        help="Whether to shuffle the order of points in the input point cloud for Point Transformer V3 autoencoder, which can improve generalization.",
+    )
+
+    parser.add_argument(
+        "--ptv3_n_stages",
+        type=int,
+        default=5,
+        help="Number of stages for Point Transformer V3 autoencoder (2-5).",
+    )
+
+    parser.add_argument(
+        "--lambda_cd",
+        type=float,
+        default=0.0,
+        help="Weight for Chamfer Distance reconstruction loss.",
+    )
+    parser.add_argument(
+        "--lambda_ot",
+        type=float,
+        default=0.0,
+        help="Weight for Optimal Transport (Sinkhorn) reconstruction loss.",
+    )
+
+    parser.add_argument(
+        "--ptv3_zero_mean_noise",
+        action="store_true",
+        help="Whether to center the noise to zero mean during training to prevent translation bias.",
+    )
+
+    parser.add_argument(
+        "--debug_mode",
+        type=int,
+        default=0,
+        help="Debug mode for training complexity: 0:Full, 1:Zero noise, 2:Const noise, 3:Fixed rand noise/Fixed T, 4:Fixed rand noise/Var T, 5:Rand noise/Fixed T",
+    )
+
+    parser.add_argument(
+        "--ptv3_backbone",
+        type=str,
+        default="full",
+        choices=["simple", "full"],
+        help="PTv3 backbone type: 'simple' (no pooling, 1 layer) or 'full' (hierarchical U-Net).",
+    )
+    parser.add_argument(
+        "--uniform_points",
+        action="store_true",
+        help="Whether to use uniform sampling of points instead of importance sampling based on RCS for training the autoencoder, which can improve generalization to far-range points.",
+    )
+    parser.add_argument(
+        "--denoiser_model",
+        type=str,
+        default="ptv3",
+        help="Architecture for DiT denoiser model: 'pointnet' or 'pointnext'.",
+    )
+    parser.add_argument(
+        "--man_normalize_type",
+        type=str,
+        default="std",
+        help="Normalization type for MAN dataset: 'std', or 'minmax'",
+    )
     return parser.parse_args()
 
 
@@ -2916,7 +3068,7 @@ def get_pointnextdit_runid(config):
 def get_pointnext_runid(config):
 
     scene_str = "-".join(map(str, sorted(config["scene_ids"])))
-    good_loss_str = '-'.join([f'{w:.2E}' for w in config['ae_weight_good_loss']])
+    good_loss_str = "-".join([f"{w:.2E}" for w in config["ae_weight_good_loss"]])
 
     return f"{config['exp_name']}_e{config['ae_epochs']}_sc{scene_str}_{config['data_file'].replace('man-','')}_np{config['num_points']}_fr{config['num_input_frames']}_model{config['point_ae_model'].replace('modelpointnext-','')}_sd{config['seed']}_latdim{config['latent_dim']}_latseq{config['latent_seq_length']}_decay{config['ae_decay']:.2E}_lr{config['ae_lr']:.2E}_bs{config['batch_size']}_qnh{config['query_num_heads']}_qdrop{config['query_dropout']:.2E}_dnl{config['decoder_num_layers']}_dnh{config['decoder_num_heads']}_ddrop{config['decoder_dropout']:.2E}_{config['pointnext_config'].replace('/', '_').replace('.yaml','')}_ltype{config['ae_loss_type']}_wattr{'-'.join([f'{w:.2E}' for w in config['ae_weight_attr_loss']])}_bqn{config['ae_ball_query_nsample']}_bqr{config['ae_ball_query_radius']}_greedy{int(config['hungarian_use_greedy'])}_clip{int(config['ddpm_clip_sample'])}_lrdec{config['ae_lr_decay_step']}_{config['ae_lr_decay_gamma']:.2E}_skeps{config['sk_eps']}_skdetach{int(config['sk_detach'])}_otclip{int(config['ot_clip'])}_goodloss{good_loss_str}_aeclr{config['ae_lr_clr_factor']:.2E}_aels{config['ae_lr_scheduler_type']}_clrmde{config['ae_lr_clr_mode']}"
 
@@ -2980,20 +3132,24 @@ def tblogHparam(
         else:
             print(f"Warning: skipping hparam {k} with type {type(v)}")
 
-
     # metrics must be scalar numbers, prepend "hparam/" to avoid conflicts with other metrics
-    hmetrics = {f"hparam/{k}": v for k, v in metrics.items() if isinstance(v, (int, float)) and not isinstance(v, bool)}
+    hmetrics = {
+        f"hparam/{k}": v
+        for k, v in metrics.items()
+        if isinstance(v, (int, float)) and not isinstance(v, bool)
+    }
 
     # IMPORTANT: do this exactly once
     writer.add_hparams(hparams, hmetrics)
     print(f"Logged hyperparameters and metrics to TensorBoard:")
     print("Hyperparameters:")
     for k, v in hparams.items():
-        print(f"  {k}: {v}")
-
+        print(f"  {k}: {v}", end="\t\t")
+    print()
     print("Metrics:")
     for k, v in hmetrics.items():
-        print(f"  {k}: {v}")
+        print(f"  {k}: {v}", end="\t\t")
+    print()
     # make sure it hits disk
     writer.flush()
 
@@ -3031,6 +3187,8 @@ def makeDataset(
         viz_dir=plot_dir,
         grid_binary_range=config["grid_binary_range"],  # "0-1" or "neg1-1"
         keep_frames=config["num_input_frames"],
+        uniform_points=config["uniform_points"],
+        normalize_type=config["man_normalize_type"],
     )
     assert (
         len(dataset) == config["num_input_frames"]
