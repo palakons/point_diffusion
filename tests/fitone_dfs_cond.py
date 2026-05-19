@@ -977,7 +977,7 @@ if __name__ == "__main__":
         print(f"Replicated x0sbn3_norm shape: {x0sbn3_norm_rep.shape}, expected: ({B}, {N}, 3)")
 
         if args.cond_mode=="none":
-            scene_condition = torch.zeros((n_scene,), device=device).float()  
+            scene_condition = torch.zeros((n_scene,1), device=device).float()  
         else:
             if cond_method == "wan":
                 scene_condition = wan_cond.view(n_scene, -1)/ wan_cond.abs().max() 
@@ -999,12 +999,23 @@ if __name__ == "__main__":
             idx = torch.randperm(x0sbn3_norm_rep.shape[0], device=device)
             x0 = x0sbn3_norm_rep[idx][:B]  # [B, N, 3]
             cond = scene_condition_rep[idx][:B]  # [B, 1] scene conditioning (batch-wise)
+
+            # dataset = torch.utils.data.TensorDataset(x0sbn3_norm_rep, scene_condition_rep)
+            # dataloader = torch.utils.data.DataLoader(dataset, batch_size=B, shuffle=True, drop_last=True)
+            # x0, cond = next(iter(dataloader))  # Get the first batch of shuffled data
+
+            # assert x0.shape == x0_old.shape, f"Expected x0 shape {x0_old.shape}, got {x0.shape}"
+            # assert cond.shape == cond_old.shape, f"Expected cond shape {cond_old.shape}, got {cond.shape}"
+            # print("shapes okay: ", x0.shape, cond.shape)#            shapes okay:  torch.Size([128, 96, 3]) torch.Size([128, 199680])
+            # print("old shapes for reference: ", x0_old.shape, cond_old.shape) #old shapes for reference:  torch.Size([128, 96, 3]) torch.Size([128, 199680])
+
+
             # print(f"Step {step}: x0 shape: {x0.shape}, cond shape: {cond.shape}")
-            assert x0.shape == (B, N, 3), f"Expected x0 shape {(B, N, 3)}, got {x0.shape}"
+            # assert x0.shape == (B, N, 3), f"Expected x0 shape {(B, N, 3)}, got {x0.shape}"
             # assert cond.shape == (B, 1), f"Expected cond shape {(B, 1)}, got {cond.shape}"
-
+            
             t = torch.randint(0, T, (B,), device=device)
-
+            # print(f"shape of x0: {x0.shape}, t: {t.shape}, cond: {cond.shape}")
             noise = torch.randn_like(x0)
             time3 = time.time()
             x_t = scheduler.add_noise(x0, noise, t)
@@ -1034,8 +1045,12 @@ if __name__ == "__main__":
                 model.eval()
                 try:
                     with torch.no_grad():
-                        shapes =  (n_scene, 3, N) if model_name == "PTv3Dnsr" else (n_scene, N, 3)
-                        expanded_cond = scene_condition  # [n_scene, 1]
+                        if n_scene<B:
+                            shapes =  (n_scene, 3, N) if model_name == "PTv3Dnsr" else (n_scene, N, 3)
+                            expanded_cond = scene_condition  # [n_scene, 1]
+                        else:
+                            shapes =  (B, 3, N) if model_name == "PTv3Dnsr" else (B, N, 3)
+                            expanded_cond = scene_condition[:B] 
                         # print(f"[Inference] Generating sample at step {step}: shape: {shapes}, condition: {expanded_cond}")
                         pred_x = p_sample_loop(model, shapes, scheduler, num_inference_steps=T_infer, device=device, condition=expanded_cond, model_name=model_name)
                     
