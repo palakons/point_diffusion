@@ -403,7 +403,7 @@ class PointNetDenoiser(nn.Module):
 
 from diffusers import DDPMScheduler
 
-def make_man_pc(num_points=64,n_scene=1,device="cpu"):
+def make_man_pc(num_points=64,n_scene=1,device="cpu",is_dense=False):
     # B 128 128 pt 9.482Gi/15.992Gi
     import sys
     sys.path.append("/home/palakons/point_diffusion")
@@ -421,23 +421,41 @@ def make_man_pc(num_points=64,n_scene=1,device="cpu"):
     #     keep_frames=n_scene,
     #     point_preset="original",x_range=[0,50], y_range=[-50, 50], z_range=[-2, 2],
     # )[0]['filtered_radar_data'] for i in range(n_scene)], dim=0).to(device) # [B, N, 3]
-    ds = [MANDataset(
-        scene_ids=[i],
-        data_file="man-mini",
-        device=device,
-        wan_vae=True,
-        wan_vae_checkpoint="/checkpoints/huggingface_hub/models--Wan-AI--Wan2.2-T2V-A14B/Wan2.1_VAE.pth",
-        n_p=num_points,
-        normalize_type="minmax",
-        get_camera=False,
-        keep_frames=1,
-        point_preset="original",x_range=[0,50], y_range=[-50, 50], z_range=[-2, 2],
-    ) for i in range(n_scene)]
-    x0sbn3 = torch.stack([data[0]['filtered_radar_data'] for data in ds], dim=0).to(device) # [B, N, 3]
-    wan_cond = torch.stack([data[0]['wan_vae_latent'] for data in ds], dim=0).to(device) # [B, latent_dim] 
+    if is_dense:
+        ds = MANDataset(
+            scene_ids=[],
+            data_file="man-mini",
+            device=device,
+            wan_vae=True,
+            wan_vae_checkpoint="/checkpoints/huggingface_hub/models--Wan-AI--Wan2.2-T2V-A14B/Wan2.1_VAE.pth",
+            n_p=num_points,
+            normalize_type="minmax",
+            get_camera=False,
+            keep_frames=n_scene,
+            point_preset="original",x_range=[0,50], y_range=[-50, 50], z_range=[-2, 2],
+        )
+        x0sbn3 = torch.stack([ds[i]['filtered_radar_data'] for i in range(n_scene)], dim=0).to(device) # [B, N, 3]
+        wan_cond = torch.stack([ds[i]['wan_vae_latent'] for i in range(n_scene)], dim=0).to(device) # [B, latent_dim]
+        return x0sbn3, wan_cond
+    
+    else:
+        ds = [MANDataset(
+            scene_ids=[i],
+            data_file="man-mini",
+            device=device,
+            wan_vae=True,
+            wan_vae_checkpoint="/checkpoints/huggingface_hub/models--Wan-AI--Wan2.2-T2V-A14B/Wan2.1_VAE.pth",
+            n_p=num_points,
+            normalize_type="minmax",
+            get_camera=False,
+            keep_frames=1,
+            point_preset="original",x_range=[0,50], y_range=[-50, 50], z_range=[-2, 2],
+        ) for i in range(n_scene)]
+        x0sbn3 = torch.stack([data[0]['filtered_radar_data'] for data in ds], dim=0).to(device) # [B, N, 3]
+        wan_cond = torch.stack([data[0]['wan_vae_latent'] for data in ds], dim=0).to(device) # [B, latent_dim] 
 
-    # print(f"shapes x0sbn3: {x0sbn3.shape}, wan_cond: {wan_cond.shape}") #shapes x0sbn3: torch.Size([B, 128, 3]), wan_cond: torch.Size([B, 16, 2, 60, 104])
-    return x0sbn3, wan_cond
+        # print(f"shapes x0sbn3: {x0sbn3.shape}, wan_cond: {wan_cond.shape}") #shapes x0sbn3: torch.Size([B, 128, 3]), wan_cond: torch.Size([B, 16, 2, 60, 104])
+        return x0sbn3, wan_cond
 def make_various_pc(num_points=64, device="cpu",n_shapes=7):
     theta = torch.linspace(0, math.pi / 2, num_points)
     x = torch.cos(theta)
@@ -741,13 +759,17 @@ if __name__ == "__main__":
     cond_method = args.cond_method  
     scene_embed_dim = 0 if args.cond_mode == "none" else (1 if cond_method == "scene_id" else 199680)
 
-    if cond_mode  =='wan' and shape_name != "realman":
+    if cond_mode  =='wan' and not shape_name.startswith("realman"):
         raise ValueError(f"cond_mode 'wan' is only compatible with shape_name 'realman' since it relies on Wan's VAE latent. Got shape_name: {shape_name}")
 
     if shape_name == "various":
         x0sbn3 = make_various_pc(num_points=N, device=device,n_shapes=n_scene)  # [B,N, 3]
     elif shape_name == "realman":
         x0sbn3,wan_cond = make_man_pc(num_points=N, n_scene=n_scene)  # [B,N, 3]
+        x0sbn3 = x0sbn3.to(device)
+        wan_cond = wan_cond.to(device)
+    elif shape_name == "realman_dense":
+        x0sbn3,wan_cond = make_man_pc(num_points=N, n_scene=n_scene,is_dense=True)  # [B,N, 3]
         x0sbn3 = x0sbn3.to(device)
         wan_cond = wan_cond.to(device)
     else:
@@ -872,7 +894,7 @@ if __name__ == "__main__":
         plot_pc_batch(pred, None, title=f"Interpolation Test {model_name} {shape_name} N:{N} T:{T} Inf:{T_infer} B:{B}", fname=f"{temp_dir}/../sample/interpolation_test.png",azm = 45, elev=30, batch_titles=btitles)
 
     elif args.mode == "eval":
-        assert shape_name == "realman", f"Evaluation test is designed for 'realman' shape_name with multiple scenes to show effect of conditioning. Got shape_name: {shape_name}"
+        assert shape_name.startswith("realman"), f"Evaluation test is designed for 'realman' shape_name with multiple scenes to show effect of conditioning. Got shape_name: {shape_name}"
         assert cond_method  =="wan" , f"Evaluation test is designed for 'wan' conditioning method to use Wan's VAE latent for conditioning. Got cond_method: {cond_method}"
         '''get 1 more than n_scene samples, 
         sampel the model with each condition, plot will show CD, the frist n_scene samples should have low CD, the last one should have high CD if the model is learning the conditioning correctly
