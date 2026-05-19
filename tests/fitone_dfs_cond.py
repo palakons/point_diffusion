@@ -432,11 +432,12 @@ def make_man_pc(num_points=64,n_scene=1,device="cpu",is_dense=False):
             normalize_type="minmax",
             get_camera=False,
             keep_frames=n_scene,
-            point_preset="original",x_range=[0,50], y_range=[-50, 50], z_range=[-2, 2],
+                point_preset="original",x_range=[0,50], y_range=[-50, 50], z_range=[-2, 2],
+                wan_preprocess_dir="/data/palakons/man_wan_preprocessed"
         )
         x0sbn3 = torch.stack([ds[i]['filtered_radar_data'] for i in range(n_scene)], dim=0).to(device) # [B, N, 3]
         wan_cond = torch.stack([ds[i]['wan_vae_latent'] for i in range(n_scene)], dim=0).to(device) # [B, latent_dim]
-        return x0sbn3, wan_cond
+        return x0sbn3, wan_cond,ds
     
     else:
         ds = [MANDataset(
@@ -450,12 +451,14 @@ def make_man_pc(num_points=64,n_scene=1,device="cpu",is_dense=False):
             get_camera=False,
             keep_frames=1,
             point_preset="original",x_range=[0,50], y_range=[-50, 50], z_range=[-2, 2],
+            wan_preprocess_dir="/data/palakons/man_wan_preprocessed"
         ) for i in range(n_scene)]
+        combined_ds = torch.utils.data.ConcatDataset(ds)
         x0sbn3 = torch.stack([data[0]['filtered_radar_data'] for data in ds], dim=0).to(device) # [B, N, 3]
         wan_cond = torch.stack([data[0]['wan_vae_latent'] for data in ds], dim=0).to(device) # [B, latent_dim] 
 
         # print(f"shapes x0sbn3: {x0sbn3.shape}, wan_cond: {wan_cond.shape}") #shapes x0sbn3: torch.Size([B, 128, 3]), wan_cond: torch.Size([B, 16, 2, 60, 104])
-        return x0sbn3, wan_cond
+        return x0sbn3, wan_cond, combined_ds
 def make_various_pc(num_points=64, device="cpu",n_shapes=7):
     theta = torch.linspace(0, math.pi / 2, num_points)
     x = torch.cos(theta)
@@ -765,11 +768,11 @@ if __name__ == "__main__":
     if shape_name == "various":
         x0sbn3 = make_various_pc(num_points=N, device=device,n_shapes=n_scene)  # [B,N, 3]
     elif shape_name == "realman":
-        x0sbn3,wan_cond = make_man_pc(num_points=N, n_scene=n_scene)  # [B,N, 3]
+        x0sbn3,wan_cond,dataset = make_man_pc(num_points=N, n_scene=n_scene,device=device)  # [B,N, 3]
         x0sbn3 = x0sbn3.to(device)
         wan_cond = wan_cond.to(device)
     elif shape_name == "realman_dense":
-        x0sbn3,wan_cond = make_man_pc(num_points=N, n_scene=n_scene,is_dense=True)  # [B,N, 3]
+        x0sbn3,wan_cond,dataset = make_man_pc(num_points=N, n_scene=n_scene,is_dense=True,device=device)  # [B,N, 3]
         x0sbn3 = x0sbn3.to(device)
         wan_cond = wan_cond.to(device)
     else:

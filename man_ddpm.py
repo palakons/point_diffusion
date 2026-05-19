@@ -208,7 +208,8 @@ class MANDataset(Dataset):
         get_bb=False,  # whether to get bounding box of radar points
         point_preset="uniform",  # "uniform" or "original", "l-shape"
         normalize_type="std",  # "std" or "minmax", if "std", return mean, std, if "minmax", return mean(min,max), range
-        x_range=None, y_range=None, z_range=None
+        x_range=None, y_range=None, z_range=None,
+        wan_preprocess_dir=None
     ):  # load all frames from scene_id, of data_file, particular radar and camera channel
         self.device = device
         self.data_file = data_file
@@ -244,6 +245,7 @@ class MANDataset(Dataset):
         self.x_range = x_range
         self.y_range = y_range
         self.z_range = z_range
+        self.wan_preprocess_dir = wan_preprocess_dir
 
         if self.wan_vae:
             print(f"Loading VAE...")
@@ -1365,65 +1367,75 @@ class MANDataset(Dataset):
             # print("minmax temp norm:", temp.min(), temp.max())
 
             # print("hw:", (h, w))
+            preprocessed_file_path = os.path.join( self.wan_preprocess_dir, cam["filename"].split("/")[-1].replace(".jpg", f"_preprocessed.pt") ) if self.wan_preprocess_dir is not None else None
+            # print("preprocessed_file_path:", preprocessed_file_path)
+            if self.wan_preprocess_dir is not None and os.path.exists(preprocessed_file_path):
+                # print(f"Loading preprocessed image from {preprocessed_file_path}")
+                wan_vae_latent = torch.load(preprocessed_file_path).to(self.device)
+            else:
+                image_rgb_path = os.path.join(self.data_root, cam["filename"])
+                img, _ = self.crop_and_scale_last2(
+                    TF.to_tensor(Image.open(image_rgb_path).convert("RGB"))
+                    .to(self.device)
+                    .float()
+                    .sub_(0.5)
+                    .div_(0.5),
+                    (h, w),
+                    self.roi,
+                    self.original_image_size,
+                )
+                #save iamge to /home/palakons/point_diffusion/output/sample/a.jpg
+                # Image.fromarray(                ((img.squeeze(0).cpu().numpy().transpose(1, 2, 0) * 0.5 + 0.5) * 255).astype(                    np.uint8                )            ).save("/home/palakons/point_diffusion/output/sample/a.jpg") 
+                img = img.unsqueeze(1)
+                # print("img size after crop and scale:", img.shape)
+                # print("minmax img before norm:", img.min(), img.max())
+                # video0 = torch.concat(
+                #     [
+                #         torch.nn.functional.interpolate(
+                #             TF.to_tensor(Image.open(image_rgb_path).convert("RGB"))
+                #             .sub_(0.5)
+                #             .div_(0.5)
+                #             .to(self.device)[None]
+                #             .cpu(),
+                #             size=(h, w),
+                #             mode="bicubic",
+                #         ).transpose(0, 1),
+                #     ]
+                #     * F,
+                #     dim=1,
+                # )  # F,3,h,w
+                # video0 = video0.to(self.device)
+                video0 = img.repeat(1, F, 1, 1)
 
-            image_rgb_path = os.path.join(self.data_root, cam["filename"])
-            img, _ = self.crop_and_scale_last2(
-                TF.to_tensor(Image.open(image_rgb_path).convert("RGB"))
-                .to(self.device)
-                .float()
-                .sub_(0.5)
-                .div_(0.5),
-                (h, w),
-                self.roi,
-                self.original_image_size,
-            )
-            img = img.unsqueeze(1)
-            # print("img size after crop and scale:", img.shape)
-            # print("minmax img before norm:", img.min(), img.max())
-            # video0 = torch.concat(
-            #     [
-            #         torch.nn.functional.interpolate(
-            #             TF.to_tensor(Image.open(image_rgb_path).convert("RGB"))
-            #             .sub_(0.5)
-            #             .div_(0.5)
-            #             .to(self.device)[None]
-            #             .cpu(),
-            #             size=(h, w),
-            #             mode="bicubic",
-            #         ).transpose(0, 1),
-            #     ]
-            #     * F,
-            #     dim=1,
-            # )  # F,3,h,w
-            # video0 = video0.to(self.device)
-            video0 = img.repeat(1, F, 1, 1)
+                # temp shape: torch.Size([3, 1, 480, 832])
+                # min max temp before norm: tensor(0.) tensor(1.)
+                # minmax temp norm: tensor(-1.1611) tensor(1.1844)
+                # hw: (480, 832)
+                # img size after crop and scale: torch.Size([3, 1, 480, 832])
+                # minmax img before norm: tensor(-0.4431, device='cuda:0') tensor(0.2272, device='cuda:0')
+                # video shape: torch.Size([3, 5, 480, 832])
+                # video0 shape before to device: torch.Size([3, 5, 480, 832])
 
-            # temp shape: torch.Size([3, 1, 480, 832])
-            # min max temp before norm: tensor(0.) tensor(1.)
-            # minmax temp norm: tensor(-1.1611) tensor(1.1844)
-            # hw: (480, 832)
-            # img size after crop and scale: torch.Size([3, 1, 480, 832])
-            # minmax img before norm: tensor(-0.4431, device='cuda:0') tensor(0.2272, device='cuda:0')
-            # video shape: torch.Size([3, 5, 480, 832])
-            # video0 shape before to device: torch.Size([3, 5, 480, 832])
+                videos = video0.unsqueeze(0)  # add batch dim
 
-            videos = video0.unsqueeze(0)  # add batch dim
+                # save_dir = "/home/palakons/from_scratch/output"
+                # # save eachf frame in videos
+                # for fi in range(video0.shape[1]):
+                #     vframe = video0[:, fi, :, :].unsqueeze(0)
+                #     vframe = (vframe * 0.5 + 0.5).clamp(0, 1)
+                #     vframe_pil = TF.to_pil_image(vframe.squeeze().cpu())
+                #     vframe_pil.save(
+                #         os.path.join(
+                #             save_dir,
+                #             f"{frame_token}_{self.camera_channel.replace('CAMERA_','')}_wanvae_frame{fi}.png",
+                #         )
+                #     )
+                # verified 29-jan-26
 
-            # save_dir = "/home/palakons/from_scratch/output"
-            # # save eachf frame in videos
-            # for fi in range(video0.shape[1]):
-            #     vframe = video0[:, fi, :, :].unsqueeze(0)
-            #     vframe = (vframe * 0.5 + 0.5).clamp(0, 1)
-            #     vframe_pil = TF.to_pil_image(vframe.squeeze().cpu())
-            #     vframe_pil.save(
-            #         os.path.join(
-            #             save_dir,
-            #             f"{frame_token}_{self.camera_channel.replace('CAMERA_','')}_wanvae_frame{fi}.png",
-            #         )
-            #     )
-            # verified 29-jan-26
-
-            wan_vae_latent = self.vae21.encode(videos)[0]
+                wan_vae_latent = self.vae21.encode(videos.to(self.device))[0]
+                if self.wan_preprocess_dir is not None:
+                    torch.save(wan_vae_latent.cpu(), preprocessed_file_path)
+                    print(f"Saved preprocessed image to {preprocessed_file_path}")
         time_115 = time.time()
         # 5) filter points
         # print("camera_front.shape", camera_front.shape) #[3, 943, 1980])
@@ -1514,7 +1526,7 @@ class MANDataset(Dataset):
             "load camera": time_8 - time_7,
             "upscale depth": time_9 - time_8,
             "calib transform": time_11 - time_10,
-            "filter points": time_12 - time_11,
+            "wan": time_12 - time_11,
             "visualization": time_14 - time_13,
             "final padding": time_15 - time_14,
         }
@@ -1522,7 +1534,7 @@ class MANDataset(Dataset):
         # print time percentages
         # for k, v in time_diff.items():
         #     print(f"{k}: {v/total_time*100:.2f}%")
-
+        
         output = {
             "filtered_radar_data": output_filtered_radar_data,
             "uvz": output_uvz,
