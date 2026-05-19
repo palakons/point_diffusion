@@ -2867,6 +2867,12 @@ def parse_args():
         action="store_true",
         help="Whether to clip DDPM samples to valid range.",
     )
+    parser.add_argument(
+        "--ddpm_fixed_timestep",
+        type=int,
+        default=-1,
+        help="If >= 0, use a fixed timestep for DDPM sampling during training for consistency.",
+    )
     # exp_name
     parser.add_argument(
         "--exp_name",
@@ -3009,19 +3015,28 @@ def parse_args():
         "--ptv3_backbone",
         type=str,
         default="full",
-        choices=["simple", "full"],
+        choices=["simple", "full",  "full-nodrop", "simpler"    ],
         help="PTv3 backbone type: 'simple' (no pooling, 1 layer) or 'full' (hierarchical U-Net).",
     )
     parser.add_argument(
-        "--uniform_points",
-        action="store_true",
-        help="Whether to use uniform sampling of points instead of importance sampling based on RCS for training the autoencoder, which can improve generalization to far-range points.",
+        "--ptv3_param_multiplier",
+        type=float,
+        default=1.0,
+        help="Multiplier for number of parameters in Point Transformer V3 autoencoder. This scales the depth, channel width, and number of attention heads in the model to create smaller or larger variants."
+    )
+    parser.add_argument(
+        "--point_preset",
+        type=str,
+        default="uniform",
+        choices=["uniform", "original", "l-shape"],
+        help="Type of point preset to use for training: 'uniform', 'original', or 'l-shape'.",
     )
     parser.add_argument(
         "--denoiser_model",
         type=str,
         default="ptv3",
-        help="Architecture for DiT denoiser model: 'pointnet' or 'pointnext'.",
+        choices=["ptv3", "simple_unet", "minimal"],
+        help="Architecture for the point-cloud denoiser. Default is 'ptv3' for backward compatibility; 'simple_unet' and 'minimal' are lightweight alternatives.",
     )
     parser.add_argument(
         "--man_normalize_type",
@@ -3029,6 +3044,43 @@ def parse_args():
         default="std",
         help="Normalization type for MAN dataset: 'std', or 'minmax'",
     )
+    parser.add_argument(
+        "--man_data_x_range_filtering",
+        type=float,
+        nargs=2,
+        default=[0.0, 500.0],
+        help="X range for filtering MAN dataset during preprocessing.",
+    )   
+    parser.add_argument(
+        "--man_data_y_range_filtering",
+        type=float,
+        nargs=2,    
+        default=[-500.0, 500.0],
+        help="Y range for filtering MAN dataset during preprocessing.",
+    )
+    parser.add_argument(
+        "--man_data_z_range_filtering",
+        type=float,
+        nargs=2,
+        default=[-20,20.0],
+        help="Z range for filtering MAN dataset during preprocessing.",
+    )
+
+    parser.add_argument(
+        "--ptv3_time_conditioning_mode",
+        type=str,
+        default="pdnorm_only",
+        choices=["pdnorm_only", "feat_add", "hybrid", "feat_concat", "no_time"],
+        help="How to inject time embeddings into PTv3Dnsr: 'pdnorm_only' (default, backward-compatible), 'feat_add' (project time and add to features), 'hybrid' (both PDNorm and feat_add), 'feat_concat' (concatenate time to features, non-backward-compatible), 'no_time' (do not inject timestep anywhere).",
+    )
+
+    parser.add_argument(
+        "--ptv3_project_coord_dim",
+        type=int,
+        default=0,
+        help="Optional: project 3D coordinates to this dimension using a Linear layer (e.g., 32, 64). If 0, use raw coordinates.",
+    )
+
     return parser.parse_args()
 
 
@@ -3086,27 +3138,96 @@ def query_gpu_stats(gpu_index: int = 0) -> Optional[Dict[str, float]]:
     Returns dict with utilization.gpu (%), power.draw (W), memory.used (MiB), memory.total (MiB)
     using nvidia-smi. Returns None if nvidia-smi is unavailable.
     """
+    # Prefer NVML (pynvml) which reports driver-level stats and allows
+    # mapping CUDA_VISIBLE_DEVICES -> physical device index when necessary.
     try:
-        cmd = [
-            "nvidia-smi",
-            f"--id={gpu_index}",
-            "--query-gpu=utilization.gpu,power.draw,memory.used,memory.total",
-            "--format=csv,noheader,nounits",
-        ]
-        out = subprocess.check_output(cmd, text=True).strip()
-        if not out:
-            return None
-        util_str, power_str, mem_used_str, mem_total_str = [
-            x.strip() for x in out.split(",")
-        ]
-        return {
-            "util_gpu": float(util_str),
-            "power_w": float(power_str),
-            "mem_used_mib": float(mem_used_str),
-            "mem_total_mib": float(mem_total_str),
-        }
+        import os
+        try:
+            from pynvml import (
+                nvmlInit,
+                nvmlShutdown,
+                nvmlDeviceGetCount,
+                nvmlDeviceGetHandleByIndex,
+                nvmlDeviceGetUtilizationRates,
+                nvmlDeviceGetPowerUsage,
+                nvmlDeviceGetMemoryInfo,
+                nvmlDeviceGetUUID,
+            )
+
+            nvmlInit()
+            try:
+                count = nvmlDeviceGetCount()
+
+                # Map visible GPU index (as seen by CUDA via CUDA_VISIBLE_DEVICES)
+                # to physical NVML index when CUDA_VISIBLE_DEVICES is set.
+                cuda_vis = os.environ.get("CUDA_VISIBLE_DEVICES")
+                physical_index = gpu_index
+                if cuda_vis:
+                    entries = [e.strip() for e in cuda_vis.split(",") if e.strip() != ""]
+                    if 0 <= gpu_index < len(entries):
+                        mapped = entries[gpu_index]
+                        # if mapping is an integer index, use it
+                        try:
+                            physical_index = int(mapped)
+                        except Exception:
+                            # otherwise try to match by UUID prefix
+                            for idx in range(count):
+                                h = nvmlDeviceGetHandleByIndex(idx)
+                                try:
+                                    uuid = nvmlDeviceGetUUID(h)
+                                    if isinstance(uuid, bytes):
+                                        uuid = uuid.decode()
+                                except Exception:
+                                    uuid = None
+                                if uuid and (mapped in uuid or uuid in mapped):
+                                    physical_index = idx
+                                    break
+
+                # clamp physical_index
+                physical_index = max(0, min(physical_index, count - 1))
+
+                handle = nvmlDeviceGetHandleByIndex(physical_index)
+                util = nvmlDeviceGetUtilizationRates(handle)
+                mem = nvmlDeviceGetMemoryInfo(handle)
+                # nvmlDeviceGetPowerUsage returns milliwatts
+                try:
+                    power_mw = nvmlDeviceGetPowerUsage(handle)
+                    power_w = float(power_mw) / 1000.0
+                except Exception:
+                    power_w = float("nan")
+
+                return {
+                    "util_gpu": float(getattr(util, "gpu", getattr(util, "gpuUtil", 0))),
+                    "power_w": power_w,
+                    "mem_used_mib": float(mem.used) / (1024 * 1024),
+                    "mem_total_mib": float(mem.total) / (1024 * 1024),
+                }
+            finally:
+                try:
+                    nvmlShutdown()
+                except Exception:
+                    pass
+        except Exception:
+            # If pynvml is not available or fails, fall back to nvidia-smi CLI
+            cmd = [
+                "nvidia-smi",
+                f"--id={gpu_index}",
+                "--query-gpu=utilization.gpu,power.draw,memory.used,memory.total",
+                "--format=csv,noheader,nounits",
+            ]
+            out = subprocess.check_output(cmd, text=True).strip()
+            if not out:
+                return None
+            util_str, power_str, mem_used_str, mem_total_str = [x.strip() for x in out.split(",")]
+            return {
+                "util_gpu": float(util_str),
+                "power_w": float(power_str),
+                "mem_used_mib": float(mem_used_str),
+                "mem_total_mib": float(mem_total_str),
+            }
     except Exception as e:
-        print("Could not query GPU stats via nvidia-smi.", e)  # noqa: T201
+        # best effort: report and return None
+        print("Could not query GPU stats via NVML/nvidia-smi.", e)  # noqa: T201
         return None
 
 
@@ -3187,8 +3308,12 @@ def makeDataset(
         viz_dir=plot_dir,
         grid_binary_range=config["grid_binary_range"],  # "0-1" or "neg1-1"
         keep_frames=config["num_input_frames"],
-        uniform_points=config["uniform_points"],
+        point_preset=config["point_preset"],
         normalize_type=config["man_normalize_type"],
+        
+        x_range=config["man_data_x_range_filtering"],
+        y_range=config["man_data_y_range_filtering"],
+        z_range=config["man_data_z_range_filtering"],
     )
     assert (
         len(dataset) == config["num_input_frames"]

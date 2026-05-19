@@ -86,6 +86,47 @@ class SimplePerspectiveCamera:
 
         return uvz, camera_points
 
+def make_dummy_lshape(n_p, device):
+    # We will build up to n_p points by concatenating simple segments.
+    # First make a 32-point prototype; if n_p differs, resample crudely.
+
+    n1 = max(8, int(n_p * 0.50))   # horizontal arm
+    n2 = max(6, int(n_p * 0.30))   # vertical arm
+    n3 = max(4, n_p - n1 - n2)     # elevated short arm
+
+    # horizontal arm: x in [-1, 1], y=0, z=0
+    x1 = torch.linspace(-1.0, 1.0, n1, device=device)
+    y1 = torch.zeros(n1, device=device)
+    z1 = torch.zeros(n1, device=device)
+    arm1 = torch.stack([x1, y1, z1], dim=1)
+
+    # vertical arm: x=0, y in [0, 1], z=0
+    x2 = torch.zeros(n2, device=device)
+    y2 = torch.linspace(0.0, 1.0, n2, device=device)
+    z2 = torch.zeros(n2, device=device)
+    arm2 = torch.stack([x2, y2, z2], dim=1)
+
+    # elevated short arm: x=0.4, y in [0, 0.6], z=0.5
+    x3 = torch.full((n3,), 0.4, device=device)
+    y3 = torch.linspace(0.0, 0.6, n3, device=device)
+    z3 = torch.full((n3,), 0.5, device=device)
+    arm3 = torch.stack([x3, y3, z3], dim=1)
+
+    pts = torch.cat([arm1, arm2, arm3], dim=0)
+
+    # exact length safety
+    if pts.shape[0] > n_p:
+        pts = pts[:n_p]
+    elif pts.shape[0] < n_p:
+        # pad by repeating last point if ever needed
+        pad = pts[-1:].repeat(n_p - pts.shape[0], 1)
+        pts = torch.cat([pts, pad], dim=0)
+
+    # center and scale to roughly [-1, 1]
+    pts = pts - pts.mean(dim=0, keepdim=True)
+    pts = pts / pts.abs().max()
+
+    return pts
 
 def chamfer_distance(pred_uvz, gt_uvz, device):
     # convert to tensor
@@ -165,8 +206,9 @@ class MANDataset(Dataset):
         grid_binary_range: str = "0-1",  # "0-1" or "neg1-1"
         keep_frames=0,
         get_bb=False,  # whether to get bounding box of radar points
-        uniform_points=False,  # whether to assign radar points to uniform grid and only keep one point in each grid cell, if multiple points in one grid cell, keep the one with highest rcs
+        point_preset="uniform",  # "uniform" or "original", "l-shape"
         normalize_type="std",  # "std" or "minmax", if "std", return mean, std, if "minmax", return mean(min,max), range
+        x_range=None, y_range=None, z_range=None
     ):  # load all frames from scene_id, of data_file, particular radar and camera channel
         self.device = device
         self.data_file = data_file
@@ -197,8 +239,11 @@ class MANDataset(Dataset):
         self.get_depth = get_depth
         self.get_occ_grid = get_occ_grid
         self.get_camera = get_camera
-        self.uniform_points = uniform_points
+        self.point_preset = point_preset
         self.normalize_type = normalize_type
+        self.x_range = x_range
+        self.y_range = y_range
+        self.z_range = z_range
 
         if self.wan_vae:
             print(f"Loading VAE...")
@@ -255,7 +300,7 @@ class MANDataset(Dataset):
             ):
                 loaded_data = self.load_data(trucksc, frame_token, self.get_bb)
                 if (
-                    self.uniform_points
+                    self.point_preset == "uniform"
                 ):  # assign grid of x [0-200] y [-100, 100] z [-20, 20] to radar points, and only keep one point in each grid cell, if multiple points in one grid cell, keep the one with highest rcs
                     # mesh grid
                     n_point_axis = int(self.n_p ** (1 / 3)) + 1
@@ -282,6 +327,8 @@ class MANDataset(Dataset):
                     loaded_data["filtered_radar_data"] = torch.tensor(
                         points, dtype=torch.float32, device=self.device
                     )
+                elif self.point_preset == "l-shape":  
+                    loaded_data["filtered_radar_data"] = make_dummy_lshape(self.n_p, device=self.device)
 
                 self.data_bank.append(
                     {
@@ -869,7 +916,9 @@ class MANDataset(Dataset):
 
         # --- map ROI into x index space ---
         H0, W0 = original_size_hw
-
+        if roi is None:
+            roi = (0, H0, 0, W0)    
+        
         min_v, max_v, min_u, max_u = roi
         h0 = int(min_v * in_h / H0)
         h1 = int(max_v * in_h / H0)
@@ -1271,11 +1320,22 @@ class MANDataset(Dataset):
                     self.original_image_size == camera_front.shape[1:]
                 ), "All images must have the same size"
         time_10 = time.time()
-        points_in_radar_view = radar_data_all[:, :3].clone().detach().float()
+        # points_in_radar_view = radar_data_all[:, :3].clone().detach().float()
         rcs = radar_data_all[:, 6:7].clone().detach().float()
 
+        radar_data_all_filter_distance = radar_data_all[:, :3].clone().detach().float()
+        #masking point with x, y and z in self.x_range, self.y_range and self.z_range
+        for i,axs in enumerate([self.x_range, self.y_range, self.z_range]):
+            if axs is not None:
+                assert len(axs) == 2 and axs[0] < axs[1], "Range should be a tuple of (min, max) with min < max"
+                radar_data_all_filter_distance = radar_data_all_filter_distance[
+                    (radar_data_all_filter_distance[:, i] >= axs[0])
+                    & (radar_data_all_filter_distance[:, i] <= axs[1])
+                ]
+        n_points_after_distance_filter = radar_data_all_filter_distance.shape[0]
+
         image_coord, camera_view_points = cam_calib_obj.transform_points(
-            points_in_radar_view
+            radar_data_all_filter_distance
         )
         points_uvz = image_coord[:, :3]  # N x3
         time_11 = time.time()
@@ -1306,6 +1366,7 @@ class MANDataset(Dataset):
 
             # print("hw:", (h, w))
 
+            image_rgb_path = os.path.join(self.data_root, cam["filename"])
             img, _ = self.crop_and_scale_last2(
                 TF.to_tensor(Image.open(image_rgb_path).convert("RGB"))
                 .to(self.device)
@@ -1377,7 +1438,9 @@ class MANDataset(Dataset):
             & (points_uvz[:, 2] > 0)  # Ensure points are in front of the camera
         )
         time_12 = time.time()
-        filtered_radar_data = radar_data_all[mask]
+        filtered_radar_data = radar_data_all_filter_distance[mask]
+
+
         npoints_filtered = filtered_radar_data.shape[0]
 
         rcs = filtered_radar_data[:, 6:7]
@@ -1465,6 +1528,7 @@ class MANDataset(Dataset):
             "uvz": output_uvz,
             "frame_token": frame_token,
             "npoints_original": npoints_original,
+            "npoints_after_distance_filter": n_points_after_distance_filter,
             "npoints_filtered": npoints_filtered,
         }
         if self.wan_vae:
