@@ -245,7 +245,9 @@ class MANDataset(Dataset):
         self.x_range = x_range
         self.y_range = y_range
         self.z_range = z_range
-        self.wan_preprocess_dir = wan_preprocess_dir
+        self.wan_preprocess_dir = os.path.join(wan_preprocess_dir,self.data_file) if wan_preprocess_dir is not None else None
+        if self.wan_preprocess_dir is not None:
+            os.makedirs(self.wan_preprocess_dir, exist_ok=True)
 
         if self.wan_vae:
             print(f"Loading VAE...")
@@ -301,44 +303,45 @@ class MANDataset(Dataset):
                 len(self.data_bank) < self.keep_frames or self.keep_frames == 0
             ):
                 loaded_data = self.load_data(trucksc, frame_token, self.get_bb)
-                if (
-                    self.point_preset == "uniform"
-                ):  # assign grid of x [0-200] y [-100, 100] z [-20, 20] to radar points, and only keep one point in each grid cell, if multiple points in one grid cell, keep the one with highest rcs
-                    # mesh grid
-                    n_point_axis = int(self.n_p ** (1 / 3)) + 1
-                    x = np.linspace(0, 200, n_point_axis)
-                    y = np.linspace(-100, 100, n_point_axis)
-                    z = np.linspace(-20, 20, n_point_axis)
-                    xx, yy, zz = np.meshgrid(x, y, z)
-                    # reassign xx,yy zz to  loaded_data["filtered_radar_data"]
-                    points = []
-                    for i in range(self.n_p):
-                        points.append(
-                            [
-                                0 + xx.flatten()[i],
-                                -100 + yy.flatten()[i],
-                                -20 + zz.flatten()[i],
-                            ]
+                if loaded_data is not None:
+                    if (
+                        self.point_preset == "uniform"
+                    ):  # assign grid of x [0-200] y [-100, 100] z [-20, 20] to radar points, and only keep one point in each grid cell, if multiple points in one grid cell, keep the one with highest rcs
+                        # mesh grid
+                        n_point_axis = int(self.n_p ** (1 / 3)) + 1
+                        x = np.linspace(0, 200, n_point_axis)
+                        y = np.linspace(-100, 100, n_point_axis)
+                        z = np.linspace(-20, 20, n_point_axis)
+                        xx, yy, zz = np.meshgrid(x, y, z)
+                        # reassign xx,yy zz to  loaded_data["filtered_radar_data"]
+                        points = []
+                        for i in range(self.n_p):
+                            points.append(
+                                [
+                                    0 + xx.flatten()[i],
+                                    -100 + yy.flatten()[i],
+                                    -20 + zz.flatten()[i],
+                                ]
+                            )
+                        assert (
+                            len(points) == self.n_p
+                        ), f"n_p is too large, please reduce n_p to less than {len(points)}"
+                        assert len(points) == len(
+                            loaded_data["filtered_radar_data"]
+                        ), f"n_p is too large, please reduce n_p to less than {len(points)}"
+                        loaded_data["filtered_radar_data"] = torch.tensor(
+                            points, dtype=torch.float32, device=self.device
                         )
-                    assert (
-                        len(points) == self.n_p
-                    ), f"n_p is too large, please reduce n_p to less than {len(points)}"
-                    assert len(points) == len(
-                        loaded_data["filtered_radar_data"]
-                    ), f"n_p is too large, please reduce n_p to less than {len(points)}"
-                    loaded_data["filtered_radar_data"] = torch.tensor(
-                        points, dtype=torch.float32, device=self.device
-                    )
-                elif self.point_preset == "l-shape":  
-                    loaded_data["filtered_radar_data"] = make_dummy_lshape(self.n_p, device=self.device)
+                    elif self.point_preset == "l-shape":  
+                        loaded_data["filtered_radar_data"] = make_dummy_lshape(self.n_p, device=self.device)
 
-                self.data_bank.append(
-                    {
-                        **loaded_data,
-                        "scene_id": scene_id,
-                        "frame_index": pbar.n,
-                    }
-                )
+                    self.data_bank.append(
+                        {
+                            **loaded_data,
+                            "scene_id": scene_id,
+                            "frame_index": pbar.n,
+                        }
+                    )
                 # print("loaded", i, "frame_token", frame_token)
                 frame_token = trucksc.get("sample", frame_token)["next"]
                 pbar.update(1)
@@ -1323,21 +1326,25 @@ class MANDataset(Dataset):
                 ), "All images must have the same size"
         time_10 = time.time()
         # points_in_radar_view = radar_data_all[:, :3].clone().detach().float()
-        rcs = radar_data_all[:, 6:7].clone().detach().float()
+        # rcs = radar_data_all[:, 6:7].clone().detach().float()
+        # doppler = radar_data_all[:, 3:6].clone().detach().float()
 
-        radar_data_all_filter_distance = radar_data_all[:, :3].clone().detach().float()
+        # print(f"shapes {radar_data_all.shape} {rcs.shape} {doppler.shape}")
+        # radar_data_all_filter_distance = radar_data_all[:, :3].clone().detach().float()
+        radar_data_all_filter = radar_data_all.clone().detach().float()
         #masking point with x, y and z in self.x_range, self.y_range and self.z_range
         for i,axs in enumerate([self.x_range, self.y_range, self.z_range]):
             if axs is not None:
                 assert len(axs) == 2 and axs[0] < axs[1], "Range should be a tuple of (min, max) with min < max"
-                radar_data_all_filter_distance = radar_data_all_filter_distance[
-                    (radar_data_all_filter_distance[:, i] >= axs[0])
-                    & (radar_data_all_filter_distance[:, i] <= axs[1])
+                radar_data_all_filter = radar_data_all_filter[
+                    (radar_data_all_filter[:, i] >= axs[0])
+                    & (radar_data_all_filter[:, i] <= axs[1])
                 ]
-        n_points_after_distance_filter = radar_data_all_filter_distance.shape[0]
+        # print(f"shapes {radar_data_all_filter_distance.shape} {rcs.shape} {doppler.shape}")
+        n_points_after_distance_filter = radar_data_all_filter.shape[0]
 
         image_coord, camera_view_points = cam_calib_obj.transform_points(
-            radar_data_all_filter_distance
+            radar_data_all_filter[:,:3]# x y z
         )
         points_uvz = image_coord[:, :3]  # N x3
         time_11 = time.time()
@@ -1450,12 +1457,11 @@ class MANDataset(Dataset):
             & (points_uvz[:, 2] > 0)  # Ensure points are in front of the camera
         )
         time_12 = time.time()
-        filtered_radar_data = radar_data_all_filter_distance[mask]
-
+        filtered_radar_data = radar_data_all_filter[mask]
 
         npoints_filtered = filtered_radar_data.shape[0]
 
-        rcs = filtered_radar_data[:, 6:7]
+        # print(f"shapes {filtered_radar_data.shape} {filtered_rcs.shape} {filtered_doppler.shape}")
 
         if self.coord_only:
             filtered_radar_data = filtered_radar_data[:, :3]
@@ -1499,7 +1505,8 @@ class MANDataset(Dataset):
         # 6) keep or padding radar points to fixed number, self.n_p
         output_filtered_radar_data = filtered_radar_data
         output_uvz = points_uvz[mask]
-
+        if output_uvz.shape[0] == 0:
+            return None  # skip this frame if no radar points are left after filtering
         assert (
             output_filtered_radar_data.shape[0] == output_uvz.shape[0]
         ), "Filtered radar data and UVZ points must have the same number of points"

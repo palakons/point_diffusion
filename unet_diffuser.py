@@ -251,7 +251,7 @@ class MLPDenoiser(nn.Module):
         # optional coord projector
         if coord_projector_dim and coord_projector_dim > 0:
             self.coord_projector = nn.Sequential(
-                nn.Linear(3, coord_projector_dim),
+                nn.Linear(in_channels, coord_projector_dim),
                 nn.GELU(),
                 nn.Linear(coord_projector_dim, coord_projector_dim),
             )
@@ -1350,7 +1350,7 @@ class PTv3Dnsr(nn.Module):
         # --- FIX: Ensure coordinates are not interleaved ---
         # Transpose (B, 3, N) -> (B, N, 3) so that flatten gives (x, y, z) rows
         x_pts = x.transpose(1, 2).contiguous()
-        coord = x_pts.reshape(-1, 3).to(device)
+        coord = x_pts[:,:, :3].reshape(-1, 3).to(device)
 
         # Use provided condition if available, otherwise fallback to default
         ptv3_condition = "DDPM"
