@@ -3,3 +3,11 @@
 *.csv
 *.png
 /plots
+*.gif
+*.log
+*.zip
+*.tar.gz
+*.ipynb_checkpoints
+*.pt
+*.pth
+*.h5

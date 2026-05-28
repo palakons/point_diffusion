@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math, os
 from tqdm import tqdm, trange
+import numpy as np
 
 
 
@@ -618,6 +619,20 @@ def make_man_pc(
             wan_preprocess_dir="/data/palakons/man_wan_preprocessed",
             coord_only=False
         )
+
+        # print(f"keys in man dataset item: {ds[0].keys()}")  # keys
+        npoints_originals =[ds[i]['npoints_original'] for i in range(n_scene)]
+        npoints_after_distance_filter = [ds[i]['npoints_after_distance_filter'] for i in range(n_scene)]
+        npoints_filtereds = [ds[i]['npoints_filtered'] for i in range(n_scene)]
+        # print(f"n point npoints_original {ds[0]['npoints_original']}, npoints_after_distance_filter: {ds[0]['npoints_after_distance_filter']}, npoints_filtered: {ds[0]['npoints_filtered']}")  #n point npoints_original 800, npoints_after_distance_filter: 185, npoints_filtered: 135
+        #print min max mean
+        print(f"npoints_originals: min {min(npoints_originals)}, max {max(npoints_originals)}, mean {sum(npoints_originals)/len(npoints_originals)}")
+        print(f"npoints_after_distance_filter: min {min(npoints_after_distance_filter)}, max {max(npoints_after_distance_filter)}, mean {sum(npoints_after_distance_filter)/len(npoints_after_distance_filter)}")
+        print(f"npoints_filtereds: min {min(npoints_filtereds)}, max {max(npoints_filtereds)}, mean {sum(npoints_filtereds)/len(npoints_filtereds)}")
+        # npoints_originals: min 173, max 800, mean 644.32
+        # npoints_after_distance_filter: min 81, max 273, mean 179.62
+        # npoints_filtereds: min 58, max 221, mean 136.66
+        # exit()
         x0sbn3 = torch.stack(
             [ds[i]["filtered_radar_data"] for i in range(n_scene)], dim=0
         ).to(
@@ -761,6 +776,10 @@ def make_various_pc(num_points=64, device="cpu", n_shapes=7):
     data = dataset[0]
     shape_man = data["filtered_radar_data"]
 
+
+    torch.manual_seed(42)
+    random_shape = torch.rand(num_points, 3) * 2 - 1  # random shape in [-1,1]
+
     data = torch.stack(
         [
             shape_spiral,
@@ -768,12 +787,16 @@ def make_various_pc(num_points=64, device="cpu", n_shapes=7):
             shape_oval,
             shape_metaball,
             shape_wedge,
+            random_shape,
             shape_boxside,
             shape_man,
         ],
         dim=0,
     ).to(device)
-
+    print(f"old shape before adding extra features: {data.shape}") # should be [7, num_points, 3]
+    #attached 2 2 tot he last dim, random data, to test conditioning on extra features
+    torch.manual_seed(42) #this ensure the random features are the same across runs for consistency
+    data = torch.cat([data, torch.rand_like(data[:,:,:2])], dim=-1)
     print(
         "Created various shapes point cloud with shape: ",
         data.shape,
@@ -783,10 +806,11 @@ def make_various_pc(num_points=64, device="cpu", n_shapes=7):
         num_points,
         " points per shape",
     )
-    # normalize each shape, subrtact mean, devide by max distance from mean
-    data = data - data.mean(dim=[1], keepdim=True)
-    # print("center : ", data.mean(dim=[1], keepdim=True)) # shape
-    data = data / data.abs().max(dim=1, keepdim=True)[0].max(dim=2, keepdim=True)[0]
+    if False:  #will be normed outside
+        # normalize each shape, subrtact mean, devide by max distance from mean
+        data = data - data.mean(dim=[1], keepdim=True)
+        # print("center : ", data.mean(dim=[1], keepdim=True)) # shape
+        data = data / data.abs().max(dim=1, keepdim=True)[0].max(dim=2, keepdim=True)[0]
     return data[:n_shapes, :num_points, :]
 
 
@@ -885,26 +909,88 @@ def plot_pc_batch(
         ax.set_ylim(-1.0, 1.0)
         ax.set_zlim(-1.0, 1.0)
 
-        if has_attr:
-            doppler_err = (pc[idx, :, 3] - gt[idx, :, 3]).ravel()
-            rcs_err = (pc[idx, :, 4] - gt[idx, :, 4]).ravel()
-            axins = inset_axes(ax, width="38%", height="38%", loc="upper left", borderpad=1)
-            bins = 20
-            axins.hist(doppler_err, bins=bins, alpha=0.6, color="tab:orange", density=True)
-            axins.hist(rcs_err, bins=bins, alpha=0.6, color="tab:green", density=True)
-            axins.axvline(0.0, color="black", linewidth=1)
-            axins.set_xticks([])
-            axins.set_yticks([])
-            axins.set_title("d/rcs err", fontsize=7)
-
+        cd_string = ""
         if gt is not None:
-            cd = pt3d_chamfer_distance(
-                torch.from_numpy(pc[idx : idx + 1]), torch.from_numpy(gt[idx : idx + 1])
-            )[0]
-            if batch_titles and len(batch_titles) == batch_size:
-                ax.set_title(f"{batch_titles[idx]} CD: {cd.item():.1e}", fontsize=10)
+            if has_attr:
+
+                # i have to compute the gt-pc correlation, pc_idx, wihci point in pc corresponds to which point in gt,, by find the NN between pc and gt, 
+                # then from this paring, identify corresponding doppler and rcs values, compute error, plot histogram of error, and compute mse loss for doppler and rcs, and add to title
+
+                pc_idx = np.argmin(
+                    np.linalg.norm(
+                        pc[idx, :, :3][:, None, :] - gt[idx, :, :3][None, :, :], axis=-1
+                    ),
+                    axis=1,
+                )
+
+                doppler_err = pc[idx, :, 3] - gt[idx, pc_idx, 3]
+                rcs_err = pc[idx, :, 4] - gt[idx, pc_idx, 4]
+                xyz_err = np.linalg.norm(pc[idx, :, :3] - gt[idx, pc_idx, :3], axis=-1)
+                position_loss = np.mean(xyz_err**2)
+                
+                minmax_doppler = [-1, 1]
+                minmax_rcs = [-1, 1]
+                bins_doppler = np.linspace(minmax_doppler[0], minmax_doppler[1], 21, endpoint=True)
+                bins_rcs = np.linspace(minmax_rcs[0], minmax_rcs[1], 21, endpoint=True)
+
+                axins_l = inset_axes(ax, width="38%", height="20%", loc="lower left", borderpad=1)
+                # min max [-.5, .5] for doppler,  
+                axins_l.hist(doppler_err,  #bins=bins_doppler, 
+                             alpha=0.75, color="tab:orange", log=True)
+                axins_l.axvline(0.0, color="black", linewidth=1)
+                axins_l.tick_params(axis='both', which='major', labelsize=7)
+                #set ticklabel_format
+                axins_l.ticklabel_format(axis='x', style='plain')
+                # axins_l.set_xticks([])
+                # axins_l.set_yticks([])
+                axins_l.set_title(f"doppler L: {doppler_err.mean():.1e}", fontsize=7)
+                # axins_l.set_title(f"doppler [{minmax_doppler[0]}, {minmax_doppler[1]}] L: {doppler_loss.item():.1e}", fontsize=7)
+
+                axins_r = inset_axes(ax, width="38%", height="20%", loc="lower right", borderpad=1)
+                #[-1, 1] for rcs,
+                axins_r.hist(rcs_err, #bins=bins_rcs,
+                              alpha=0.75, color="tab:green",  log=True)
+                axins_r.axvline(0.0, color="black", linewidth=1)
+                #axis ticks alebls should ahve size 7 font, and in normal number nor "r" format
+                axins_r.tick_params(axis='both', which='major', labelsize=7)
+                axins_r.ticklabel_format(axis='x', style='plain')
+                # axins_r.set_xticks([])
+                # axins_r.set_yticks([])
+                # axins_r.set_title(f"rcs [{minmax_rcs[0]}, {minmax_rcs[1]}] L: {rcs_loss.item():.1e}", fontsize=7)
+                axins_r.set_title(f"rcs L: {rcs_err.mean():.1e}", fontsize=7)
+
+                #add top-left inset, plot 2d scatter of doppler vs rcs, with limits [-0.5, 0.5] for doppler and [-1, 1] for rcs, one set for pred, another for gt
+                axins_tl = inset_axes(ax, width="38%", height="20%", loc="upper left", borderpad=1)
+                axins_tl.scatter(pc[idx, :, 3], pc[idx, :, 4], alpha=0.75, color="tab:blue", label="Noisy", marker="o", s=10)
+                axins_tl.scatter(gt[idx, :, 3], gt[idx, :, 4], alpha=0.75, color="tab:red", label="GT", marker="^", s=10)
+
+
+                # axins_tl.set_xlim(minmax_doppler)
+                # axins_tl.set_ylim(minmax_rcs)
+                # axins_tl.set_xticks([])
+                # axins_tl.set_yticks([])
+                #set x y label
+                axins_tl.set_xlabel("Doppler", fontsize=6)
+                axins_tl.set_ylabel("RCS", fontsize=6)
+                axins_tl.set_title("Doppler vs RCS", fontsize=7)
+                # axins_tl.legend(fontsize=6)
+
+
+                # rmse_doppler = np.sqrt(np.mean(doppler_err**2))
+                # rmse_rcs = np.sqrt(np.mean(rcs_err**2))
+                cd = pt3d_chamfer_distance(
+                    torch.from_numpy(pc[idx : idx + 1, :, :3]), torch.from_numpy(gt[idx : idx + 1, :, :3])
+                )[0]
+                cd_string = f"CD:{cd.item():.1e} L:{position_loss.item():.1e}"  
             else:
-                ax.set_title(f"CD: {cd.item():.1e}", fontsize=10)
+                cd = pt3d_chamfer_distance(
+                    torch.from_numpy(pc[idx : idx + 1]), torch.from_numpy(gt[idx : idx + 1])
+                )[0]
+                cd_string = f"CD: {cd.item():.1e}"
+        if batch_titles and len(batch_titles) == batch_size:
+            ax.set_title(f"{batch_titles[idx]} {cd_string}", fontsize=10)
+        else:
+            ax.set_title(cd_string, fontsize=10)
         ax.view_init(elev=elev, azim=azm)
 
     for idx in range(batch_size, n_rows * n_cols):
@@ -1128,22 +1214,61 @@ def argparse():
         action="store_true",
         help="Whether to train on RCS and Doppler features",
     )
+    
+    parser.add_argument(
+        "--loss_weight_position",
+        type=float,
+        default=1.0,
+        help="Loss weight for position feature, only used if --train_rcs_doppler is set",
+    )
+    parser.add_argument(
+        "--loss_weight_doppler",
+        type=float,
+        default=1.0,
+        help="Loss weight for Doppler feature, only used if --train_rcs_doppler is set",
+    )
+    parser.add_argument(
+        "--loss_weight_rcs",
+        type=float,
+        default=1.0,
+        help="Loss weight for RCS feature, only used if --train_rcs_doppler is set",
+    )
     args = parser.parse_args()
 
     return args
 
-def normalize_data(x, mean=None, max_half_range=None):
+def normalize_data(x, mean=None, max_half_range=None,save_filename_title=None):
     '''
     x: [B, N, D]
     mean: optional precomputed mean to use for centering, 
     max_half_range: optional precomputed max_half_range to use for scaling,
     '''
+    is_train = mean is None 
     if mean is None:
         mean = x.mean(dim=[0, 1], keepdim=True)  # [1, 1, D]
     x_centered = x - mean
     if max_half_range is None:
         max_half_range = x_centered.abs().max()  # [B, 1, 1]
     x_normalized = x_centered / max_half_range
+
+    if save_filename_title is not None:
+        fname,title = save_filename_title
+        #plot log historgam of the original data and the normalized data for each dimension
+        import matplotlib.pyplot as plt
+        #2 col for before and after normalization, and D rows for each dimension
+        fig, axs = plt.subplots( x.shape[2], 2, figsize=(8, 4 * x.shape[2]))
+        if x.shape[2] == 1:
+            axs = axs[None, :]
+        for d in range(x.shape[2]):
+            n,bins,patch = axs[d, 0].hist(x[:,:,d].cpu().numpy().flatten(), bins=50, log=True, color="tab:blue", alpha=0.75)
+            axs[d, 0].set_title(f"Original data - dim {d}")
+            n,bins,patch = axs[d, 1].hist(x_normalized[:,:,d].cpu().numpy().flatten(), bins=50, log=True, color="tab:orange", alpha=0.75)
+            # print(f"Dimension {d}: n {n}, bins {bins}")
+            axs[d, 1].set_title(f"{title} - dim {d} {'train' if is_train else 'eval'}")
+        plt.suptitle(title)
+        plt.tight_layout()
+        plt.savefig(fname)
+        plt.close()
     return x_normalized, mean, max_half_range
 
 if __name__ == "__main__":
@@ -1171,6 +1296,10 @@ if __name__ == "__main__":
         f"Using conditioning mode: {cond_mode}, conditioning method: {cond_method}, scene_embed_dim: {scene_embed_dim}"
     )
 
+
+    loss_weights = {"doppler": args.loss_weight_doppler if args.train_rcs_doppler else None, "rcs": args.loss_weight_rcs if args.train_rcs_doppler else None, "position": args.loss_weight_position}
+    print(f"Using loss weights: {loss_weights}")
+
     if cond_mode == "wan" and not shape_name.startswith("realman"):
         raise ValueError(
             f"cond_mode 'wan' is only compatible with shape_name 'realman' since it relies on Wan's VAE latent. Got shape_name: {shape_name}"
@@ -1178,13 +1307,22 @@ if __name__ == "__main__":
 
     if shape_name == "various":
         total_sc = int(1.25 * n_scene)
-        assert total_sc <= 7, f"n_scene is too large for 'various' shape_name. Max allowed is 5, got {n_scene}"
+        assert total_sc <= 8, f"n_scene is too large for 'various' shape_name. "
         x0sbn3 = make_various_pc(
             num_points=N, device=device, n_shapes=total_sc
         )  # [B,N, 3]
         x0sbn3 = x0sbn3.cpu()  # Move to CPU for preprocessing to save GPU memory
+
+        doppler = x0sbn3[:,:,3:4]  # Use the 4th dimension as dummy doppler for loss calculation
+        rcs = x0sbn3[:,:,4:5]  # Use the 5th dimension as dummy rcs for loss calculation
+        x0sbn3 = x0sbn3[:,:,:3]  # Use only the first 3 dimensions as point cloud data
+
         x0sbn3_eval = x0sbn3[n_scene : ]
         x0sbn3 = x0sbn3[:n_scene]  # Use only the first n_scene shapes for training, reserve the rest for evaluation
+        doppler_eval = doppler[n_scene : ]
+        doppler = doppler[:n_scene]
+        rcs_eval = rcs[n_scene : ]
+        rcs = rcs[:n_scene]
     elif shape_name == "realman":
         total_sc = int(1.25 * n_scene)
         x0sbn3, wan_cond, dataset,doppler,rcs = make_man_pc(
@@ -1222,7 +1360,7 @@ if __name__ == "__main__":
         raise ValueError(f"Unknown shape_name: {shape_name}")
     # print(f"Loaded point cloud shape: {x0sbn3.shape}, device: {x0sbn3.device}, dtype: {x0sbn3.dtype}")
 
-    x0sbn3_norm,meanv,max_half_range = normalize_data(x0sbn3)
+    x0sbn3_norm,meanv,max_half_range = normalize_data(x0sbn3,save_filename_title=['/home/palakons/point_diffusion/output/sample/x0sbn3_normalization.png', "x0sbn3"])
     #norm each dim separatedly
     # meanx = x0sbn3.mean(dim=[0, 1], keepdim=True)
     # x0sbn3_norm = x0sbn3 - meanx
@@ -1230,7 +1368,7 @@ if __name__ == "__main__":
     # x0sbn3_norm = x0sbn3_norm / maxrange
 
 
-    x0sbn3_eval_norm,_,_ = normalize_data(x0sbn3_eval, mean=meanv, max_half_range=max_half_range)
+    x0sbn3_eval_norm,_,_ = normalize_data(x0sbn3_eval, mean=meanv, max_half_range=max_half_range, save_filename_title=['/home/palakons/point_diffusion/output/sample/x0sbn3_eval_normalization.png', "x0sbn3_eval"])
 
     # x0sbn3_eval_norm = x0sbn3_eval - meanx
     # x0sbn3_eval_norm = x0sbn3_eval_norm / maxrange
@@ -1244,8 +1382,8 @@ if __name__ == "__main__":
     doppler_eval = torch.norm(doppler_eval, p=2, dim=-1, keepdim=True)
     # print(f"Original doppler shape: {doppler.shape}, rcs shape: {rcs.shape}") # Original doppler shape: torch.Size([B, 128, 1]), rcs shape: torch.Size([B, 128, 1])
 
-    doppler_norm, doppler_mean, doppler_max_half_range = normalize_data(doppler)
-    doppler_eval_norm, _, _ = normalize_data(doppler_eval, mean=doppler_mean, max_half_range=doppler_max_half_range)
+    doppler_norm, doppler_mean, doppler_max_half_range = normalize_data(doppler, save_filename_title=['/home/palakons/point_diffusion/output/sample/doppler_normalization.png', "doppler"])
+    doppler_eval_norm, _, _ = normalize_data(doppler_eval, mean=doppler_mean, max_half_range=doppler_max_half_range, save_filename_title=['/home/palakons/point_diffusion/output/sample/doppler_eval_normalization.png', "doppler_eval"])
 
     # meandoppler = doppler.mean(dim=[0, 1], keepdim=True)
     # doppler_norm = doppler - meandoppler
@@ -1255,16 +1393,24 @@ if __name__ == "__main__":
     # doppler_eval_norm = doppler_eval - meandoppler
     # doppler_eval_norm = doppler_eval_norm / maxrange_doppler
 
-    rcs_norm, rcs_mean, rcs_max_half_range = normalize_data(rcs)
-    rcs_eval_norm, _, _ = normalize_data(rcs_eval, mean=rcs_mean, max_half_range=rcs_max_half_range)
+    rcs_norm, rcs_mean, rcs_max_half_range = normalize_data(rcs, save_filename_title=['/home/palakons/point_diffusion/output/sample/rcs_normalization.png', "rcs"])
+    rcs_eval_norm, _, _ = normalize_data(rcs_eval, mean=rcs_mean, max_half_range=rcs_max_half_range, save_filename_title=['/home/palakons/point_diffusion/output/sample/rcs_eval_normalization.png', "rcs_eval"])
+
+
+    print(f"min max x0 after norm: {x0sbn3_norm.amin(dim=[0,1])}, {x0sbn3_norm.amax(dim=[0,1])}") # min max x0 after norm: tensor([-1., -1., -1.]), tensor([1., 1., 1.]
+    print(f"min max doppler after norm: {doppler_norm.amin(dim=[0,1])}, {doppler_norm.amax(dim=[0,1])}") # min max doppler after norm: tensor([-1.]), tensor([1.])
+    print(f"min max rcs after norm: {rcs_norm.amin(dim=[0,1])}, {rcs_norm.amax(dim=[0,1])}") # min max rcs after norm: tensor([-1.]), tensor([1.])
 
     # rcs_norm = rcs - rcs.mean(dim=[0, 1], keepdim=True)
     # rcs_norm = rcs_norm / rcs_norm.abs().max()
 
     if args.train_rcs_doppler:
         print(f"Training with RCS and Doppler. Original input shape: {x0sbn3.shape}, doppler shape: {doppler.shape}, rcs shape: {rcs.shape}") # [B, 128, 3], doppler shape: [B, 128, 3], rcs shape: [B, 128, 1]
-        x0sbn3_norm = torch.cat([x0sbn3_norm, doppler_norm, rcs_norm], dim=-1)  # [B,N,7]
-        print(f"Training with RCS and Doppler. New input shape: {x0sbn3.shape}") # Training with RCS and Doppler. New input shape: torch.Size([B, 128, 7])
+        x0sbn3_norm = torch.cat([x0sbn3_norm, doppler_norm, rcs_norm], dim=-1)  # [B,N,5]
+        print(f"Training with RCS and Doppler. New input shape: {x0sbn3_norm.shape}") # Training with RCS and Doppler. New input shape: torch.Size([B, 128, 5])
+
+        x0sbn3_eval_norm = torch.cat([x0sbn3_eval_norm, doppler_eval_norm, rcs_eval_norm], dim=-1)  # [B,N,5]
+        print(f"Evaluation with RCS and Doppler. New input shape: {x0sbn3_eval_norm.shape}") # Evaluation with RCS and Doppler. New input shape:
 
 
     # model = PointNetDenoiser(
@@ -1329,7 +1475,18 @@ if __name__ == "__main__":
             use_head=True,
             scene_embed_dim=scene_embed_dim,  # Enable scene conditioning with scalar ID
         ).to(device)
-        run_id = f"{model_name}_{shape_name}_{N}{f'_dim{inout_dim}' if inout_dim ==5 else f''}_e{epoch}_T{T}_Inf{T_infer}_b{B}_sc{args.n_scene}_mode{cond_mode}_cond{cond_method}"
+
+        dop_suffix = f"_dop{loss_weights['doppler']:.1e}" if loss_weights["doppler"] is not None and loss_weights["doppler"] !=1 else ""
+        rcs_suffix = f"_rcs{loss_weights['rcs']:.1e}" if loss_weights["rcs"] is not None and loss_weights["rcs"] !=1 else ""
+        position_suffix = f"_pos{loss_weights['position']:.1e}" if  loss_weights["position"] !=1 else ""
+
+        run_id = (
+            f"{model_name}_{shape_name}_{N}"
+            f"{f'_dim{inout_dim}' if inout_dim == 5 else ''}"
+            f"_e{epoch}_T{T}_Inf{T_infer}_b{B}_sc{args.n_scene}_mode{cond_mode}_cond{cond_method}"
+            f"{position_suffix}{dop_suffix}{rcs_suffix}"
+        )
+        # run_id = f"{model_name}_{shape_name}_{N}{f'_dim{inout_dim}' if inout_dim ==5 else f''}_e{epoch}_T{T}_Inf{T_infer}_b{B}_sc{args.n_scene}_mode{cond_mode}_cond{cond_method}{'' if loss_weigths['doppler'] is None else f'_dop{loss_weigths["doppler"]:.1e}'}{'' if loss_weigths['rcs'] is None else f'_rcs{loss_weigths["rcs"]:.1e}'}"
     elif model_name == "SetTxDnsr":
         dim=64
         model = FullSetTransformerDenoiser(
@@ -1340,8 +1497,14 @@ if __name__ == "__main__":
             num_heads=8,
             dropout=0.,
             out_channels=inout_dim,
+            wan_shape=(16, 2, 60, 104) if cond_mode != "none" and cond_method != 'scene_id' else (1,),
         ).to(device)
-        run_id = f"{model_name}_{shape_name}_{N}{f'_dim{inout_dim}' if inout_dim ==5 else f''}_e{epoch}_T{T}_Inf{T_infer}_b{B}_sc{args.n_scene}_cond{cond_method}_d{dim}"
+
+        dop_suffix = f"_dop{loss_weights['doppler']:.1e}" if loss_weights["doppler"] is not None else ""
+        rcs_suffix = f"_rcs{loss_weights['rcs']:.1e}" if loss_weights["rcs"] is not None else ""
+        position_suffix = f"_pos{loss_weights['position']:.1e}" if  loss_weights["position"] !=1 else ""
+
+        run_id = f"{model_name}_{shape_name}_{N}{f'_dim{inout_dim}' if inout_dim ==5 else f''}_e{epoch}_T{T}_Inf{T_infer}_b{B}_sc{args.n_scene}_cond{cond_method}_d{dim}{position_suffix}{dop_suffix}{rcs_suffix}"
     else:
         raise ValueError(f"Unknown model_name: {model_name}")
 
@@ -1400,7 +1563,7 @@ if __name__ == "__main__":
         model.eval()
         print(f"scene_strength {model.scene_strength.item():.4f}")
 
-        shapes = (1, 3, N) if model_name == "PTv3Dnsr" else (1, N, 3)
+        shapes = (1, inout_dim, N) if model_name == "PTv3Dnsr" else (1, N, inout_dim)
         os.makedirs(f"{temp_dir}/../sample", exist_ok=True)
 
         B = 1
@@ -1487,6 +1650,7 @@ if __name__ == "__main__":
                 )
                 if model_name == "PTv3Dnsr":
                     pred_x = pred_x.transpose(1, 2)
+                print(f"shapes pred_x: {pred_x.shape}, gt: {gt.shape}")
                 cd = pt3d_chamfer_distance(
                     pred_x.cpu(), gt.cpu()
                 )[0]  # Compute Chamfer Distance for each sample
@@ -1534,7 +1698,7 @@ if __name__ == "__main__":
     elif args.mode == "sample":
 
         n_sampling = 12
-        shapes = (n_sampling, 3, N) if model_name == "PTv3Dnsr" else (n_sampling, N, 3)
+        shapes = (n_sampling, inout_dim, N) if model_name == "PTv3Dnsr" else (n_sampling, N, inout_dim)
         picked_indices = torch.randint(0, n_scene, (n_sampling,), device=device)
         print(f"Picked scene indices for sampling: {picked_indices.shape}")
 
@@ -1620,10 +1784,10 @@ if __name__ == "__main__":
         ), f"Expected x0sbn3_norm shape[0] to match n_scene {n_scene}, got {x0sbn3_norm.shape}"
         print(
             f"Batch size: {B}, Number of scenes: {n_scene}, Replication factor for scenes: {rep_time} 0sbn3_norm.shape: {x0sbn3_norm.shape}"
-        )
+        ) # torch.Size([40, 128, 5])          
         x0sbn3_norm_rep = x0sbn3_norm.repeat(rep_time, 1, 1)  # [rep_time, N, 3]
         print(
-            f"Replicated x0sbn3_norm shape: {x0sbn3_norm_rep.shape}, expected: ({B}, {N}, 3)"
+            f"Replicated x0sbn3_norm shape: {x0sbn3_norm_rep.shape}, expected: ({B}, {N}, 3) if not predicting doppler/rcs, ({B}, {N}, 5) if predicting doppler/rcs"
         )
 
         if args.cond_mode == "none":
@@ -1661,19 +1825,8 @@ if __name__ == "__main__":
             cond = scene_condition_rep[idx][
                 :B
             ].to(device)  # [B, 1] scene conditioning (batch-wise)
+            # print(f"shapes okay: {x0.shape}, {cond.shape}") #  torch.Size([128, 128, 5]), torch.Size([128, 1])  
 
-            # dataset = torch.utils.data.TensorDataset(x0sbn3_norm_rep, scene_condition_rep)
-            # dataloader = torch.utils.data.DataLoader(dataset, batch_size=B, shuffle=True, drop_last=True)
-            # x0, cond = next(iter(dataloader))  # Get the first batch of shuffled data
-
-            # assert x0.shape == x0_old.shape, f"Expected x0 shape {x0_old.shape}, got {x0.shape}"
-            # assert cond.shape == cond_old.shape, f"Expected cond shape {cond_old.shape}, got {cond.shape}"
-            # print("shapes okay: ", x0.shape, cond.shape)#            shapes okay:  torch.Size([128, 96, 3]) torch.Size([128, 199680])
-            # print("old shapes for reference: ", x0_old.shape, cond_old.shape) #old shapes for reference:  torch.Size([128, 96, 3]) torch.Size([128, 199680])
-
-            # print(f"Step {step}: x0 shape: {x0.shape}, cond shape: {cond.shape}")
-            # assert x0.shape == (B, N, 3), f"Expected x0 shape {(B, N, 3)}, got {x0.shape}"
-            # assert cond.shape == (B, 1), f"Expected cond shape {(B, 1)}, got {cond.shape}"
 
             t = torch.randint(0, T, (B,), device=device)
             # print(f"shape of x0: {x0.shape}, t: {t.shape}, cond: {cond.shape}")
@@ -1689,7 +1842,18 @@ if __name__ == "__main__":
                 # Other models expect condition: (B, scene_embed_dim)
                 pred = model(x_t, t, condition=cond)
             time5 = time.time()
-            loss = F.mse_loss(pred, noise)
+            # loss = F.mse_loss(pred, noise)
+
+            loss_position = F.mse_loss(pred[..., :3], noise[..., :3]) # CD? 
+            if inout_dim > 3:
+                loss_doppler = F.mse_loss(pred[..., 3:3+1], noise[..., 3:3+1])
+                loss_rcs = F.mse_loss(pred[..., 3+1:], noise[..., 3+1:])
+                loss = loss_position + loss_weights['doppler'] * loss_doppler + loss_weights['rcs'] * loss_rcs
+            else:
+                loss = loss_position
+
+
+
             time6 = time.time()
             optimizer.zero_grad()
             loss.backward()
@@ -1709,14 +1873,14 @@ if __name__ == "__main__":
                     with torch.no_grad():
                         if n_scene < B:
                             shapes = (
-                                (n_scene, 3, N)
+                                (n_scene, inout_dim, N)
                                 if model_name == "PTv3Dnsr"
-                                else (n_scene, N, 3)
+                                else (n_scene, N, inout_dim)
                             )
                             expanded_cond = scene_condition  # [n_scene, 1]
                         else:
                             shapes = (
-                                (B, 3, N) if model_name == "PTv3Dnsr" else (B, N, 3)
+                                (B, inout_dim, N) if model_name == "PTv3Dnsr" else (B, N, inout_dim)
                             )
                             expanded_cond = scene_condition[:B]
                         if shapes[0] > 8:
