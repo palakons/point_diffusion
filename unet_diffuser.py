@@ -1008,6 +1008,7 @@ class PTv3Dnsr(nn.Module):
         use_cpe=True,
         use_head=True,  # If False, decoder outputs out_channels directly (no projection bottleneck)
         scene_embed_dim=0,  # Scene embedding dimension; if > 0, create cond_mlp to map scene condition to context
+        accept_bnc=False,  # Whether to naturally accept [B,N,C] input for backward compatibility with PTv3, or require [B,C,N] and permute internally
     ):
         """
         PTv3 Denoiser for DDPM. Supports dynamic depth via n_stages.
@@ -1038,6 +1039,7 @@ class PTv3Dnsr(nn.Module):
         self.time_conditioning_mode = time_conditioning_mode
         self.use_head = use_head
         self.scene_embed_dim = scene_embed_dim
+        self.accept_bnc = accept_bnc
         
         assert time_conditioning_mode in ["pdnorm_only", "feat_add", "hybrid", "feat_concat", "no_time"], \
             f"Invalid time_conditioning_mode: {time_conditioning_mode}"
@@ -1342,6 +1344,9 @@ class PTv3Dnsr(nn.Module):
             torch.Tensor: Predicted noise and variance in shape (B, C_out, N).
         """
         device = next(self.parameters()).device
+        if self.accept_bnc:
+            # If accepting [B,N,C], permute to [B,C,N]
+            x = x.permute(0, 2, 1).contiguous()
         x = x.to(device)
         t = t.to(device)
 
@@ -1503,6 +1508,9 @@ class PTv3Dnsr(nn.Module):
             )
         out = out.view(B, N, -1).transpose(1, 2).contiguous()  # (B, out_channels*2, N)
         # print("[PTv3Dnsr] out shape after reshaping: ", out.shape) #[1, 6, 2]
+        if self.accept_bnc:
+            # Permute back to [B, N, C] if accepting BNC input
+            out = out.permute(0, 2, 1).contiguous()  # (B, N, out_channels*2)
         return out
     
 
