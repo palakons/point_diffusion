@@ -22,7 +22,8 @@ class ExperimentLogger:
             json.dump(config, f, indent=2)
 
         self.tb.add_text("config", json.dumps(config, indent=2), global_step=0)
-
+    def log_text(self, tag, text, step):
+        self.tb.add_text(tag, text, step)
     def log_scalars(self, prefix, step, data):
         clean = {}
         for k, v in data.items():

@@ -1,3 +1,4 @@
+import json
 import re
 import time
 import sys
@@ -23,7 +24,7 @@ from io_dataset import (
     save_checkpoint,
     duplicate_batch,
     make_dataset,
-    save_point_sample,
+    save_point_sample,make_proper_man_dataset
 )
 def debug_batch(x, pred=None, target=None, loss=None, name=""):
     print(f"\n--- DEBUG {name} ---")
@@ -38,7 +39,7 @@ def debug_batch(x, pred=None, target=None, loss=None, name=""):
         print("loss:", loss, "finite:", torch.isfinite(loss).item())
         print("loss item:", loss.item())
 
-    print("------------------\n")
+    print("-=--------------=-\n")
 
 def check_model(model):
     print(f"Model: {model.__class__.__name__}")
@@ -127,10 +128,11 @@ def chamfer_xyz_with_matched_attrs(
 
 
 def reconstruct_x0(pred, x_t, t, scheduler, prediction_type):
+    # return x0 and scale factor for epsilon to x0 conversion if applicable
     if prediction_type == "sample":
-        return pred
+        return pred, None
     alpha_bar = scheduler.alphas_cumprod[t].view(-1, 1, 1)
-    return (x_t - torch.sqrt(1 - alpha_bar) * pred) / torch.sqrt(alpha_bar)
+    return (x_t - torch.sqrt(1 - alpha_bar) * pred) / torch.sqrt(alpha_bar) , torch.sqrt((1 - alpha_bar)/alpha_bar)
 
 
 def make_run_id(args):
@@ -142,16 +144,25 @@ def make_run_id(args):
         else ""
     )
 
-    model_spec = f"_dim{64}" if args.model_name == "SetTxDnsr" else ""
+    model_spec = f"_dim{args.set_tx_dim}" if args.model_name == "SetTxDnsr" else ""
+    if args.model_name == "SetTxDnsr":
+        if args.set_cond_type != "film":
+            model_spec += f"_{args.set_cond_type}"
+        if args.use_condition_pooling:
+            model_spec += f"_pool_k{args.condition_pool_kernel}"
+        
 
     shape_spec = f"_{args.data_file}" if args.shape_name.startswith("realman") else ""
 
     cd_spec = f"_cdmd{args.cd_mode}" if args.lambda_cd > 0 else ""
 
-    # --prediction_type epsilon|sample
-    # --sampler ddpm|ddim
 
-    return f"{args.model_name}{model_spec}_{args.shape_name}{shape_spec}_train_sc{args.n_scene}_N{args.N}_B{args.B}_T{args.T}-{args.T_infer}_{args.prediction_type}-{args.sampler}_it{args.ddpm_iteration}_{args.cond_mode}{cond_spec}_weight{dop_rcs_loss_weight}_lmse{args.lambda_mse:1.3f}_lcd{args.lambda_cd:1.3f}{cd_spec}"
+    stridge_str = f"_str{args.wan_frame_stride}_edge{args.wan_edge_policy}" if args.wan_frame_mode != "repeat" else ""
+    wan_id = f"_fr{args.wan_frames}_mode{args.wan_frame_mode}{stridge_str}" if args.cond_method == "wan" else ""
+
+    scale_eps2x0_str = "_scaleeps2x0" if args.scale_eps2x0_conversion else ""
+        
+    return f"{args.model_name}{model_spec}_{args.shape_name}{shape_spec}_train_sc{args.n_scene}_N{args.N}_B{args.B}_T{args.T}-{args.T_infer}_{args.prediction_type}-{args.sampler}{scale_eps2x0_str}_it{args.ddpm_iteration}_{args.cond_mode}{cond_spec}{wan_id}_weight{dop_rcs_loss_weight}_lmse{args.lambda_mse:1.3f}_lcd{args.lambda_cd:1.3f}{cd_spec}"
 
 
 @torch.no_grad()
@@ -241,7 +252,7 @@ def parse_args():
         "--shape_name",
         type=str,
         default="realman",
-        help="Shape to train on: 'realman' or 'various'",
+        help="Shape to train on: 'realman' or 'various', 'realman_dense', 'man_proper_split'"
     )
     parser.add_argument(
         "--mode",
@@ -345,6 +356,66 @@ def parse_args():
         default="ddpm",
         help="The sampling method to use during inference: 'ddpm' (standard DDPM sampling), 'ddim' (DDIM sampling)",
     )
+    parser.add_argument(
+        "--wan_frames", 
+        type=int,
+        default=5,
+        help="Number of frames to use for Wan's VAE latent conditioning"
+    )   
+    parser.add_argument(
+        "--wan_frame_mode",
+        type=str,
+        default="repeat",
+        help="Mode for handling Wan's VAE latent frames: 'repeat/center/past/future'"
+    )
+    parser.add_argument(
+        "--wan_frame_stride",
+        type=int,
+        default=1,
+        help="Stride for selecting frames for Wan's VAE latent conditioning"
+    )
+    parser.add_argument(
+        "--wan_edge_policy",
+        type=str,
+        default="skip",
+        help="Policy for handling edge frames in Wan's VAE latent conditioning: 'skip/pad'"
+    )
+    parser.add_argument(
+        "--set_cond_type",
+        type=str,
+        default="film",
+        choices=["film", "xattn", "film-xattn"],
+        help="Conditioning type for SetTxDnsr: 'film', 'xattn', or 'film-xattn'",
+    )
+    parser.add_argument(
+        "--scale_eps2x0_conversion",
+        action="store_true",
+        help="During epsilon to x0 conversion, scale the predicted epsilon by the standard deviation of the noise added at each timestep, as suggested in some implementations to improve stability. This is only applied when prediction_type is 'epsilon' and the CD loss is used."
+    )
+    parser.add_argument(
+        "--exp_name",
+        type=str,
+        default="default_exp_name",
+        help="Optional experiment name to use in logging. If not provided, a name will be generated based on the other arguments.",
+    )
+    parser.add_argument(
+        "--set_tx_dim",
+        type=int,
+        default=64,
+        help="Dimension of the Set Transformer features in the SetTxDnsr model",
+    )
+    parser.add_argument(
+        "--use_condition_pooling",
+        action="store_true",
+        help="Pool WAN condition spatially before FiLM/XAttn conditioning.",
+    )
+
+    parser.add_argument(
+        "--condition_pool_kernel",
+        type=int,
+        default=4,
+        help="Spatial pooling kernel/stride for WAN condition.",
+    )
     args = parser.parse_args()
 
     return args
@@ -366,6 +437,7 @@ def train_eval_step(
     lambda_cd=0.0,
     cd_mode = "xyz_attr",
     prediction_type="epsilon",
+    scale_eps2x0_conversion=False,
 ):
     num_samples = x0sbn3_norm_rep.shape[0]
 
@@ -375,7 +447,7 @@ def train_eval_step(
         idx = torch.randint(0, num_samples, (B,), device="cpu")
     else:
         model.eval()
-        idx = torch.arange(
+        # idx = torch.arange(
         #     x0sbn3_norm_rep.shape[0], device="cpu"
         # )  # use the same order for evaluation for consistency
         idx = torch.arange(min(B, num_samples), device="cpu")
@@ -384,9 +456,12 @@ def train_eval_step(
     # cond = scene_condition_rep[idx][:B].to(device)
 
     x0_cpu = x0sbn3_norm_rep[idx]
-    cond_cpu = scene_condition_rep[idx]
     x0 = x0_cpu.to(device, non_blocking=True)
-    cond = cond_cpu.to(device, non_blocking=True)
+    if scene_condition_rep is not None:
+        cond_cpu = scene_condition_rep[idx]
+        cond = cond_cpu.to(device, non_blocking=True)
+    else:
+        cond = None
 
     t = torch.randint(0, T, (B,), device=device)
     noise = torch.randn_like(x0)
@@ -446,7 +521,21 @@ def train_eval_step(
 
             alpha_bar = scheduler.alphas_cumprod[t].view(-1, 1, 1)
             x0_hat_o = (x_t - torch.sqrt(1 - alpha_bar) * pred) / torch.sqrt(alpha_bar)
-            x0_hat = reconstruct_x0(pred, x_t, t, scheduler, prediction_type)
+            x0_hat,conversion_scale = reconstruct_x0(pred, x_t, t, scheduler, prediction_type)
+            if False:
+                from matplotlib import pyplot as plt
+                print(f"t: {t}, conversion_scale {conversion_scale.shape}: {conversion_scale.view(-1) if conversion_scale is not None else None}") #conversion_scale torch.Size([1024, 1, 1])
+                #plot scatter scale vs t to /home/palakons/point_diffusion/output/sample
+                fig = plt.figure()
+                plt.scatter(t.cpu(), conversion_scale.view(-1).cpu())
+                plt.xlabel("t")
+                plt.ylabel("conversion_scale")
+                #log y
+                plt.yscale("log")
+                plt.title("Scatter plot of conversion scale vs t")
+                plt.savefig("/home/palakons/point_diffusion/output/sample/conversion_scale_vs_t.png")
+                plt.close()
+                exit()
             if prediction_type == "epsilon":
                 assert torch.allclose(
                     x0_hat, x0_hat_o, atol=1e-5
@@ -472,16 +561,34 @@ def train_eval_step(
             loss_dict["cd_3d_loss"] = cd_loss_dict["cd_xyz"].item()
             loss_dict["cd_doppler_loss"] = cd_loss_dict["doppler_attr_loss"].item()
             loss_dict["cd_rcs_loss"] = cd_loss_dict["rcs_attr_loss"].item()
-            loss += ( loss_weights["position"]  * cd_loss_dict["cd_xyz"]
+            cd_loss = ( loss_weights["position"]  * cd_loss_dict["cd_xyz"]
                 + loss_weights["doppler"]  * cd_loss_dict["doppler_attr_loss"]
                 + loss_weights["rcs"] * cd_loss_dict["rcs_attr_loss"]
-            )* lambda_cd
+            )* lambda_cd 
+            loss += cd_loss 
         elif cd_mode == "cd5d":
-            loss_cd5d = pt3d_chamfer_distance(x0_hat, x0)[0]  # Chamfer Distance between predicted x0 and true x0
-            # loss_cd_3d = pt3d_chamfer_distance(x0_hat[..., :3], x0[..., :3])[0]  # Chamfer Distance for position only, ignoring doppler/rcs
-            loss_dict["cd_5d_loss"] = loss_cd5d.item()
-            loss += lambda_cd * loss_cd5d
-    assert torch.isfinite(loss).all()
+            if scale_eps2x0_conversion and prediction_type == "epsilon":
+
+                loss_cd5d_batch = pt3d_chamfer_distance(x0_hat, x0, point_reduction="mean", batch_reduction=None)[0]
+                
+                # print(f"shape of loss_cd5d_batch before scaling {loss_cd5d_batch.shape}, loss_cd5d_batch value {loss_cd5d_batch}")
+                # print(f"shape of conversion_scale {conversion_scale.shape}, conversion_scale value {conversion_scale.view(-1)}")
+                loss_cd5d_batch /= 1e-8 + conversion_scale.view(-1)  # scale the CD loss by the conversion scale to account for the magnitude difference between epsilon and x0, as suggested in some implementations for stability
+                # print(f"shape of loss_cd5d_batch after scaling {loss_cd5d_batch.shape}, loss_cd5d_batch value {loss_cd5d_batch}")
+
+                loss_dict["cd_5d_loss"] = loss_cd5d_batch.mean().item()
+                cd_loss = lambda_cd * loss_cd5d_batch.mean()
+
+                # exit()
+            else:
+
+                loss_cd5d = pt3d_chamfer_distance(x0_hat, x0)[0]  
+                loss_dict["cd_5d_loss"] = loss_cd5d.item()
+                cd_loss = lambda_cd * loss_cd5d
+
+            loss += cd_loss
+    if not torch.isfinite(loss).all():
+        print(f"Non-finite loss detected! loss: {loss}, loss_dict: {loss_dict}")
 
     loss_dict["total_loss"] = loss.item()
     if is_train:
@@ -495,6 +602,24 @@ if __name__ == "__main__":
     args = parse_args()
     # Example setup
     device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    run_id = make_run_id(args)
+    system_key = "ddpm_cond_5"
+    data_dir = f"/data/palakons/{system_key}/{args.exp_name}"
+    tb_dir = f"/home/palakons/logs/tb_log/{system_key}/{args.exp_name}"
+    temp_dir = f"{data_dir}/temp"
+    samples_dir = f"{data_dir}/samples"
+    checkpoint_dir = f"/data/palakons/{system_key}/checkpoints/"
+    checkpoint_path = os.path.join(checkpoint_dir, f"latest_{run_id}.pt")
+    exists = {'tb_dir': os.path.exists(tb_dir), 'data_dir': os.path.exists(data_dir),"checkpoint_file": os.path.exists(checkpoint_path)}
+    print(f"Directories and checkpoint existence: {exists}")
+    assert not exists['tb_dir'] , f"TensorBoard log directory {tb_dir} already exists. Please choose a different experiment name or remove the existing logs to avoid overwriting."
+    # creat dir, nested if not exist
+    os.makedirs(temp_dir, exist_ok=True)
+    os.makedirs(tb_dir, exist_ok=True)
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    os.makedirs(samples_dir, exist_ok=True)
+
 
     shape_name = args.shape_name
     data_file = args.data_file
@@ -513,24 +638,43 @@ if __name__ == "__main__":
         "rcs": args.loss_weight_rcs if args.train_rcs_doppler else None,
         "position": args.loss_weight_position,
     }
+    frame_ids = None
+    if args.shape_name == "man_proper_split":
+        (x0sbn3_train_norm, cond_train_norm, doppler_train_norm, rcs_train_norm), (
+            x0sbn3_eval_norm,
+            cond_eval_norm,
+            doppler_eval_norm,
+            rcs_eval_norm,
+        ),_,frame_ids = make_proper_man_dataset( N, cond_mode, cond_method, n_train_frames=n_scene, device=device, data_file=data_file,wan_spec={"wan_frames": args.wan_frames, "wan_frame_mode": args.wan_frame_mode, "wan_frame_stride": args.wan_frame_stride, "wan_edge_policy": args.wan_edge_policy}, split_ratio={"train":0.8, "eval":0.1, "test":0.1},split_seed=42, scene_split_method="first", n_eval_frames=max(2, int(n_scene/8)), n_test_frames=max(2, int(n_scene/8))
+                                )
+        
 
-    (x0sbn3_train_norm, cond_train_norm, doppler_train_norm, rcs_train_norm), (
-        x0sbn3_eval_norm,
-        cond_eval_norm,
-        doppler_eval_norm,
-        rcs_eval_norm,
-    ) = make_dataset(
-        shape_name=shape_name,
-        n_train_scene=n_scene,
-        N=N,
-        device=device,
-        data_file=data_file,
-        cond_method=cond_method,
-        cond_mode=cond_mode 
-    )
+    else:
+
+        (x0sbn3_train_norm, cond_train_norm, doppler_train_norm, rcs_train_norm), (
+            x0sbn3_eval_norm,
+            cond_eval_norm,
+            doppler_eval_norm,
+            rcs_eval_norm,
+        ) = make_dataset(
+            shape_name=shape_name,
+            n_train_scene=n_scene,
+            N=N,
+            device=device,
+            data_file=data_file,
+            cond_method=cond_method,
+            cond_mode=cond_mode,
+            wan_spec={"wan_frames": args.wan_frames, "wan_frame_mode": args.wan_frame_mode, "wan_frame_stride": args.wan_frame_stride, "wan_edge_policy": args.wan_edge_policy}
+        )
+    print(f"Requested {n_scene} training scenes, got {x0sbn3_train_norm.shape[0]} training scenes after dataset creation")
+    print(f"Dataset created. Training scenes: {x0sbn3_train_norm.shape[0]}, Evaluation scenes: {x0sbn3_eval_norm.shape[0]}")
+    # assert x0sbn3_train_norm.shape[0] >= n_scene, f"Not enough training scenes in the dataset. Requested: {n_scene}, available: {x0sbn3_train_norm.shape[0]}"
+    n_scene = x0sbn3_train_norm.shape[0]
     print(
         f"shapes after dataset creation: x0sbn3_norm {x0sbn3_train_norm.shape}, cond {cond_train_norm.shape if cond_train_norm is not None else None}, doppler_norm {doppler_train_norm.shape if doppler_train_norm is not None else None}, rcs_norm {rcs_train_norm.shape if rcs_train_norm is not None else None}"
     )
+    print(f"shaep of x0sbn3_train_norm, cond_train_norm, doppler_train_norm, rcs_train_norm), (x0sbn3_eval_norm,            cond_eval_norm,            doppler_eval_norm,            rcs_eval_norm        ): {x0sbn3_train_norm.shape}, {cond_train_norm.shape if cond_train_norm is not None else None}, {doppler_train_norm.shape if doppler_train_norm is not None else None}, {rcs_train_norm.shape if rcs_train_norm is not None else None}), ({x0sbn3_eval_norm.shape}, {cond_eval_norm.shape if cond_eval_norm is not None else None}, {doppler_eval_norm.shape if doppler_eval_norm is not None else None}, {rcs_eval_norm.shape if rcs_eval_norm is not None else None})")
+
 
     if args.train_rcs_doppler:
         x0sbn3_train_norm = torch.cat(
@@ -544,7 +688,6 @@ if __name__ == "__main__":
         inout_dim = 3
 
     model = make_model(device, args)
-    run_id = make_run_id(args)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 
@@ -571,19 +714,6 @@ if __name__ == "__main__":
         )
     else:
         raise ValueError(f"Unsupported sampler: {args.sampler}")
-
-    system_key = "ddpm_cond_5"
-    data_dir = f"/data/palakons/{system_key}/{run_id}"
-    tb_dir = f"/home/palakons/logs/tb_log/{system_key}/{run_id}"
-    temp_dir = f"{data_dir}/temp"
-    samples_dir = f"{data_dir}/samples"
-    checkpoint_dir = f"/data/palakons/{system_key}/checkpoints/"
-    checkpoint_path = os.path.join(checkpoint_dir, f"latest_{run_id}.pt")
-    # creat dir, nested if not exist
-    os.makedirs(temp_dir, exist_ok=True)
-    os.makedirs(tb_dir, exist_ok=True)
-    os.makedirs(checkpoint_dir, exist_ok=True)
-    os.makedirs(samples_dir, exist_ok=True)
 
     # Load checkpoint if exists
     start_step, config = load_checkpoint(
@@ -839,7 +969,7 @@ if __name__ == "__main__":
 
         x0sbn3_train_norm_rep = duplicate_batch(x0sbn3_train_norm, B)  # [B, N, 3]
         x0sbn3_eval_norm_rep = duplicate_batch(x0sbn3_eval_norm, B)  # [B, N, 3]
-
+        # print(f"shape type dtype dev of cond_train_norm before replication: {cond_train_norm.shape if cond_train_norm is not None else None} {type(cond_train_norm) if cond_train_norm is not None else None} {cond_train_norm.dtype if cond_train_norm is not None else None} {cond_train_norm.device if cond_train_norm is not None else None}") #cuda
         cond_train_norm_rep = (
             duplicate_batch(cond_train_norm, B) if cond_train_norm is not None else None
         )  # [B, cond_dim]
@@ -874,6 +1004,24 @@ if __name__ == "__main__":
         )
 
         logger = ExperimentLogger(tb_dir, data_dir, vars(args))
+        logger.log_text("total_parameters", f"{sum(p.numel() for p in model.parameters())}",0)
+        
+        param_groups = {}
+        for name, param in model.named_parameters():
+            group_name = name.split(".")[0]
+            if group_name not in param_groups:
+                param_groups[group_name] = 0
+            param_groups[group_name] += param.numel()
+        for group_name, num_params in param_groups.items():
+            logger.log_text(f"num_parameters_{group_name}", f"{num_params}", 0)
+        logger.log_text("run_id", run_id, 0)
+        logger.log_text("system_key", system_key, 0)
+        logger.log_text("node_name", os.uname().nodename, 0)
+        if frame_ids is not None:
+            print(f"Saving frame_ids to logger config: {frame_ids}")
+            logger.log_text("frame_ids",json.dumps(frame_ids, indent=4),0)
+            
+
         for step in tt:
 
             loss, loss_dict = train_eval_step(
@@ -881,7 +1029,7 @@ if __name__ == "__main__":
                 optimizer=optimizer,
                 scheduler=scheduler,
                 x0sbn3_norm_rep=x0sbn3_train_norm_rep,
-                scene_condition_rep=cond_train_norm_rep,
+                scene_condition_rep=cond_train_norm_rep if not torch.all(cond_train_norm_rep == 0) else None,  # if condition is all zeros, treat it as no condition
                 T=T,
                 B=B,
                 device=device,
@@ -892,6 +1040,7 @@ if __name__ == "__main__":
                 cd_mode=args.cd_mode,
                 lambda_mse=args.lambda_mse,
                 prediction_type=args.prediction_type,
+                scale_eps2x0_conversion=args.scale_eps2x0_conversion,
             )
 
             if step % log_train_every == 0:
@@ -915,17 +1064,12 @@ if __name__ == "__main__":
                 if True:
                     dir_name = f"{samples_dir}/step_{step:06d}"
                     os.makedirs(dir_name, exist_ok=True)
-                    progressbar = tqdm(
-                        total=2 * 3 * 2,
-                        desc=f"Sampling and plotting at step {step}",
-                        leave=False,
-                    )
-
-                    for set_name, set_cond, gt in zip(
+                    
+                    for set_name, set_cond, gt in tqdm(zip(
                         ["eval", "train"],
                         [cond_eval_norm, cond_train_norm],
                         [x0sbn3_eval_norm, x0sbn3_train_norm],
-                    ):
+                    ), desc=f"Sampling and plotting at step {step}",leave=False):
                         sample_B = min(
                             8, set_cond.shape[0]
                         )  # number of samples to generate for visualization, at most 8 to avoid long sampling time and overcrowded plots
@@ -942,33 +1086,42 @@ if __name__ == "__main__":
                             ("correct_cond", expanded_cond),
                             ("zero_cond", torch.zeros_like(expanded_cond)),
                             ("shuffled_cond", expanded_cond[random_perm]),
+                            ("nn_cond", None),
                         ]
 
-                        for seed in [42, 43]:
-                            for c_name, c_value in conditions:
+                        for seed in tqdm([42, 43], desc=f"Seeds for {set_name}", leave=False):
+                            for c_name, c_value in tqdm(conditions, desc=f"Conditions for {set_name}", leave=False):
                                 npz_fname = (
                                     f"{dir_name}/{set_name}_{c_name}_sd{seed}.npz"
                                 )
-                                with torch.no_grad():
-                                    progressbar.set_description(
-                                        f"Sampling {set_name} {c_name} sd{seed}"
-                                    )
-                                    progressbar.update(1)
-                                    pred_x = p_sample_loop(
-                                        model,
-                                        shapes,
-                                        scheduler,
-                                        num_inference_steps=T_infer,
-                                        device=device,
-                                        condition=c_value,
-                                        seed=seed,  # use step as seed to get different sample each time
-                                    )
+                                pred_x = None
+                                if c_name == "nn_cond":
+                                    nn_idx = torch.cdist(expanded_cond.view(sample_B, -1).float(), cond_train_norm.view(cond_train_norm.shape[0], -1).float()).argmin(dim=1)
+                                    c_value_use = cond_train_norm[nn_idx].to(device)
+                                    pred_x = x0sbn3_train_norm[nn_idx].to(device)
+                                else:
+                                    c_value_use = c_value
+                                    with torch.no_grad():
+                                        
+                                        pred_x = p_sample_loop(
+                                            model,
+                                            shapes,
+                                            scheduler,
+                                            num_inference_steps=T_infer,
+                                            device=device,
+                                            condition=c_value_use,
+                                            seed=seed,  # use step as seed to get different sample each time
+                                        )
                                 # assert same device
                                 # assert pred_x.device == x0sbn3_norm.device, f"Device mismatch: pred_x on {pred_x.device}, x0sbn3_norm on {x0sbn3_norm.device}"
                                 # print(f"shapes for stat calculation: pred_x {pred_x.shape}, gt {x0sbn3_norm[: shapes[0]].shape}, condition {c_value.shape}  ")
-                                point_stat_output = calculate_pointset_stat(
-                                    pred_x.cpu(), gt[: shapes[0]].cpu(), c_name, seed
-                                )
+                                try:
+                                    point_stat_output = calculate_pointset_stat(
+                                        pred_x.cpu(), gt[: shapes[0]].cpu(), c_name, seed
+                                    )
+                                except Exception as e:  
+                                    print(f"Error calculating point set statistics at step {step} for {set_name} with condition {c_name} and seed {seed}: {e}")
+                                    point_stat_output = {"cd": float("nan"), "fidelity": float("nan"), "diversity": float("nan")}
 
                                 if (
                                     set_name == "eval"
@@ -978,24 +1131,27 @@ if __name__ == "__main__":
                                     logger.log_train(step, point_stat_output, log_group=False)
                                 else:
                                     raise ValueError(f"Unknown set_name: {set_name}")
-                                save_point_sample(
-                                    npz_fname,
-                                    pred_x.cpu(),
-                                    gt=gt[: shapes[0]].cpu(),
-                                    condition=c_value.cpu(),
-                                    meta={
-                                        **point_stat_output,
-                                        **{
-                                            "seed": seed,
-                                            "condition_type": c_name,
-                                            "set_name": set_name,
+                                try:
+                                    save_point_sample(
+                                        npz_fname,
+                                        pred_x.cpu(),
+                                        gt=gt[: shapes[0]].cpu(),
+                                        condition=c_value_use.cpu(),
+                                        meta={
+                                            **point_stat_output,
+                                            **{
+                                                "seed": seed,
+                                                "condition_type": c_name,
+                                                "set_name": set_name,
+                                            },
                                         },
-                                    },
-                                )
-
+                                    )
+                                except Exception as e:
+                                    print(f"Error saving point sample at step {step} for {set_name} with condition {c_name} and seed {seed}: {e}")
+                                    continue
                                 batch_titles = [
                                     f"cond:{c:.2f}"
-                                    for c in c_value[:sample_B]
+                                    for c in c_value_use[:sample_B]
                                     .view(sample_B, -1)
                                     .mean(dim=1)
                                 ]
@@ -1016,7 +1172,7 @@ if __name__ == "__main__":
                                     * 90,
                                     batch_titles=batch_titles,
                                 )
-                    progressbar.close()
+                                
                 # except Exception as e:
                 #     print(f"Error during inference/plotting at step {step}: {e}")
                 model.train()
@@ -1028,7 +1184,7 @@ if __name__ == "__main__":
                     optimizer=optimizer,
                     scheduler=scheduler,
                     x0sbn3_norm_rep=x0sbn3_eval_norm_rep,
-                    scene_condition_rep=cond_eval_norm_rep,
+                    scene_condition_rep=cond_eval_norm_rep if not torch.all(cond_eval_norm_rep == 0) else None,  # if condition is all zeros, treat it as no condition
                     T=T,
                     B=B,
                     device=device,
@@ -1039,6 +1195,7 @@ if __name__ == "__main__":
                     cd_mode=args.cd_mode,
                     lambda_mse=args.lambda_mse,
                     prediction_type=args.prediction_type,
+                    scale_eps2x0_conversion=args.scale_eps2x0_conversion,
                 )
                 logger.log_val(step, val_dict, log_group=False)
 
@@ -1054,9 +1211,13 @@ if __name__ == "__main__":
         )
         for set_name in ["eval", "train"]:
             for seed in [42, 43]:
-                for c_name in ["correct_cond", "zero_cond", "shuffled_cond"]:
+                for c_name in ["correct_cond", "zero_cond", "shuffled_cond", "nn_cond"]:
                     os.system(
                         f"ls -v {temp_dir}/denoised_{set_name}_{c_name}_{seed}_*.png | xargs cat | ffmpeg -y -framerate {fps} -f image2pipe -i - {temp_dir}/../{set_name}_{c_name}_{seed}_{run_id}.gif"
+                    )
+                    #scale=640:-1
+                    os.system(
+                        f"ls -v {temp_dir}/denoised_{set_name}_{c_name}_{seed}_*.png | xargs cat | ffmpeg -y -f image2pipe -vcodec png -i - -vf \"fps=10,scale=640:-1:flags=lanczos,split[s0][s1];[s0]palettegen=max_colors=128[p];[s1][p]paletteuse=dither=bayer:bayer_scale=3\" {temp_dir}/../{set_name}_{c_name}_{seed}_{run_id}_scaled.gif"
                     )
                     os.system(
                         f"rm {temp_dir}/denoised_{set_name}_{c_name}_{seed}_*.png"

@@ -1,6 +1,7 @@
 
 import sys,math
 
+from altair import condition
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -30,10 +31,20 @@ class FullSetTransformerBlock(nn.Module):
         num_heads: int = 8,
         mlp_ratio: int = 4,
         dropout: float = 0.0,
+        cond_type: str = "film",
     ):
         super().__init__()
+        self.cond_type = cond_type
         self.norm1 = nn.LayerNorm(dim)
-        self.film1 = FiLM(dim, context_dim)
+        if self.cond_type in ["film", "film-xattn"]:
+            print(f"make FiLM block with context_dim {context_dim}")
+            self.film1 = FiLM(dim, context_dim)
+
+        if self.cond_type in ["xattn", "film-xattn"]:
+            print(f"make xattn block with context_dim {context_dim} and num_heads {num_heads}")
+            self.norm_cross = nn.LayerNorm(dim)
+            self.cross_attn = nn.MultiheadAttention(embed_dim=dim, num_heads=num_heads, dropout=dropout, batch_first=True)
+
         self.attn = nn.MultiheadAttention(
             embed_dim=dim,
             num_heads=num_heads,
@@ -42,7 +53,8 @@ class FullSetTransformerBlock(nn.Module):
         )
         self.drop1 = nn.Dropout(dropout)
         self.norm2 = nn.LayerNorm(dim)
-        self.film2 = FiLM(dim, context_dim)
+        if self.cond_type in ["film", "film-xattn"]:
+            self.film2 = FiLM(dim, context_dim)
         hidden = dim * mlp_ratio
         self.mlp = nn.Sequential(
             nn.Linear(dim, hidden),
@@ -51,19 +63,29 @@ class FullSetTransformerBlock(nn.Module):
             nn.Linear(hidden, dim),
         )
         self.drop2 = nn.Dropout(dropout)
-    def forward(self, h: torch.Tensor, context: torch.Tensor):
+
+    def forward(self, h: torch.Tensor, context: torch.Tensor, cross_context: torch.Tensor = None):
         """
         h:       [B, N, D]
         context: [B, C]
         """
         # Attention residual branch
         a = self.norm1(h)
-        a = self.film1(a, context)
+        if self.cond_type in ["film", "film-xattn"]:
+            a = self.film1(a, context)
         a, _ = self.attn(a, a, a, need_weights=False)
         h = h + self.drop1(a)
+
+        # Cross-attention residual branch
+        if self.cond_type in ["xattn", "film-xattn"] and cross_context is not None:
+            c = self.norm_cross(h)
+            c, _ = self.cross_attn(c, cross_context, cross_context, need_weights=False) # Q from h, K,V from cross_context
+            h = h + self.drop1(c)
+
         # MLP residual branch
         m = self.norm2(h)
-        m = self.film2(m, context)
+        if self.cond_type in ["film", "film-xattn"]:
+            m = self.film2(m, context)
         m = self.mlp(m)
         h = h + self.drop2(m)
         return h
@@ -89,22 +111,60 @@ class FullSetTransformerDenoiser(nn.Module):
         dropout: float = 0.0,
         out_channels: int = 3,
         in_channels: int = 3,
+        cond_type: str = "film",
+        mlp_ratio: int = 4,
+        use_condition_pooling: bool = False,
+        condition_pool_kernel: int = 4,
     ):
         super().__init__()
+
+        valid_cond_types = {"film", "xattn", "film-xattn", "none"}
+        assert cond_type in valid_cond_types, f"Unknown cond_type: {cond_type}"
+
         self.dim = dim
+        self.cond_type = cond_type
+        self.mlp_ratio = mlp_ratio
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.wan_shape = tuple(wan_shape)
+        self.use_condition_pooling = use_condition_pooling
+        self.condition_pool_kernel = condition_pool_kernel
+        self.wan_shape = wan_shape
+
         self.time_emb = SinusoidalTimeEmbedding(time_dim)
         self.time_mlp = nn.Sequential(
             nn.Linear(time_dim, dim),
             nn.SiLU(),
             nn.Linear(dim, dim),
         )
-        wan_dim = math.prod(wan_shape)
-        self.wan_mlp = nn.Sequential(
-            nn.Linear(wan_dim, wan_hidden),
-            nn.SiLU(),
-            nn.Linear(wan_hidden, dim),
-            nn.LayerNorm(dim),
-        )
+        if self.cond_type in ["film", "film-xattn"]:
+            # Backward compatibility: flatten the entire WAN latent into a single vector
+            # wan_dim = math.prod(wan_shape)
+            if self.use_condition_pooling and len(wan_shape) == 4:
+                c, f, h, w = wan_shape
+                assert h % condition_pool_kernel == 0 and w % condition_pool_kernel == 0, "WAN spatial dimensions must be divisible by pool kernel"
+                pooled_h = h // condition_pool_kernel
+                pooled_w = w // condition_pool_kernel
+                wan_dim = c * f * pooled_h * pooled_w
+            else:
+                wan_dim = math.prod(wan_shape)
+
+            self.wan_mlp_film = nn.Sequential(
+                nn.Linear(wan_dim, wan_hidden),
+                nn.SiLU(),
+                nn.Linear(wan_hidden, dim),
+                nn.LayerNorm(dim),
+            )
+        if self.cond_type in ["xattn", "film-xattn"]:
+            # For cross-attention: process tokens from the WAN latent space.
+            wan_token_dim = wan_shape[0] * wan_shape[1] if len(wan_shape) >= 2 else math.prod(wan_shape)
+            self.wan_mlp_cross = nn.Sequential(
+                nn.Linear(wan_token_dim, wan_hidden),
+                nn.SiLU(),
+                nn.Linear(wan_hidden, dim),
+                nn.LayerNorm(dim),
+            )
         self.xyz_proj = nn.Sequential(
             nn.Linear(in_channels, dim),
             nn.GELU(),
@@ -117,6 +177,8 @@ class FullSetTransformerDenoiser(nn.Module):
                     context_dim=dim,
                     num_heads=num_heads,
                     dropout=dropout,
+                    cond_type=cond_type,
+                    mlp_ratio=mlp_ratio
                 )
                 for _ in range(num_layers)
             ]
@@ -127,6 +189,32 @@ class FullSetTransformerDenoiser(nn.Module):
             nn.GELU(),
             nn.Linear(dim, out_channels),
         )
+    def _pool_wan_condition(self, condition: torch.Tensor, B: int) -> torch.Tensor:
+        """
+        condition: [B, 16, 2, 60, 104]
+        returns:   [B, 32, 15, 26] if pooling enabled with k=4
+                [B, 32, 60, 104] if pooling disabled
+        """
+        if condition.ndim != 5:
+            raise ValueError(
+                f"Expected WAN condition [B, C, F, H, W], got {condition.shape}"
+            )
+
+        wan = condition.reshape(
+            B,
+            condition.shape[1] * condition.shape[2],
+            condition.shape[3],
+            condition.shape[4],
+        )
+
+        if self.use_condition_pooling:
+            wan = F.avg_pool2d(
+                wan,
+                kernel_size=self.condition_pool_kernel,
+                stride=self.condition_pool_kernel,
+            )
+
+        return wan
     def forward(self, x: torch.Tensor, t: torch.Tensor, condition=None, **kwargs):
         """
         x: [B, N, 3]
@@ -137,15 +225,61 @@ class FullSetTransformerDenoiser(nn.Module):
         h = self.xyz_proj(x)
         # timestep context
         t_context = self.time_mlp(self.time_emb(t.to(x.device)))
-        # WAN condition context
+        # WAN condition context #shape [16, 2, 60, 104] -> flatten to [B, wan_dim]
+        context = t_context
+        cross_context = None
+        #if all are zeros in condition, set to None
         if condition is not None:
-            wan = condition.to(x.device).view(B, -1)
-            wan_context = self.wan_mlp(wan)
-            context = t_context + wan_context
-        else:
-            context = t_context
+            if self.cond_type in ["film", "film-xattn"]:
+                # wan_film = condition.to(x.device).view(B, -1)
+                # wan_context_film = self.wan_mlp_film(wan_film)
+                # context = t_context + wan_context_film
+
+                cond = condition.to(device=x.device, dtype=x.dtype)
+                if self.use_condition_pooling:
+                    wan = self._pool_wan_condition(cond, B)  # [B, 32, 15, 26]
+                    wan_film = wan.reshape(B, -1)
+                else:
+                    wan_film = cond.reshape(B, -1)
+                # print(f"[FullSetTransformerDenoiser] WAN condition shape: {condition.shape}, processed WAN shape for FiLM: {wan_film.shape} should be [B, 12480]") #[B, 32, 15, 26] 
+                wan_context_film = self.wan_mlp_film(wan_film)
+                # print(f"[FullSetTransformerDenoiser] FiLM context shape: {wan_context_film.shape} should be [B, dim]") #→ [B, 12480]
+                context = t_context + wan_context_film
+            if self.cond_type in ["xattn", "film-xattn"]:
+                # wan_cross = condition.to(x.device) # [B, 16, 2, 60, 104]
+    
+                # if wan_cross.ndim == 5:
+                #     # Reshape WAN latent into a sequence of tokens
+                #     # [B, 16, 2, 60, 104] -> [B, 60*104, 16*2]
+                #     num_tokens = wan_cross.shape[3] * wan_cross.shape[4]
+                #     token_dim = wan_cross.shape[1] * wan_cross.shape[2]
+                #     wan_tokens = wan_cross.permute(0, 3, 4, 1, 2).reshape(B, num_tokens, token_dim)
+                # else:
+                #     # Fallback for non-WAN 1D/2D conditions (e.g., scene_id)
+                #     wan_tokens = wan_cross.view(B, 1, -1)
+                #     raise ValueError(f"Expected WAN condition with shape [B, 16, 2, 60, 104], got {condition.shape}")
+                # Project tokens to the model's dimension
+                # cross_context = self.wan_mlp_cross(wan_tokens) # [B, num_tokens, dim]
+
+                cond = condition.to(device=x.device, dtype=x.dtype)
+
+                if cond.ndim == 5:
+                    wan = self._pool_wan_condition(cond, B)  # [B, 32, H', W']
+                    # print(f"[FullSetTransformerDenoiser] WAN condition shape: {condition.shape}, pooled WAN shape: {wan.shape} should be [B, 32, 15, 26]") #[B, 32, 15, 26]
+                    wan_tokens = wan.permute(0, 2, 3, 1).reshape(B, -1, wan.shape[1])
+                else:
+                    raise ValueError(
+                        f"Expected WAN condition with shape [B, 16, 2, 60, 104], got {condition.shape}"
+                    )
+                # print(f"[FullSetTransformerDenoiser] WAN condition shape: {condition.shape}, processed WAN shape for cross-attention: {wan_tokens.shape} should be [B, 390, 32]") # → [B, 390, 32] 
+                cross_context = self.wan_mlp_cross(wan_tokens)
+                # print(f"[FullSetTransformerDenoiser] cross-attention context shape: {cross_context.shape} should be [B, 390, dim]") #[B, 390, dim]
+
+    
+    
+
         for block in self.blocks:
-            h = block(h, context)
+            h = block(h, context, cross_context)
         out = self.out(self.out_norm(h))
         return out
 
@@ -576,6 +710,7 @@ def make_model( device, args):
     inout_dim = 5 if args.train_rcs_doppler else 3
     cond_mode = args.cond_mode
     cond_method = args.cond_method  
+
     
     if model_name == "PTv3Dnsr":
         sys.path.append("/home/palakons/point_diffusion")
@@ -607,7 +742,8 @@ def make_model( device, args):
         ).to(device)
 
     elif model_name == "SetTxDnsr":
-        dim=64
+        dim=args.set_tx_dim
+        set_cond_type =args.set_cond_type
         model = FullSetTransformerDenoiser(
             in_channels=inout_dim,
             dim =dim,
@@ -617,6 +753,10 @@ def make_model( device, args):
             dropout=0.,
             out_channels=inout_dim,
             wan_shape=(16, 2, 60, 104) if cond_mode != "none" and cond_method != 'scene_id' else (1,),
+            cond_type=set_cond_type ,
+            mlp_ratio=4,
+            use_condition_pooling=args.use_condition_pooling,
+            condition_pool_kernel=args.condition_pool_kernel,
         ).to(device)
     else:
         raise ValueError(f"Unknown model_name: {model_name}")

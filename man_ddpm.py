@@ -202,6 +202,7 @@ class MANDataset(Dataset):
         get_camera=True,
         wan_vae: bool = False,
         wan_vae_checkpoint: str = "wan2_1_832x480.pth",
+        wan_spec={"wan_frames":5, "wan_frame_mode":"repeat", "wan_frame_stride":1,"wan_edge_policy":"skip"},  # wan_frame_mode : repeat/center/past/future, wan_edge_policy: skip/pad
         viz_dir: str = "",
         grid_binary_range: str = "0-1",  # "0-1" or "neg1-1"
         keep_frames=0,
@@ -246,15 +247,20 @@ class MANDataset(Dataset):
         self.y_range = y_range
         self.z_range = z_range
         self.wan_preprocess_dir = os.path.join(wan_preprocess_dir,self.data_file) if wan_preprocess_dir is not None else None
+        self.wan_spec = wan_spec
+        print("wan process dir:", self.wan_preprocess_dir)
+        
+
         if self.wan_preprocess_dir is not None:
             os.makedirs(self.wan_preprocess_dir, exist_ok=True)
 
         if self.wan_vae:
-            print(f"Loading VAE...")
+            print(f"Loading VAE from checkpoint: {self.wan_vae_checkpoint}")
             self.vae21 = Wan2_1_VAE(
                 vae_pth=self.wan_vae_checkpoint,
                 device=self.device,
             )
+            print("VAE loaded successfully.")
         # store mean and std
 
         if self.data_file == "man-mini":
@@ -287,6 +293,10 @@ class MANDataset(Dataset):
             self.inferDA3_depth_image(img_files, depth_files, batch_size=128)
 
         self.data_bank = []
+        image_cache = []  # Cache for loaded images to avoid redundant disk reads
+
+        stredge_str = f"_str{self.wan_spec['wan_frame_stride']}_edge{self.wan_spec['wan_edge_policy']}" if self.wan_spec['wan_frame_mode'] != "repeat" else ""
+        latent_id = f"fr{self.wan_spec['wan_frames']}_mode{self.wan_spec['wan_frame_mode']}{stredge_str}"
         for scene_id in tqdm(self.scene_ids, desc="Loading scenes"):
             if len(self.data_bank) >= self.keep_frames and self.keep_frames != 0:
                 break
@@ -303,7 +313,23 @@ class MANDataset(Dataset):
                 len(self.data_bank) < self.keep_frames or self.keep_frames == 0
             ):
                 loaded_data = self.load_data(trucksc, frame_token, self.get_bb)
+                if self.wan_vae: #if wan, and cached, and the cahed wan tensor is [0], set loaded_data to None
+                    preprocessed_file_path = os.path.join( self.wan_preprocess_dir, loaded_data["camera_file_name"].split("/")[-1].replace(".jpg", f"_{latent_id}.pt") ) 
+                    if os.path.exists(preprocessed_file_path):
+                        loaded_wan = torch.load(preprocessed_file_path)
+                        # print(f"type dtype shape device of cached preprocessed VAE latent for scene {scene_id} frame {pbar.n}: {type(loaded_wan)}, {loaded_wan.dtype}, {loaded_wan.shape}, {loaded_wan.device}")
+                        if   torch.load(preprocessed_file_path).shape == torch.Size([1]) and torch.load(preprocessed_file_path)[0] == 0:
+                            print(f"Preprocessed VAE latent for scene {scene_id} frame {pbar.n} is a placeholder, skipping loading data for this frame.len data_bank {len(self.data_bank)}")
+                            print(f"type dtype shape device of cached preprocessed VAE latent for scene {scene_id} frame {pbar.n}: {type(loaded_wan)}, {loaded_wan.dtype}, {loaded_wan.shape}, {loaded_wan.device}")
+                            loaded_data = None
+
                 if loaded_data is not None:
+                    image_cache.append({
+                        "scene_id": scene_id,
+                        "frame_index": pbar.n,
+                        "frame_token": frame_token,
+                        "camera_file_name": loaded_data["camera_file_name"],
+                    })
                     if (
                         self.point_preset == "uniform"
                     ):  # assign grid of x [0-200] y [-100, 100] z [-20, 20] to radar points, and only keep one point in each grid cell, if multiple points in one grid cell, keep the one with highest rcs
@@ -346,6 +372,40 @@ class MANDataset(Dataset):
                 frame_token = trucksc.get("sample", frame_token)["next"]
                 pbar.update(1)
             pbar.close()
+
+        if self.wan_vae :
+            assert os.path.exists(self.wan_preprocess_dir), f"WAN preprocess directory {self.wan_preprocess_dir} does not exist. Please run WAN preprocessing first to generate VAE latent files."
+
+            print(f"cached {len(image_cache)} images for VAE preprocessing")
+            # for item in tqdm(image_cache, desc="Preprocessing images for VAE"):
+            #     print(f"Processing scene {item['scene_id']} frame {item['frame_index']} token {item['frame_token']}")
+            missing_image_cache = []
+            for item in tqdm(image_cache, desc="Preprocessing images for VAE"):
+                preprocessed_file_path = os.path.join( self.wan_preprocess_dir, item["camera_file_name"].split("/")[-1].replace(".jpg", f"_{latent_id}.pt") ) 
+                if not os.path.exists(preprocessed_file_path):
+                    missing_image_cache.append(item)
+            print(f'Already processed {len(image_cache)-len(missing_image_cache)} cached images, {len(missing_image_cache)} images missing for VAE preprocessing')
+
+            wan_latent =self.process_camera_front_to_wan(missing_image_cache) #return list
+
+            #save wan_latent to preprocessed_file_path
+            print(f"Saving {len(missing_image_cache)} preprocessed VAE latent files to {self.wan_preprocess_dir}")
+            for item, latent in tqdm(zip(missing_image_cache, wan_latent), desc="Saving preprocessed VAE latents", total=len(missing_image_cache)):
+                preprocessed_file_path = os.path.join( self.wan_preprocess_dir, item["camera_file_name"].split("/")[-1].replace(".jpg", f"_{latent_id}.pt") ) 
+                torch.save(latent.cpu(), preprocessed_file_path)
+
+            for idx_db,item in tqdm(enumerate(image_cache), desc="Loading preprocessed VAE latents"):
+                preprocessed_file_path = os.path.join( self.wan_preprocess_dir, item["camera_file_name"].split("/")[-1].replace(".jpg", f"_{latent_id}.pt") )   
+                assert os.path.exists(preprocessed_file_path), f"Preprocessed VAE latent file {preprocessed_file_path} does not exist. Please run WAN preprocessing first to generate VAE latent files."
+
+                wan_vae_latent = torch.load(preprocessed_file_path).to(self.device)
+
+                self.data_bank[idx_db]['wan_vae_latent'] = wan_vae_latent
+
+            print(f'len data_bank {len(self.data_bank)}')
+            #clean up if record of databank with wan_vae_latent = tensor ([0]), skip
+            self.data_bank = [d for d in self.data_bank if d['wan_vae_latent'].shape != torch.Size([1])]
+            print(f'len data_bank after {len(self.data_bank)}')
 
         if False:
             ## Create GIF from PNG frames
@@ -529,6 +589,122 @@ class MANDataset(Dataset):
                         ),
                         save_di=self.viz_dir,
                     )
+    def process_camera_front_to_wan(self, image_cache):
+        if len(image_cache) == 0:
+            print("No images to process for WAN VAE.")
+            return []
+        wan_latents = []
+        wan_ready_images = []
+        w, h = 832, 480
+
+        print("wan_spec:", self.wan_spec) #{'wan_frames': 5, 'wan_frame_mode': 'repeat', 'wan_frame_stride': 1, 'wan_edge_policy': 'skip'}
+        for ic in tqdm(image_cache, desc="Processing images for VAE"):
+            image_rgb_path = os.path.join(self.data_root, ic["camera_file_name"])
+            img, _ = self.crop_and_scale_last2(
+                    TF.to_tensor(Image.open(image_rgb_path).convert("RGB"))
+                    .to(self.device)
+                    .float().sub_(0.5)
+                    .div_(0.5),
+                    (h, w),
+                    self.roi,
+                    self.original_image_size,
+                )
+            wan_ready_images.append(img)
+        wan_ready_images = torch.stack(wan_ready_images, dim=0)  # (B, C, H, W) wan_ready_images shape: torch.Size([50, 3, 480, 832])
+        # should be [B, C, F, H, W] 
+        #duplicate along frame dimension according to wan_spec
+        if self.wan_spec["wan_frame_mode"] == "repeat":
+            wan_tiled_images = wan_ready_images.unsqueeze_(2).repeat(1, 1, self.wan_spec["wan_frames"], 1, 1)  # (B, C, F, H, W)
+        else:
+            # wan_tiled_images 
+
+            # need to take into acount of frames, mode, stride, edge policy ,with respect to the scene edge , as we have scene_id, frame_index, to tell the boundary
+            # inside image_cache
+            # "scene_id": scene_id,
+            # "frame_index": pbar.n,
+            # "frame_token": frame_token,
+            # "camera_front": loaded_data["camera_front"],
+            # "camera_file_name": loaded_data["camera_file_name"],
+
+            #group min max indeces of a scene_id
+            scene_id_indeces = {}
+            for i, item in enumerate(image_cache):
+                # print(f"Index {i} scene_id {item['scene_id']} frame_index {item['frame_index']} camera_file_name {item['camera_file_name']}")
+                scene_id = item["scene_id"]
+                if scene_id not in scene_id_indeces:
+                    scene_id_indeces[scene_id] = []
+                scene_id_indeces[scene_id].append(i)
+            # print("scene_id_indeces:", scene_id_indeces)
+            tiling_plan = []
+            for ic_idx in range(len(image_cache)):
+                item = image_cache[ic_idx]
+                indeces_to_tile = []
+                
+                for f in range(self.wan_spec["wan_frames"]):
+                    if self.wan_spec["wan_frame_mode"] == "center":
+                        idx = ic_idx + (f - self.wan_spec["wan_frames"] // 2) * self.wan_spec["wan_frame_stride"]
+                    elif self.wan_spec["wan_frame_mode"] == "past":
+                        idx = ic_idx - (self.wan_spec["wan_frames"] - f - 1) * self.wan_spec["wan_frame_stride"]
+                    elif self.wan_spec["wan_frame_mode"] == "future":
+                        idx = ic_idx + f * self.wan_spec["wan_frame_stride"]
+                    else:
+                        raise ValueError(f"Unknown wan_frame_mode: {self.wan_spec['wan_frame_mode']}")
+                    
+                    # edge policy
+                    if self.wan_spec["wan_edge_policy"] == "skip":
+                        if idx < min(scene_id_indeces[item["scene_id"]]) or idx >= max(scene_id_indeces[item["scene_id"]]) + 1:
+                            continue
+                    elif self.wan_spec["wan_edge_policy"] == "pad":
+                        # print(f"scene id {item['scene_id']} indeces: {scene_id_indeces[item['scene_id']]} ")
+                        if idx < min(scene_id_indeces[item["scene_id"]]):
+                            idx = min(scene_id_indeces[item["scene_id"]])
+                        elif idx >= max(scene_id_indeces[item["scene_id"]]) + 1:
+                            idx = max(scene_id_indeces[item["scene_id"]])
+                    else:
+                        raise ValueError(f"Unknown wan_edge_policy: {self.wan_spec['wan_edge_policy']}")
+
+                    indeces_to_tile.append(idx)
+                tiling_plan.append(indeces_to_tile)
+                # print(f"Image {ic_idx} frame_index {item['frame_index']} indeces_to_tile: {indeces_to_tile}")
+            print("tiling_plan:", tiling_plan)
+
+            print(f"type dtype shape dev of wan_ready_images: {type(wan_ready_images)}, {wan_ready_images.dtype}, {wan_ready_images.shape}, {wan_ready_images.device}")
+            wan_ready_images = wan_ready_images.cpu()
+            print(f"type dtype shape dev of wan_ready_images: {type(wan_ready_images)}, {wan_ready_images.dtype}, {wan_ready_images.shape}, {wan_ready_images.device}")
+            tiled_list = [
+                torch.stack([wan_ready_images[idx] for idx in indeces], dim=1) for indeces in tiling_plan if len(indeces) == self.wan_spec["wan_frames"]
+            ]
+            ok_indices = [i for i, indeces in enumerate(tiling_plan) if len(indeces) == self.wan_spec["wan_frames"]]
+            print(f"tiled_list shape: {[(t.shape) for t in tiled_list]}")  # tiled_list shape: [torch.Size([3, 5, 480, 832]), torch.Size([3, 5, 480, 832]), torch.Size([3, 5, 480, 832]) ...
+            print(f"ok_indices: {ok_indices}")  # ok_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38]
+            wan_tiled_images = torch.stack(tiled_list, dim=0)  # (B, C, F, H, W)
+            print(f"wan_tiled_images shape after stack: {wan_tiled_images.shape}")  # tiled_list shape after stack: torch.Size([50, 3, 5, 480, 832])
+       
+        print("wan_tiled_images shape:", wan_tiled_images.shape )
+        with torch.no_grad():
+            BATCH = 16
+            for i in tqdm(range(0, wan_tiled_images.shape[0], BATCH), desc="Encoding images with VAE"):
+                batch_imgs = wan_tiled_images[i : i + BATCH].to(self.device)
+                # print("batch_imgs shape:", batch_imgs.shape) #batch_imgs shape: torch.Size([2, 3, 5, 480, 832])
+                outputs = self.vae21.encode(batch_imgs)  
+                # print(f"type of outputs: {type(outputs)}, length of outputs: {len(outputs)}") #<class 'list'>, length of outputs: 32
+                #must be list, make tensor
+                output_tensor = torch.stack(outputs, dim=0)  # (B, latent_dim)
+                # print("latents shape:", output_tensor.shape) #torch.Size([50, 16, 2, 60, 104])
+                wan_latents.append(output_tensor.cpu())
+
+        wan_latents = torch.cat(wan_latents, dim=0)  # (num_images, latent_dim)
+        print("wan_latents shape:", wan_latents.shape   ) #wan_latents shape: torch.Size([50, 16, 2, 60, 104])
+        #convert first dim to list
+        if wan_latents.shape[0] != wan_ready_images.shape[0]:
+            #use ok_indices to filter wan_latents
+            wan_latent_list = [torch.zeros(1) ] * wan_ready_images.shape[0]
+            for idx, ok_idx in enumerate(ok_indices):
+                wan_latent_list[ok_idx] = wan_latents[idx]
+        else:   
+            wan_latent_list = [wan_latents[i] for i in range(wan_latents.shape[0])]
+        print(f"lenz: {len(wan_latent_list)}")
+        return wan_latent_list
 
     def inverse_SE3(self, T: torch.Tensor) -> torch.Tensor:
         R = T[:3, :3]
@@ -643,103 +819,6 @@ class MANDataset(Dataset):
             image_size=[image_size_hw],
         )
 
-    # def calib_to_camera_base_MAN(
-    #     self,
-    #     cam_calib,
-    #     cam_pose,
-    #     radar_calib,
-    #     radar_pose,
-    #     image_size_hw: tuple,
-    #     offset: int = 0,
-    #     image_size: int = 618,
-    #     step=4,
-    # ):
-    #     """
-    #     image_size_hw: tuple, (height, width), origninal image size
-    #     """
-
-    #     # === Build individual transforms as 4x4 homogeneous matrices ===
-    #     T_radar2ego = (
-    #         self.to_homogeneous(
-    #             self.quat2mat(radar_calib["rotation"]),
-    #             torch.tensor(radar_calib["translation"]),
-    #         )
-    #         if step >= 1
-    #         else torch.eye(4)
-    #     )
-    #     T_ego2global_r = (
-    #         self.to_homogeneous(
-    #             self.quat2mat(radar_pose["rotation"]),
-    #             torch.tensor(radar_pose["translation"]),
-    #         )
-    #         if step >= 2
-    #         else torch.eye(4)
-    #     )
-    #     T_global2ego_c = (
-    #         self.to_homogeneous(
-    #             self.quat2mat(cam_pose["rotation"]),
-    #             torch.tensor(cam_pose["translation"]),
-    #         )
-    #         if step >= 3
-    #         else torch.eye(4)
-    #     )
-    #     T_ego2cam = (
-    #         self.to_homogeneous(
-    #             self.quat2mat(cam_calib["rotation"]),
-    #             torch.tensor(cam_calib["translation"]),
-    #         )
-    #         if step >= 4
-    #         else torch.eye(4)
-    #     )
-
-    #     # === Compose full radar → camera transform === but some conventions like Pytorch3D uses right matrix multiplication in computation procedure
-
-    #     # T_radar2cam = T_radar2ego.sT @ T_ego2global_r.T @ torch.linalg.inv(T_global2ego_c).T @ torch.linalg.inv(T_ego2cam).T
-
-    #     T_global2ego_c_inv = self.inverse_SE3(T_global2ego_c)
-    #     T_ego2cam_inv = self.inverse_SE3(T_ego2cam)
-
-    #     T_radar2cam = (
-    #         T_radar2ego.T @ T_ego2global_r.T @ T_global2ego_c_inv.T @ T_ego2cam_inv.T
-    #     )
-
-    #     R = T_radar2cam[:3, :3].unsqueeze(0)  # (1, 3, 3)
-    #     T = (T_radar2cam[3, :3].T).unsqueeze(0)  # (1, 3)
-
-    #     # print("R", R,R.shape            )
-    #     # print("R-1R", torch.linalg.inv(R) @ R)
-    #     # print("T", T,T.shape)
-
-    #     MAN_image_height = 943
-
-    #     s = image_size / MAN_image_height
-    #     # print("calib_to_camera_base_MAN s", s)
-    #     # Convert intrinsic matrix K to tensor
-
-    #     K = torch.tensor(cam_calib["camera_intrinsic"])
-
-    #     K[0, 0] = K[0, 0] * s
-    #     K[1, 1] = K[1, 1] * s
-
-    #     K[0, 2] = K[0, 2] * s
-    #     K[1, 2] = K[1, 2] * s
-
-    #     offset = offset * s
-
-    #     # Extract focal length and principal point from K
-    #     focal_length = torch.tensor([[K[0, 0], K[1, 1]]])
-    #     principal_point = torch.tensor([[K[0, 2] - offset, K[1, 2]]])
-
-    #     # Create a PerspectiveCameras object
-    #     return PerspectiveCameras(
-    #         focal_length=focal_length,
-    #         principal_point=principal_point,
-    #         R=R,
-    #         T=T,
-    #         in_ndc=False,
-    #         # image_size=[image_size_hw],
-    #         image_size=[[image_size, image_size]],
-    #     )
     def inferDA3_depth_image(
         self, image_paths, output_paths, batch_size=4
     ):  # output as h,w  (1 channel)
@@ -1284,6 +1363,7 @@ class MANDataset(Dataset):
         # 4) load camera
         time_7 = time.time()
         if self.get_camera:
+            
             image_rgb_path = os.path.join(self.data_root, cam["filename"])
 
             camera_front = plt.imread(image_rgb_path).transpose(
@@ -1301,6 +1381,56 @@ class MANDataset(Dataset):
 
             # upscale depth image to match camera size
             # [238, 504, 4] depth_image
+
+
+
+            if False: #test image clone
+                print("Testing image clone to device...")
+                if self.double_flip_images:
+                    # rotate 180 degrees
+                    camera_front = torch.flip(camera_front, [1])
+                    camera_front = torch.flip(camera_front, [2])
+                img1 = camera_front.clone().to(self.device).float() 
+
+                # print shape dtype, device, type, min max
+                print("img1 shape:", img1.shape)  # (3, H, W)
+                print("img1 dtype:", img1.dtype)  # torch.float32
+                print("img1 device:", img1.device)  # cuda:0
+                print("img1 type:", type(img1))  # <class 'torch.Tensor'>
+                print("img1 min max:", img1.min(), img1.max())  # min max values
+
+
+                image_rgb_path = os.path.join(self.data_root, cam["filename"])
+                img2 = (
+                    TF.to_tensor(Image.open(image_rgb_path).convert("RGB"))
+                    .to(self.device)
+                    .float())
+                
+                print("img2 shape:", img2.shape)  # (3, 1, H, W)
+                print("img2 dtype:", img2.dtype)  # torch.float32
+                print("img2 device:", img2.device)  # cuda:0
+                print("img2 type:", type(img2))  # <class 'torch.Tensor'>
+                print("img2 min max:", img2.min(), img2.max())  # min max values
+
+                # img1 shape: torch.Size([3, 943, 1980])
+                # img1 dtype: torch.float32
+                # img1 device: cuda:0
+                # img1 type: <class 'torch.Tensor'>
+                # img1 min max: tensor(0., device='cuda:0') tensor(1., device='cuda:0')
+
+                # img2 shape: torch.Size([3, 943, 1980])
+                # img2 dtype: torch.float32
+                # img2 device: cuda:0
+                # img2 type: <class 'torch.Tensor'>
+                # img2 min max: tensor(0., device='cuda:0') tensor(1., device='cuda:0')
+
+                # save the two images to /home/palakons/point_diffusion/output/sample/ as a.jpg and b.jpg
+                Image.fromarray(                ((img1.cpu().numpy().transpose(1, 2, 0) * 0.5 + 0.5) * 255).astype(                    np.uint8                )            ).save("/home/palakons/point_diffusion/output/sample/a.jpg")
+                Image.fromarray(                ((img2.squeeze(0).cpu().numpy().transpose(1, 2, 0) * 0.5 + 0.5) * 255).astype(                    np.uint8                )            ).save("/home/palakons/point_diffusion/output/sample/b.jpg")
+
+                print(f"all close, max diff: {(img1 - img2).abs().max()}")  # all close, max diff: tensor(0., device='cuda:0')
+
+                exit()
         time_9 = time.time()
         if self.get_depth:
             if (
@@ -1349,31 +1479,12 @@ class MANDataset(Dataset):
         points_uvz = image_coord[:, :3]  # N x3
         time_11 = time.time()
 
-        if self.wan_vae:
+        if self.wan_vae and False: #original
             # infer
 
             w, h = 832, 480
             F = 5
 
-            # temp = torch.nn.functional.interpolate(
-            #     TF.to_tensor(Image.open(image_rgb_path).convert("RGB"))
-            #     .sub_(0.5)
-            #     .div_(0.5)
-            #     .to(self.device)[None]
-            #     .cpu(),
-            #     size=(h, w),
-            #     mode="bicubic",
-            # ).transpose(0, 1)
-
-            # print("temp shape:", temp.shape)  # torch.Size([3, 480, 832])
-            # print(
-            #     "min max temp before norm:",
-            #     TF.to_tensor(Image.open(image_rgb_path).convert("RGB")).min(),
-            #     TF.to_tensor(Image.open(image_rgb_path).convert("RGB")).max(),
-            # )
-            # print("minmax temp norm:", temp.min(), temp.max())
-
-            # print("hw:", (h, w))
             preprocessed_file_path = os.path.join( self.wan_preprocess_dir, cam["filename"].split("/")[-1].replace(".jpg", f"_preprocessed.pt") ) if self.wan_preprocess_dir is not None else None
             # print("preprocessed_file_path:", preprocessed_file_path)
             if self.wan_preprocess_dir is not None and os.path.exists(preprocessed_file_path):
@@ -1549,9 +1660,10 @@ class MANDataset(Dataset):
             "npoints_original": npoints_original,
             "npoints_after_distance_filter": n_points_after_distance_filter,
             "npoints_filtered": npoints_filtered,
+            "camera_file_name": cam["filename"],
         }
-        if self.wan_vae:
-            output["wan_vae_latent"] = wan_vae_latent  # add wan vae latent
+        # if self.wan_vae:
+        #     output["wan_vae_latent"] = wan_vae_latent  # add wan vae latent
         if self.get_clip:
             output["clip_feature"] = clip_feature  # add clip feature
         if self.get_camera:

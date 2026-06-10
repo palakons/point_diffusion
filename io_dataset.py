@@ -29,20 +29,20 @@ def save_point_sample(path, pred, gt=None, condition=None, meta=None):
     np.savez_compressed(path, **data)
 
 def make_man_pc(
-    num_points=64, n_scene=1, device="cpu", is_dense=False, data_file="man-mini"
+    num_points=64, n_scene=1, device="cpu", is_dense=False, data_file="man-mini",wan_spec={"wan_frames":5, "wan_frame_mode":"repeat", "wan_frame_stride":1,"wan_edge_policy":"skip"},get_wan_cond=True,scene_ids=[]
 ):
     # B 128 128 pt 9.482Gi/15.992Gi
     import sys
-
+    print(f"get_wan_cond: {get_wan_cond}, wan_spec: {wan_spec}")
     sys.path.append("/home/palakons/point_diffusion")
     from man_ddpm import MANDataset
     if is_dense:
         ds = MANDataset(
             # scene_ids=list(range(450,598)),
-            scene_ids=[],
+            scene_ids=scene_ids,
             data_file=data_file,
             device=device,
-            wan_vae=True,
+            wan_vae=get_wan_cond,
             wan_vae_checkpoint="/checkpoints/huggingface_hub/models--Wan-AI--Wan2.2-T2V-A14B/Wan2.1_VAE.pth",
             n_p=num_points,
             normalize_type="minmax",
@@ -53,10 +53,16 @@ def make_man_pc(
             y_range=[-50, 50],
             z_range=[-2, 2],
             wan_preprocess_dir="/data/palakons/man_wan_preprocessed",
-            coord_only=False
+            coord_only=False,
+            wan_spec = wan_spec
         )
 
         # print(f"keys in man dataset item: {ds[0].keys()}")  # keys
+        print(f'len of ds: {len(ds)}, expected: {n_scene}') # len of ds: 148, expected: 148
+
+        print(f"------- NOW will assume n_scene=len(ds) and stack the data -------")
+        n_scene = len(ds)
+
         npoints_originals =[ds[i]['npoints_original'] for i in range(n_scene)]
         npoints_after_distance_filter = [ds[i]['npoints_after_distance_filter'] for i in range(n_scene)]
         npoints_filtereds = [ds[i]['npoints_filtered'] for i in range(n_scene)]
@@ -74,11 +80,14 @@ def make_man_pc(
         ).to(
             device
         )  # [B, N, 3]
-        wan_cond = torch.stack(
-            [ds[i]["wan_vae_latent"] for i in range(n_scene)], dim=0
-        ).to(
-            device
-        )  # [B, latent_dim]
+        wan_cond = None
+        if get_wan_cond and wan_spec is not None:
+            wan_cond = torch.stack(
+                [ds[i]["wan_vae_latent"] for i in range(n_scene)], dim=0
+            ).to(
+                device
+            )  # [B, latent_dim]
+        
         return x0sbn3[:,:,:3], wan_cond, ds, x0sbn3[:,:,3:6],x0sbn3[:,:,6:]
 
     else:
@@ -87,7 +96,7 @@ def make_man_pc(
                 scene_ids=[i],
                 data_file=data_file,
                 device=device,
-                wan_vae=True,
+                wan_vae=get_wan_cond,
                 wan_vae_checkpoint="/checkpoints/huggingface_hub/models--Wan-AI--Wan2.2-T2V-A14B/Wan2.1_VAE.pth",
                 n_p=num_points,
                 normalize_type="minmax",
@@ -98,6 +107,7 @@ def make_man_pc(
                 y_range=[-50, 50],
                 z_range=[-2, 2],
                 wan_preprocess_dir="/data/palakons/man_wan_preprocessed",
+            wan_spec = wan_spec,
             coord_only=False
             )
             for i in range(n_scene)
@@ -106,14 +116,16 @@ def make_man_pc(
         x0sbn3 = torch.stack([data[0]["filtered_radar_data"] for data in ds], dim=0).to(
             device
         )  # [B, N, 3]
-        wan_cond = torch.stack([data[0]["wan_vae_latent"] for data in ds], dim=0).to(
-            device
-        )  # [B, latent_dim]
+        wan_cond = None
+        if get_wan_cond and wan_spec is not None:
+            wan_cond = torch.stack([data[0]["wan_vae_latent"] for data in ds], dim=0).to(
+                device
+            )  # [B, latent_dim]
         # print(f"shapes x0sbn3: {x0sbn3.shape}, wan_cond: {wan_cond.shape}") #shapes x0sbn3: torch.Size([B, 128, 3]), wan_cond: torch.Size([B, 16, 2, 60, 104])
         return x0sbn3[:,:,:3], wan_cond, combined_ds, x0sbn3[:,:,3:6],x0sbn3[:,:,6:]
 
 
-def make_various_pc(num_points=64, device="cpu", n_shapes=7):
+def make_various_pc(num_points=64, device="cpu", n_shapes=7,wan_spec={"wan_frames":5, "wan_frame_mode":"repeat", "wan_frame_stride":1,"wan_edge_policy":"skip"}):
     theta = torch.linspace(0, math.pi / 2, num_points)
     x = torch.cos(theta)
     y = torch.sin(theta)
@@ -208,6 +220,9 @@ def make_various_pc(num_points=64, device="cpu", n_shapes=7):
         x_range=[0, 50],
         y_range=[-50, 50],
         z_range=[-2, 2],
+            wan_preprocess_dir="/data/palakons/man_wan_preprocessed",
+            coord_only=False,
+            wan_spec = wan_spec
     )
     data = dataset[0]
     shape_man = data["filtered_radar_data"]
@@ -225,14 +240,14 @@ def make_various_pc(num_points=64, device="cpu", n_shapes=7):
             shape_wedge,
             random_shape,
             shape_boxside,
-            shape_man,
+            shape_man[:,:3]
         ],
         dim=0,
     ).to(device)
     print(f"old shape before adding extra features: {data.shape}") # should be [7, num_points, 3]
     #attached 2 2 tot he last dim, random data, to test conditioning on extra features
     torch.manual_seed(42) #this ensure the random features are the same across runs for consistency
-    data = torch.cat([data, torch.rand_like(data[:,:,:2])], dim=-1)
+    data = torch.cat([data, torch.rand_like(data[:,:,:2])], dim=-1).cpu()
     print(
         "Created various shapes point cloud with shape: ",
         data.shape,
@@ -349,14 +364,128 @@ def duplicate_batch(x,target_batch_size):
     x_repeated = x_repeated[:target_batch_size]  # Repeat and trim to target batch size
     assert x_repeated.shape[0] == target_batch_size, f"Expected batch size {target_batch_size}, but got {x_repeated.shape[0]}"
     return x_repeated
-def make_dataset(shape_name, n_train_scene, N, cond_mode, cond_method, device='cpu', data_file=None):
+
+def make_proper_man_dataset( N, cond_mode, cond_method, n_train_frames=None, device='cpu', data_file=None,wan_spec=None, split_ratio=None,split_seed=42,scene_split_method="random",n_eval_frames=None,n_test_frames=None): #random,first,last
+    if wan_spec is None:
+        wan_spec={"wan_frames":5, "wan_frame_mode":"repeat", "wan_frame_stride":1,"wan_edge_policy":"skip"}
+    if split_ratio is None:
+        split_ratio={"train":0.8, "eval":0.1, "test":0.1}
+
+    total_scenes = 597 if data_file == "man-full" else 10
+
+    all_scene_ids = list(range(total_scenes))
+    
+    test_scenes_num = max(1, int(split_ratio["test"] * total_scenes)) 
+    eval_scenes_num = max(1, int(split_ratio["eval"] * total_scenes)) 
+    train_scenes_num = total_scenes - test_scenes_num - eval_scenes_num
+
+    if scene_split_method == "last":
+        #reverse the scene ids, so that we take the last scenes for training, and the first scenes for testing and evaluation
+        all_scene_ids = all_scene_ids[::-1]
+    elif scene_split_method == "random":
+        g = torch.Generator().manual_seed(split_seed)
+        all_scene_ids=torch.randperm(total_scenes, generator=g).numpy().tolist()
+
+    available_train_scenes = sorted(all_scene_ids[:train_scenes_num])
+    available_eval_scenes = sorted(all_scene_ids[train_scenes_num:train_scenes_num+eval_scenes_num])
+    available_test_scenes = sorted(all_scene_ids[train_scenes_num+eval_scenes_num:train_scenes_num+eval_scenes_num+test_scenes_num])
+    print(f"Total scenes: {total_scenes}, Train scenes: {available_train_scenes}, Eval scenes: {available_eval_scenes}, Test scenes: {available_test_scenes}")
+    n_eval_frames = total_scenes*40 if n_eval_frames is None else n_eval_frames
+    n_test_frames = total_scenes*40 if n_test_frames is None else n_test_frames
+    
+
+    get_wan = (cond_method == 'wan' and cond_mode != 'none')
+    
+    train_ds,eval_ds,test_ds = [list(make_man_pc(
+        num_points=N,scene_ids= scene_ids,
+        n_scene=n_frame_num,
+        is_dense=True,
+        device=device,
+        data_file=data_file,
+        wan_spec=wan_spec,
+        get_wan_cond=get_wan
+    ) ) for scene_ids,n_frame_num in zip([available_train_scenes, available_eval_scenes, available_test_scenes], [n_train_frames, n_eval_frames, n_test_frames])] #x0sbn3, wan_cond (maybe None), dataset,doppler,rcs
+    print(f"requested train frames: {n_train_frames}, eval frames: {n_eval_frames}, test frames: {n_test_frames}")
+    print(f"actual train frames: {train_ds[0].shape[0]}, eval frames: {eval_ds[0].shape[0]}, test frames: {test_ds[0].shape[0]} which is {'DIFFERENT' if train_ds[0].shape[0]!=n_train_frames else 'SAME'} as requested")
+    
+    frame_ids = {"train": {'token':[train_ds[2][i]['frame_token'][:5] for i in range(train_ds[0].shape[0])],"scene_id":[train_ds[2][i]['scene_id'] for i in range(train_ds[0].shape[0])],"frame_index":[train_ds[2][i]['frame_index'] for i in range(train_ds[0].shape[0])]},"eval": {'token':[eval_ds[2][i]['frame_token'][:5] for i in range(eval_ds[0].shape[0])],"scene_id":[eval_ds[2][i]['scene_id'] for i in range(eval_ds[0].shape[0])],"frame_index":[eval_ds[2][i]['frame_index'] for i in range(eval_ds[0].shape[0])]},"test": {'token':[test_ds[2][i]['frame_token'][:5] for i in range(test_ds[0].shape[0])],"scene_id":[test_ds[2][i]['scene_id'] for i in range(test_ds[0].shape[0])],"frame_index":[test_ds[2][i]['frame_index'] for i in range(test_ds[0].shape[0])]} }
+    
+    train_ds =[train_ds[0], train_ds[1], torch.norm(train_ds[3], p=2, dim=-1, keepdim=True), train_ds[4]] #x0sbn3, wan_cond, doppler, rcs
+    eval_ds =[eval_ds[0], eval_ds[1], torch.norm(eval_ds[3], p=2, dim=-1, keepdim=True), eval_ds[4]] #x0sbn3, wan_cond, doppler, rcs
+    test_ds =[test_ds[0], test_ds[1], torch.norm(test_ds[3], p=2, dim=-1, keepdim=True), test_ds[4]] #x0sbn3, wan_cond, doppler, rcs
+
+
+
+    assert train_ds[2].shape[-1] == 1, f"Doppler should have shape [B, N, 1], but got {train_ds[2].shape}"  
+
+
+    
+    frame_count={"train": train_ds[0].shape[0], "eval": eval_ds[0].shape[0], "test": test_ds[0].shape[0]}
+    print(f"sizes of train_ds: {train_ds[0].shape}, eval_ds: {eval_ds[0].shape}, test_ds: {test_ds[0].shape}") # should be [n_scene, num_points, 3]
+    assert train_ds[0].shape[0] == n_train_frames, f"Expected {n_train_frames} frames in train_ds, but got {train_ds[0].shape[0]}"
+
+    # x0sbn3, wan_cond, dataset,doppler,rcs = train_ds
+
+    if cond_mode =='none':
+        print("cond_mode is 'none', setting wan_cond to zeros.")
+        train_ds[1] =  torch.zeros(( train_ds[0].shape[0] , 1), device='cpu').float()
+        eval_ds[1] =  torch.zeros(( eval_ds[0].shape[0] , 1), device='cpu').float()
+        test_ds[1] =  torch.zeros(( test_ds[0].shape[0] , 1), device='cpu').float()
+    else:
+        if cond_method == 'wan':
+            assert  train_ds[1] is not None, "wan_cond is None but cond_method is 'wan'."
+            wan_max = train_ds[1].abs().max() 
+            if wan_max == 0:
+                print("Warning: max absolute value of wan_cond in train_ds is 0, which may cause division by zero during normalization. Setting wan_max to 1 to avoid this issue.")
+                wan_max = 1.0
+
+            for ds in [train_ds, eval_ds, test_ds]:
+                print(f"max abs wan_cond in ds: {ds[1].abs().max() if ds[1] is not None else 'N/A'}") # check the max abs value of wan_cond before normalization
+                ds[1] /= wan_max
+                
+            for ds in [train_ds, eval_ds, test_ds]:
+                print(f"max abs wan_cond after normalization in ds: {ds[1].abs().max() if ds[1] is not None else 'N/A'}") # check the max abs value of wan_cond after normalization
+        elif cond_method == 'scene_id': #actually frame_id
+            total_scenes_num = frame_count["train"] + frame_count["eval"] + frame_count["test"]
+            train_ds[1] = ((torch.arange(0, 0+train_ds[0].shape[0], device='cpu').float() / total_scenes_num)*2-1).unsqueeze(1)  # [n_scene], normalized to [-1,1]
+            acc_scenes_num = train_ds[0].shape[0]
+            eval_ds[1] = ((torch.arange(acc_scenes_num, acc_scenes_num+eval_ds[0].shape[0], device='cpu').float() / total_scenes_num)*2-1).unsqueeze(1)  # [n_scene], normalized to [-1,1]
+            acc_scenes_num += eval_ds[0].shape[0]
+            test_ds[1] = ((torch.arange(acc_scenes_num, acc_scenes_num+test_ds[0].shape[0], device='cpu').float() / total_scenes_num)*2-1).unsqueeze(1)  # [n_scene], normalized to [-1,1]
+
+    for setname, ds in zip(["train", "eval", "test"], [train_ds, eval_ds, test_ds]):
+        print(f"Dataset: {setname}")
+        for i, name in enumerate(["x0sbn3", "wan_cond", "doppler","rcs"]): #assume no None
+            print(f"{name} {i}  shape: {ds[i].shape}, dtype: {ds[i].dtype}, device: {ds[i].device}") 
+            ds[i] = ds[i].cpu()
+
+    for setname, ds in zip(["train", "eval", "test"], [train_ds, eval_ds, test_ds]):
+        print(f"Dataset: {setname}")
+        for i, name in  enumerate(["x0sbn3", "wan_cond", "doppler","rcs"]): #assume no None
+            print(f"{name} {i}shape: {ds[i].shape}, dtype: {ds[i].dtype}, device: {ds[i].device}")  #must be on cpu for the following preprocessing steps to save GPU memory??
+            assert ds[i].device == torch.device('cpu'), f"{name} in {setname} dataset is not on CPU after preprocessing, which may cause high GPU memory usage. Please move it to CPU before further processing. Current device: {ds[i].device}"
+
+    for data_name,idx in zip(["x0sbn3","doppler","rcs"], [0,2,3]):
+        mean, max_half_range = None, None
+        for setname, ds in zip(["train", "eval", "test"], [train_ds, eval_ds, test_ds]):
+            if mean is None:
+                ds[idx], mean_, max_half_range_ = normalize_data(ds[idx], save_filename_title=(f"/home/palakons/point_diffusion/output/sample/{setname}_{data_name}_data_normalization.png", f"{setname} {data_name} data normalization"))
+                mean = mean_
+                max_half_range = max_half_range_    
+            else:
+                ds[idx],_,_ = normalize_data(ds[idx], mean=mean, max_half_range=max_half_range, save_filename_title=(f"/home/palakons/point_diffusion/output/sample/{setname}_{data_name}_data_normalization.png", f"{setname} {data_name} data normalization"))
+
+    return train_ds, eval_ds, test_ds,frame_ids
+
+
+def make_dataset(shape_name, n_train_scene, N, cond_mode, cond_method, device='cpu', data_file=None,wan_spec={"wan_frames":5, "wan_frame_mode":"repeat", "wan_frame_stride":1,"wan_edge_policy":"skip"}):
     total_sc = int(1.25 * n_train_scene)
 
     if cond_mode =='none':
-        cond = torch.zeros((total_sc, 1), device=device).float()
+        cond = torch.zeros((total_sc, 1), device='cpu').float()
     else:
         if cond_method == 'scene_id':
-            cond = torch.arange(total_sc, device=device).float() / max(
+            cond = torch.arange(total_sc, device='cpu').float() / max(
                         total_sc - 1, 1
                     )  # [n_scene], normalized to [0,1]
             cond = (cond * 2 - 1) # normalize to [-1,1], [batch_size, cond_dim]
@@ -366,7 +495,7 @@ def make_dataset(shape_name, n_train_scene, N, cond_mode, cond_method, device='c
         assert cond_mode is None or cond_method == 'scene_id', f"cond_mode {cond_mode} is not compatible with shape_name 'various' since it relies on scene_id conditioning. Please set cond_mode to 'scene_id' or None."
         assert total_sc <= 8, f"n_scene is too large for 'various' shape_name. "
         x0sbn3 = make_various_pc(
-            num_points=N, device=device, n_shapes=total_sc
+            num_points=N, device=device, n_shapes=total_sc,wan_spec=wan_spec
         )  # [B,N, 3]
         x0sbn3 = x0sbn3.cpu()  # Move to CPU for preprocessing to save GPU memory
 
@@ -387,9 +516,11 @@ def make_dataset(shape_name, n_train_scene, N, cond_mode, cond_method, device='c
 
     elif shape_name == "realman":
         x0sbn3, wan_cond, dataset,doppler,rcs = make_man_pc(
-            num_points=N, n_scene=total_sc, device=device, data_file=data_file
+            num_points=N, n_scene=total_sc, device=device, data_file=data_file,wan_spec=wan_spec,get_wan_cond=(cond_method == 'wan' and cond_mode != 'none')
         )  # [B,N, 3]
-        x0sbn3, wan_cond, dataset,doppler,rcs = x0sbn3.cpu(), wan_cond.cpu(), dataset, doppler.cpu(), rcs.cpu()  # Move to CPU for preprocessing to save GPU memory
+        x0sbn3, dataset,doppler,rcs = x0sbn3.cpu(), dataset, doppler.cpu(), rcs.cpu()  # Move to CPU for preprocessing to save GPU memory
+        if wan_cond is not None:
+            wan_cond = wan_cond.cpu()  # Move to CPU for preprocessing to save GPU memory
         x0sbn3_eval = x0sbn3[n_train_scene : n_train_scene+n_eval_scene]  # Reserve the last part for evaluation
         x0sbn3 = x0sbn3[:n_train_scene]  # Use only the first n_scene shapes for training, reserve the rest for evaluation
         
@@ -416,8 +547,12 @@ def make_dataset(shape_name, n_train_scene, N, cond_mode, cond_method, device='c
             is_dense=True,
             device=device,
             data_file=data_file,
+            wan_spec=wan_spec,
+            get_wan_cond=(cond_method == 'wan' and cond_mode != 'none')
         )  # [B,N, 3]
-        x0sbn3, wan_cond, dataset,doppler,rcs = x0sbn3.cpu(), wan_cond.cpu(), dataset, doppler.cpu(), rcs.cpu()  # Move to CPU for preprocessing to save GPU memory
+        x0sbn3,  dataset,doppler,rcs = x0sbn3.cpu(), dataset, doppler.cpu(), rcs.cpu()  # Move to CPU for preprocessing to save GPU memory
+        if wan_cond is not None:
+            wan_cond = wan_cond.cpu()  # Move to CPU for preprocessing to save GPU memory
 
         if cond_method == 'wan' and cond_mode != 'none':
             cond = wan_cond / wan_cond.abs().max()  # Normalize wan_cond to [-1,1] for conditioning

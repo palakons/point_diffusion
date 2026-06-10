@@ -11,3 +11,4 @@
 *.pt
 *.pth
 *.h5
+/output
