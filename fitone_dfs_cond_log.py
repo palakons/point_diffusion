@@ -26,6 +26,99 @@ from io_dataset import (
     make_dataset,
     save_point_sample,make_proper_man_dataset
 )
+def sample_or_retrieve_in_batches(
+    model, scheduler, gt_all, cond_all, cond_train_norm, x0sbn3_train_norm,
+    c_name, seed, N, inout_dim, T_infer, device, batch_size=32
+):
+    preds = []
+    conds_used = []
+
+    total = gt_all.shape[0]
+
+    for s in range(0, total, batch_size):
+        e = min(s + batch_size, total)
+        gt_b = gt_all[s:e]
+        cond_b = cond_all[s:e]
+        b = e - s
+        shapes_b = (b, N, inout_dim)
+
+        if c_name == "correct_cond":
+            c_value_use = cond_b.to(device)
+
+            with torch.no_grad():
+                pred_b = p_sample_loop(
+                    model, shapes_b, scheduler,
+                    num_inference_steps=T_infer,
+                    device=device,
+                    condition=c_value_use,
+                    seed=seed,
+                )
+
+        elif c_name == "zero_cond":
+            c_value_use = torch.zeros_like(cond_b).to(device)
+
+            with torch.no_grad():
+                pred_b = p_sample_loop(
+                    model, shapes_b, scheduler,
+                    num_inference_steps=T_infer,
+                    device=device,
+                    condition=c_value_use,
+                    seed=seed,
+                )
+
+        elif c_name == "shuffled_cond":
+            perm = torch.randperm(total)
+            while torch.equal(perm, torch.arange(total)) and total > 1:
+                perm = torch.randperm(total)
+
+            # fixed shuffled condition for this full evaluation
+            shuffled_all = cond_all[perm]
+            c_value_use = shuffled_all[s:e].to(device)
+
+            with torch.no_grad():
+                pred_b = p_sample_loop(
+                    model, shapes_b, scheduler,
+                    num_inference_steps=T_infer,
+                    device=device,
+                    condition=c_value_use,
+                    seed=seed,
+                )
+
+        elif c_name == "nn_retrieval":
+            q = F.normalize(cond_b.reshape(b, -1).float().cpu(), dim=-1, eps=1e-8)
+            k = F.normalize(
+                cond_train_norm.reshape(cond_train_norm.shape[0], -1).float().cpu(),
+                dim=-1,
+                eps=1e-8,
+            )
+            nn_idx = (q @ k.T).argmax(dim=1)
+
+            c_value_use = cond_train_norm[nn_idx].to(device)
+            pred_b = x0sbn3_train_norm[nn_idx].to(device)
+
+        else:
+            raise ValueError(f"Unknown condition type: {c_name}")
+
+        preds.append(pred_b.detach().cpu())
+        conds_used.append(c_value_use.detach().cpu() if c_value_use is not None else None)
+
+    pred_all = torch.cat(preds, dim=0)
+    cond_used_all = torch.cat(conds_used, dim=0) if conds_used[0] is not None else None
+
+    return pred_all, cond_used_all
+def none_if_all_zero(x):
+    if x is None:
+        return None
+    return None if torch.all(x == 0) else x
+def append_eval_row(csv_path, row: dict):
+    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+    file_exists = os.path.exists(csv_path)
+
+    with open(csv_path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(row)
 def debug_batch(x, pred=None, target=None, loss=None, name=""):
     print(f"\n--- DEBUG {name} ---")
     print("x:", tuple(x.shape), x.dtype, x.device, "grad?", x.requires_grad)
@@ -150,6 +243,8 @@ def make_run_id(args):
             model_spec += f"_{args.set_cond_type}"
         if args.use_condition_pooling:
             model_spec += f"_pool_k{args.condition_pool_kernel}"
+        if args.use_wan_pos_emb:
+            model_spec += "_wanpe"
         
 
     shape_spec = f"_{args.data_file}" if args.shape_name.startswith("realman") else ""
@@ -203,6 +298,9 @@ def p_sample_loop(
             model_output = model(x, t_tensor, condition=condition)
             # print(f"step")
             x = scheduler.step(model_output, t_step, x).prev_sample
+    except Exception as e:
+        print(f"Exception in p_sample_loop: {e}")
+        print(f"shaps at exception: x {x.shape}, t_tensor {t_tensor.shape}, condition {condition.shape if condition is not None else None}")
     finally:
         model.train(prev_mode)
     return x
@@ -416,6 +514,11 @@ def parse_args():
         default=4,
         help="Spatial pooling kernel/stride for WAN condition.",
     )
+    parser.add_argument(
+        "--use_wan_pos_emb",
+        action="store_true",
+        help="Add learned 2D positional embeddings to WAN tokens for cross-attention.",
+    )
     args = parser.parse_args()
 
     return args
@@ -457,6 +560,8 @@ def train_eval_step(
 
     x0_cpu = x0sbn3_norm_rep[idx]
     x0 = x0_cpu.to(device, non_blocking=True)
+    assert not torch.isnan(x0).any() and not torch.isinf(x0).any(), f"NaN or Inf detected in x0 after moving to device: {x0}"
+
     if scene_condition_rep is not None:
         cond_cpu = scene_condition_rep[idx]
         cond = cond_cpu.to(device, non_blocking=True)
@@ -594,6 +699,16 @@ def train_eval_step(
     if is_train:
         optimizer.zero_grad()
         loss.backward()
+
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            model.parameters(),
+            max_norm=1.0,
+            error_if_nonfinite=True,
+        )
+        loss_dict["grad_norm"] = grad_norm.item()
+        
+
+
         optimizer.step()
     return loss, loss_dict
 
@@ -1004,6 +1119,8 @@ if __name__ == "__main__":
         )
 
         logger = ExperimentLogger(tb_dir, data_dir, vars(args))
+
+        summary_csv = os.path.join(data_dir+"/..", "condition_eval_summary.csv")
         logger.log_text("total_parameters", f"{sum(p.numel() for p in model.parameters())}",0)
         
         param_groups = {}
@@ -1029,7 +1146,7 @@ if __name__ == "__main__":
                 optimizer=optimizer,
                 scheduler=scheduler,
                 x0sbn3_norm_rep=x0sbn3_train_norm_rep,
-                scene_condition_rep=cond_train_norm_rep if not torch.all(cond_train_norm_rep == 0) else None,  # if condition is all zeros, treat it as no condition
+                scene_condition_rep=cond_train_norm_rep,
                 T=T,
                 B=B,
                 device=device,
@@ -1048,9 +1165,9 @@ if __name__ == "__main__":
                 loss_dict.update(
                     {
                         "lr": optimizer.param_groups[0]["lr"],
-                        "grad_norm": torch.nn.utils.clip_grad_norm_(
-                            model.parameters(), max_norm=1e5
-                        ),
+                        # "grad_norm": torch.nn.utils.clip_grad_norm_(
+                        #     model.parameters(), max_norm=1e5
+                        # ),
                     }
                 )
                 logger.log_train(step, loss_dict, log_group=False)
@@ -1070,13 +1187,16 @@ if __name__ == "__main__":
                         [cond_eval_norm, cond_train_norm],
                         [x0sbn3_eval_norm, x0sbn3_train_norm],
                     ), desc=f"Sampling and plotting at step {step}",leave=False):
+                        assert gt.shape[0] == set_cond.shape[0], f"Number of samples in gt {gt.shape[0]} and condition {set_cond.shape[0]} must match for set {set_name}"
                         sample_B = min(
-                            8, set_cond.shape[0]
-                        )  # number of samples to generate for visualization, at most 8 to avoid long sampling time and overcrowded plots
+                            8, set_cond.shape[0], gt.shape[0]
+                        ) 
+                        # sample_B = gt.shape[0]
                         assert (
                             set_cond.shape[0] >= sample_B
                         ), f"Need at least {sample_B} samples in the dataset for visualization, but got {set_cond.shape[0]}"
                         expanded_cond = set_cond[:sample_B]
+                        extended_gt = gt[:sample_B]                        
                         shapes = (sample_B, N, inout_dim)
 
                         random_perm = torch.randperm(sample_B)
@@ -1084,23 +1204,34 @@ if __name__ == "__main__":
                             random_perm = torch.randperm(sample_B)
                         conditions = [
                             ("correct_cond", expanded_cond),
+                            # ("zero_cond", None),
                             ("zero_cond", torch.zeros_like(expanded_cond)),
                             ("shuffled_cond", expanded_cond[random_perm]),
-                            ("nn_cond", None),
+                            ("nn_retrieval", None),
                         ]
 
                         for seed in tqdm([42, 43], desc=f"Seeds for {set_name}", leave=False):
                             for c_name, c_value in tqdm(conditions, desc=f"Conditions for {set_name}", leave=False):
+                                if set_name == "train" and c_name == "nn_retrieval":
+                                    continue
+                                if c_name == "nn_retrieval" and seed != 42:
+                                    continue
+                                
                                 npz_fname = (
                                     f"{dir_name}/{set_name}_{c_name}_sd{seed}.npz"
                                 )
                                 pred_x = None
-                                if c_name == "nn_cond":
-                                    nn_idx = torch.cdist(expanded_cond.view(sample_B, -1).float(), cond_train_norm.view(cond_train_norm.shape[0], -1).float()).argmin(dim=1)
+                                if c_name == "nn_retrieval":
+                                    # nn_idx = torch.cdist(expanded_cond.view(sample_B, -1).float(), cond_train_norm.view(cond_train_norm.shape[0], -1).float()).argmin(dim=1)
+
+                                    q = F.normalize(expanded_cond.reshape(sample_B, -1).float(), dim=-1)
+                                    k = F.normalize(cond_train_norm.reshape(cond_train_norm.shape[0], -1).float(), dim=-1)
+                                    nn_idx = (q @ k.T).argmax(dim=1)
+
                                     c_value_use = cond_train_norm[nn_idx].to(device)
                                     pred_x = x0sbn3_train_norm[nn_idx].to(device)
                                 else:
-                                    c_value_use = c_value
+                                    c_value_use = c_value.to(device) if c_value is not None else None
                                     with torch.no_grad():
                                         
                                         pred_x = p_sample_loop(
@@ -1117,12 +1248,34 @@ if __name__ == "__main__":
                                 # print(f"shapes for stat calculation: pred_x {pred_x.shape}, gt {x0sbn3_norm[: shapes[0]].shape}, condition {c_value.shape}  ")
                                 try:
                                     point_stat_output = calculate_pointset_stat(
-                                        pred_x.cpu(), gt[: shapes[0]].cpu(), c_name, seed
+                                        pred_x.cpu(), extended_gt.cpu(), c_name, seed
                                     )
                                 except Exception as e:  
                                     print(f"Error calculating point set statistics at step {step} for {set_name} with condition {c_name} and seed {seed}: {e}")
                                     point_stat_output = {"cd": float("nan"), "fidelity": float("nan"), "diversity": float("nan")}
 
+                                summary_row = {
+                                    "run_id": run_id,
+                                    "step": step,
+                                    "n_scene": args.n_scene,
+                                    "set_name": set_name,              # train/eval
+                                    "condition_type": c_name,          # correct/zero/shuffled/nn
+                                    "seed": seed,
+                                    "model_name": args.model_name,
+                                    "cond_type": getattr(args, "set_cond_type", None),
+                                    "prediction_type": args.prediction_type,
+                                    "cd_mode": args.cd_mode,
+                                    "lambda_cd": args.lambda_cd,
+                                    "lambda_mse": args.lambda_mse,
+                                    "use_condition_pooling": getattr(args, "use_condition_pooling", False),
+                                    "condition_pool_kernel": getattr(args, "condition_pool_kernel", None),
+                                    "set_tx_dim": getattr(args, "set_tx_dim", None),
+                                }
+                                for k, v in point_stat_output.items():
+                                    if isinstance(v, torch.Tensor):
+                                        v = v.detach().cpu().item() if v.numel() == 1 else str(v.detach().cpu().tolist())
+                                    summary_row[k] = v
+                                append_eval_row(summary_csv, summary_row)
                                 if (
                                     set_name == "eval"
                                 ):  # log for seed, condition type, and eval/train set
@@ -1135,8 +1288,8 @@ if __name__ == "__main__":
                                     save_point_sample(
                                         npz_fname,
                                         pred_x.cpu(),
-                                        gt=gt[: shapes[0]].cpu(),
-                                        condition=c_value_use.cpu(),
+                                        gt=extended_gt.cpu(),
+                                        condition=c_value_use.cpu() if c_value_use is not None else None,
                                         meta={
                                             **point_stat_output,
                                             **{
@@ -1154,11 +1307,11 @@ if __name__ == "__main__":
                                     for c in c_value_use[:sample_B]
                                     .view(sample_B, -1)
                                     .mean(dim=1)
-                                ]
+                                ] if c_value_use is not None else [f"N/A" for _ in range(sample_B)]
                                 # print(f"batch_titles: {batch_titles}")
                                 plot_pc_batch(
                                     pred_x,
-                                    gt=gt[: shapes[0]],
+                                    gt=extended_gt,
                                     title=f"step{step} {set_name} {c_name} sd{seed} N:{N} T:{T} Inf:{T_infer} B:{B}",
                                     fname=f"{temp_dir}/denoised_{set_name}_{c_name}_{seed}_{step:06d}.png",
                                     azm=azm_easing(
@@ -1184,7 +1337,7 @@ if __name__ == "__main__":
                     optimizer=optimizer,
                     scheduler=scheduler,
                     x0sbn3_norm_rep=x0sbn3_eval_norm_rep,
-                    scene_condition_rep=cond_eval_norm_rep if not torch.all(cond_eval_norm_rep == 0) else None,  # if condition is all zeros, treat it as no condition
+                    scene_condition_rep=cond_eval_norm_rep,
                     T=T,
                     B=B,
                     device=device,
@@ -1211,7 +1364,7 @@ if __name__ == "__main__":
         )
         for set_name in ["eval", "train"]:
             for seed in [42, 43]:
-                for c_name in ["correct_cond", "zero_cond", "shuffled_cond", "nn_cond"]:
+                for c_name in ["correct_cond", "zero_cond", "shuffled_cond", "nn_retrieval"]:
                     os.system(
                         f"ls -v {temp_dir}/denoised_{set_name}_{c_name}_{seed}_*.png | xargs cat | ffmpeg -y -framerate {fps} -f image2pipe -i - {temp_dir}/../{set_name}_{c_name}_{seed}_{run_id}.gif"
                     )

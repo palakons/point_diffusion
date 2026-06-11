@@ -13,15 +13,31 @@ class FiLM(nn.Module):
             nn.SiLU(),
             nn.Linear(context_dim, dim * 2),
         )
+
+        nn.init.zeros_(self.to_gamma_beta[-1].weight)
+        nn.init.zeros_(self.to_gamma_beta[-1].bias)
     def forward(self, h: torch.Tensor, context: torch.Tensor):
         """
         h:       [B, N, D]
         context: [B, C]
         """
+
+        # trace_tensor("FiLM/input_h_before", h)
+        # trace_tensor("FiLM/context", context)
+
         gamma, beta = self.to_gamma_beta(context).chunk(2, dim=-1)
+
+        # trace_tensor("FiLM/gamma", gamma)
+        # trace_tensor("FiLM/beta", beta)
+
         gamma = gamma[:, None, :]
         beta = beta[:, None, :]
-        return h * (1.0 + gamma) + beta
+        out =h * (1.0 + gamma) + beta
+
+        # trace_tensor("FiLM/output_h_after", out)
+
+
+        return out
 
 class FullSetTransformerBlock(nn.Module):
     def __init__(
@@ -66,28 +82,42 @@ class FullSetTransformerBlock(nn.Module):
 
     def forward(self, h: torch.Tensor, context: torch.Tensor, cross_context: torch.Tensor = None):
         """
-        h:       [B, N, D]
+        h:       [B, N, D] 32, 128 ,128
         context: [B, C]
         """
+
+        #trace_tensor(f"block/input_h", h)
         # Attention residual branch
         a = self.norm1(h)
+        #trace_tensor(f"block/norm1_h", a)
         if self.cond_type in ["film", "film-xattn"]:
             a = self.film1(a, context)
         a, _ = self.attn(a, a, a, need_weights=False)
+        #trace_tensor(f"block/attn_h", a)
         h = h + self.drop1(a)
+        #trace_tensor(f"block/output_h", h)
+
 
         # Cross-attention residual branch
         if self.cond_type in ["xattn", "film-xattn"] and cross_context is not None:
             c = self.norm_cross(h)
+            #trace_tensor(f"block/norm_cross_h", c)
             c, _ = self.cross_attn(c, cross_context, cross_context, need_weights=False) # Q from h, K,V from cross_context
+            #trace_tensor(f"block/cross_attn_h", c)
             h = h + self.drop1(c)
+            #trace_tensor(f"block/output_h", h)
+
 
         # MLP residual branch
         m = self.norm2(h)
+        #trace_tensor(f"block/norm2_h", m)
         if self.cond_type in ["film", "film-xattn"]:
             m = self.film2(m, context)
+            #trace_tensor(f"block/film2_h", m)
         m = self.mlp(m)
+        #trace_tensor(f"block/mlp_h", m)
         h = h + self.drop2(m)
+        #trace_tensor(f"block/output_h", h)
         return h
 
 class FullSetTransformerDenoiser(nn.Module):
@@ -115,6 +145,7 @@ class FullSetTransformerDenoiser(nn.Module):
         mlp_ratio: int = 4,
         use_condition_pooling: bool = False,
         condition_pool_kernel: int = 4,
+        use_wan_pos_emb: bool = False,
     ):
         super().__init__()
 
@@ -130,6 +161,7 @@ class FullSetTransformerDenoiser(nn.Module):
         self.wan_shape = tuple(wan_shape)
         self.use_condition_pooling = use_condition_pooling
         self.condition_pool_kernel = condition_pool_kernel
+        self.use_wan_pos_emb = use_wan_pos_emb
         self.wan_shape = wan_shape
 
         self.time_emb = SinusoidalTimeEmbedding(time_dim)
@@ -165,6 +197,20 @@ class FullSetTransformerDenoiser(nn.Module):
                 nn.Linear(wan_hidden, dim),
                 nn.LayerNorm(dim),
             )
+            if self.use_wan_pos_emb:
+                if len(wan_shape) != 4:
+                    raise ValueError(f"use_wan_pos_emb expects WAN shape [C,F,H,W], got {wan_shape}")
+
+                _, _, h, w = wan_shape
+
+                if self.use_condition_pooling:
+                    assert h % condition_pool_kernel == 0 and w % condition_pool_kernel == 0, \
+                        "WAN spatial dimensions must be divisible by pool kernel"
+                    h = h // condition_pool_kernel
+                    w = w // condition_pool_kernel
+
+                self.wan_pos_emb = nn.Parameter(torch.zeros(1, h * w, dim))
+                nn.init.trunc_normal_(self.wan_pos_emb, std=0.02)
         self.xyz_proj = nn.Sequential(
             nn.Linear(in_channels, dim),
             nn.GELU(),
@@ -222,6 +268,9 @@ class FullSetTransformerDenoiser(nn.Module):
         B, N, C = x.shape
         # assert C == 3, f"Expected x [B,N,3], got {x.shape}"
         # xyz as the point feature
+        # trace_tensor("input_x", x)
+        # trace_tensor("input_t", t)
+        # trace_tensor("input_condition", condition)
         h = self.xyz_proj(x)
         # timestep context
         t_context = self.time_mlp(self.time_emb(t.to(x.device)))
@@ -272,13 +321,21 @@ class FullSetTransformerDenoiser(nn.Module):
                         f"Expected WAN condition with shape [B, 16, 2, 60, 104], got {condition.shape}"
                     )
                 # print(f"[FullSetTransformerDenoiser] WAN condition shape: {condition.shape}, processed WAN shape for cross-attention: {wan_tokens.shape} should be [B, 390, 32]") # → [B, 390, 32] 
-                cross_context = self.wan_mlp_cross(wan_tokens)
+                # cross_context = self.wan_mlp_cross(wan_tokens)
                 # print(f"[FullSetTransformerDenoiser] cross-attention context shape: {cross_context.shape} should be [B, 390, dim]") #[B, 390, dim]
 
-    
-    
+                cross_context = self.wan_mlp_cross(wan_tokens)
 
-        for block in self.blocks:
+                if self.use_wan_pos_emb:
+                    cross_context = cross_context + self.wan_pos_emb.to(
+                        device=cross_context.device,
+                        dtype=cross_context.dtype,
+                    )
+
+        for ib, block in enumerate(self.blocks):
+            # trace_tensor(f"block_{ib}/input_h", h)
+            # trace_tensor(f"block_{ib}/context", context)
+            # trace_tensor(f"block_{ib}/cross_context", cross_context)
             h = block(h, context, cross_context)
         out = self.out(self.out_norm(h))
         return out
@@ -757,7 +814,29 @@ def make_model( device, args):
             mlp_ratio=4,
             use_condition_pooling=args.use_condition_pooling,
             condition_pool_kernel=args.condition_pool_kernel,
+            use_wan_pos_emb=args.use_wan_pos_emb,
         ).to(device)
     else:
         raise ValueError(f"Unknown model_name: {model_name}")
     return model
+def trace_tensor(name, x, step=None):
+    if x is None:
+        print(f"[TRACE] {name}: None")
+        return
+
+    with torch.no_grad():
+        finite = torch.isfinite(x).all().item()
+        x_det = x.detach()
+        print(
+            f"[TRACE step={step}] {name}: "
+            f"finite={finite} "
+            f"shape={tuple(x_det.shape)} "
+            f"min={x_det.min().item():.4e} "
+            f"max={x_det.max().item():.4e} "
+            f"mean={x_det.mean().item():.4e} "
+            f"std={x_det.std().item():.4e} "
+            f"absmax={x_det.abs().max().item():.4e}"
+        )
+
+        if not finite:
+            raise FloatingPointError(f"{name} contains NaN/Inf")
