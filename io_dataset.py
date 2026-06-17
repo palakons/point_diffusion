@@ -365,54 +365,103 @@ def duplicate_batch(x,target_batch_size):
     assert x_repeated.shape[0] == target_batch_size, f"Expected batch size {target_batch_size}, but got {x_repeated.shape[0]}"
     return x_repeated
 
-def make_proper_man_dataset( N, cond_mode, cond_method, n_train_frames=None, device='cpu', data_file=None,wan_spec=None, split_ratio=None,split_seed=42,scene_split_method="random",n_eval_frames=None,n_test_frames=None): #random,first,last
+def make_proper_man_dataset( N, cond_mode, cond_method, n_train_frames=None, device='cpu', data_file=None,wan_spec=None, split_ratio=None,split_seed=42,scene_split_method="random",n_eval_frames=None,n_test_frames=None,one_distribution= False): #random,first,last
     if wan_spec is None:
         wan_spec={"wan_frames":5, "wan_frame_mode":"repeat", "wan_frame_stride":1,"wan_edge_policy":"skip"}
     if split_ratio is None:
         split_ratio={"train":0.8, "eval":0.1, "test":0.1}
 
     total_scenes = 597 if data_file == "man-full" else 10
-
     all_scene_ids = list(range(total_scenes))
-    
-    test_scenes_num = max(1, int(split_ratio["test"] * total_scenes)) 
-    eval_scenes_num = max(1, int(split_ratio["eval"] * total_scenes)) 
-    train_scenes_num = total_scenes - test_scenes_num - eval_scenes_num
-
-    if scene_split_method == "last":
-        #reverse the scene ids, so that we take the last scenes for training, and the first scenes for testing and evaluation
-        all_scene_ids = all_scene_ids[::-1]
-    elif scene_split_method == "random":
-        g = torch.Generator().manual_seed(split_seed)
-        all_scene_ids=torch.randperm(total_scenes, generator=g).numpy().tolist()
-
-    available_train_scenes = sorted(all_scene_ids[:train_scenes_num])
-    available_eval_scenes = sorted(all_scene_ids[train_scenes_num:train_scenes_num+eval_scenes_num])
-    available_test_scenes = sorted(all_scene_ids[train_scenes_num+eval_scenes_num:train_scenes_num+eval_scenes_num+test_scenes_num])
-    print(f"Total scenes: {total_scenes}, Train scenes: {available_train_scenes}, Eval scenes: {available_eval_scenes}, Test scenes: {available_test_scenes}")
-    n_eval_frames = total_scenes*40 if n_eval_frames is None else n_eval_frames
-    n_test_frames = total_scenes*40 if n_test_frames is None else n_test_frames
-    
-
     get_wan = (cond_method == 'wan' and cond_mode != 'none')
-    
-    train_ds,eval_ds,test_ds = [list(make_man_pc(
-        num_points=N,scene_ids= scene_ids,
-        n_scene=n_frame_num,
-        is_dense=True,
-        device=device,
-        data_file=data_file,
-        wan_spec=wan_spec,
-        get_wan_cond=get_wan
-    ) ) for scene_ids,n_frame_num in zip([available_train_scenes, available_eval_scenes, available_test_scenes], [n_train_frames, n_eval_frames, n_test_frames])] #x0sbn3, wan_cond (maybe None), dataset,doppler,rcs
-    print(f"requested train frames: {n_train_frames}, eval frames: {n_eval_frames}, test frames: {n_test_frames}")
-    print(f"actual train frames: {train_ds[0].shape[0]}, eval frames: {eval_ds[0].shape[0]}, test frames: {test_ds[0].shape[0]} which is {'DIFFERENT' if train_ds[0].shape[0]!=n_train_frames else 'SAME'} as requested")
-    
+    if one_distribution:
+        print("one_distribution is True, using all scenes for train, and no eval or test scenes.")
+        all_scene_ids = torch.randperm(total_scenes, generator=torch.Generator().manual_seed(split_seed)).numpy().tolist() #shuffle the scene ids
+        assert n_train_frames is not None, "n_train_frames must be specified when one_distribution is True, since we need to know how many frames to sample from the shuffled scenes."
+        if n_eval_frames is None :
+            n_eval_frames = int(n_train_frames * split_ratio["eval"]/split_ratio["train"])
+            print(f"n_eval_frames is not specified, set to {n_eval_frames} based on n_train_frames and split_ratio.")
+        if n_test_frames is None :
+            n_test_frames = int(n_train_frames * split_ratio["test"]/split_ratio["train"])
+            print(f"n_test_frames is not specified, set to {n_test_frames} based on n_train_frames and split_ratio.")
+        total_frames = n_train_frames + n_eval_frames + n_test_frames
+        print(f"total_frames: {total_frames}, n_train_frames: {n_train_frames}, n_eval_frames: {n_eval_frames}, n_test_frames: {n_test_frames}")
+
+        mands = make_man_pc(
+            num_points=N,scene_ids= all_scene_ids,
+            n_scene=total_frames,
+            is_dense=True,
+            device=device,
+            data_file=data_file,
+            wan_spec=wan_spec,
+            get_wan_cond=get_wan
+        ) #x0sbn3[:,:,:3], wan_cond, combined_ds, x0sbn3[:,:,3:6],x0sbn3[:,:,6:]
+        assert mands[0].shape[0] == total_frames, f"Expected total_frames {total_frames}, but got {mands[0].shape[0]}"
+        
+        train_ds = [mands[0][:n_train_frames]]
+        train_ds.append(mands[1][:n_train_frames] if mands[1] is not None else None)
+        train_ds.append(mands[2][:n_train_frames] if mands[2] is not None else None)
+        train_ds.append(mands[3][:n_train_frames] if mands[3] is not None else None)
+        train_ds.append(mands[4][:n_train_frames] if mands[4] is not None else None)
+
+        eval_ds = [mands[0][n_train_frames:n_train_frames+n_eval_frames]]
+        eval_ds.append(mands[1][n_train_frames:n_train_frames+n_eval_frames] if mands[1] is not None else None)
+        eval_ds.append(mands[2][n_train_frames:n_train_frames+n_eval_frames] if mands[2] is not None else None)
+        eval_ds.append(mands[3][n_train_frames:n_train_frames+n_eval_frames] if mands[3] is not None else None)
+        eval_ds.append(mands[4][n_train_frames:n_train_frames+n_eval_frames] if mands[4] is not None else None)
+
+        test_ds = [mands[0][n_train_frames+n_eval_frames:]]
+        test_ds.append(mands[1][n_train_frames+n_eval_frames:] if mands[1] is not None else None)
+        test_ds.append(mands[2][n_train_frames+n_eval_frames:] if mands[2] is not None else None)
+        test_ds.append(mands[3][n_train_frames+n_eval_frames:] if mands[3] is not None else None)
+        test_ds.append(mands[4][n_train_frames+n_eval_frames:] if mands[4] is not None else None)   
+
+
+        assert train_ds[0].shape[0] == n_train_frames, f"Expected n_train_frames {n_train_frames}, but got {train_ds[0].shape[0]}"
+        assert eval_ds[0].shape[0] == n_eval_frames, f"Expected n_eval_frames {n_eval_frames}, but got {eval_ds[0].shape[0]}"
+        assert test_ds[0].shape[0] == n_test_frames, f"Expected n_test_frames {n_test_frames}, but got {test_ds[0].shape[0]}"
+
+    else:
+
+        
+        test_scenes_num = max(1, int(split_ratio["test"] * total_scenes)) 
+        eval_scenes_num = max(1, int(split_ratio["eval"] * total_scenes)) 
+        train_scenes_num = total_scenes - test_scenes_num - eval_scenes_num
+
+        if scene_split_method == "last":
+            #reverse the scene ids, so that we take the last scenes for training, and the first scenes for testing and evaluation
+            all_scene_ids = all_scene_ids[::-1]
+        elif scene_split_method == "random":
+            g = torch.Generator().manual_seed(split_seed)
+            all_scene_ids=torch.randperm(total_scenes, generator=g).numpy().tolist()
+
+        available_train_scenes = sorted(all_scene_ids[:train_scenes_num])
+        available_eval_scenes = sorted(all_scene_ids[train_scenes_num:train_scenes_num+eval_scenes_num])
+        available_test_scenes = sorted(all_scene_ids[train_scenes_num+eval_scenes_num:train_scenes_num+eval_scenes_num+test_scenes_num])
+        print(f"Total scenes: {total_scenes}, Train scenes: {available_train_scenes}, Eval scenes: {available_eval_scenes}, Test scenes: {available_test_scenes}")
+        n_eval_frames = total_scenes*40 if n_eval_frames is None else n_eval_frames
+        n_test_frames = total_scenes*40 if n_test_frames is None else n_test_frames
+        
+
+        
+        train_ds,eval_ds,test_ds = [list(make_man_pc(
+            num_points=N,scene_ids= scene_ids,
+            n_scene=n_frame_num,
+            is_dense=True,
+            device=device,
+            data_file=data_file,
+            wan_spec=wan_spec,
+            get_wan_cond=get_wan
+        ) ) for scene_ids,n_frame_num in zip([available_train_scenes, available_eval_scenes, available_test_scenes], [n_train_frames, n_eval_frames, n_test_frames])] #x0sbn3, wan_cond (maybe None), dataset,doppler,rcs
+        print(f"requested train frames: {n_train_frames}, eval frames: {n_eval_frames}, test frames: {n_test_frames}")
+        print(f"actual train frames: {train_ds[0].shape[0]}, eval frames: {eval_ds[0].shape[0]}, test frames: {test_ds[0].shape[0]} which is {'DIFFERENT' if train_ds[0].shape[0]!=n_train_frames else 'SAME'} as requested")
+        
     frame_ids = {"train": {'token':[train_ds[2][i]['frame_token'][:5] for i in range(train_ds[0].shape[0])],"scene_id":[train_ds[2][i]['scene_id'] for i in range(train_ds[0].shape[0])],"frame_index":[train_ds[2][i]['frame_index'] for i in range(train_ds[0].shape[0])]},"eval": {'token':[eval_ds[2][i]['frame_token'][:5] for i in range(eval_ds[0].shape[0])],"scene_id":[eval_ds[2][i]['scene_id'] for i in range(eval_ds[0].shape[0])],"frame_index":[eval_ds[2][i]['frame_index'] for i in range(eval_ds[0].shape[0])]},"test": {'token':[test_ds[2][i]['frame_token'][:5] for i in range(test_ds[0].shape[0])],"scene_id":[test_ds[2][i]['scene_id'] for i in range(test_ds[0].shape[0])],"frame_index":[test_ds[2][i]['frame_index'] for i in range(test_ds[0].shape[0])]} }
     
     train_ds =[train_ds[0], train_ds[1], torch.norm(train_ds[3], p=2, dim=-1, keepdim=True), train_ds[4]] #x0sbn3, wan_cond, doppler, rcs
     eval_ds =[eval_ds[0], eval_ds[1], torch.norm(eval_ds[3], p=2, dim=-1, keepdim=True), eval_ds[4]] #x0sbn3, wan_cond, doppler, rcs
     test_ds =[test_ds[0], test_ds[1], torch.norm(test_ds[3], p=2, dim=-1, keepdim=True), test_ds[4]] #x0sbn3, wan_cond, doppler, rcs
+
 
 
 

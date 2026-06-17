@@ -394,7 +394,7 @@ class MANDataset(Dataset):
                 preprocessed_file_path = os.path.join( self.wan_preprocess_dir, item["camera_file_name"].split("/")[-1].replace(".jpg", f"_{latent_id}.pt") ) 
                 torch.save(latent.cpu(), preprocessed_file_path)
 
-            for idx_db,item in tqdm(enumerate(image_cache), desc="Loading preprocessed VAE latents"):
+            for idx_db,item in tqdm(enumerate(image_cache), desc="Loading preprocessed VAE latents", total=len(image_cache)):
                 preprocessed_file_path = os.path.join( self.wan_preprocess_dir, item["camera_file_name"].split("/")[-1].replace(".jpg", f"_{latent_id}.pt") )   
                 assert os.path.exists(preprocessed_file_path), f"Preprocessed VAE latent file {preprocessed_file_path} does not exist. Please run WAN preprocessing first to generate VAE latent files."
 
