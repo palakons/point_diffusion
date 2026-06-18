@@ -29,14 +29,14 @@ from io_dataset import (
 )
 def sample_or_retrieve_in_batches(
     model, scheduler, gt_all, cond_all, cond_train_norm, x0sbn3_train_norm,
-    c_name, seed, N, inout_dim, T_infer, device, batch_size=32,shuffle_perm=None 
+    c_name, seed, N, inout_dim, T_infer, device, batch_size=32,shuffle_perm=None ,
 ):
     preds = []
     conds_used = []
 
     total = gt_all.shape[0]
 
-    for s in range(0, total, batch_size):
+    for s in trange(0, total, batch_size,leave=False, desc=f"Sampling batch with {c_name}"):
         e = min(s + batch_size, total)
         gt_b = gt_all[s:e]
         cond_b = cond_all[s:e]
@@ -542,6 +542,59 @@ def parse_args():
 
     return args
 
+def gather_man_ds(args, checkpoint_dir):
+    x0sbn3_norm_all, cond_all, doppler_all, rcs_all = [], [], [], []
+    frame_ids_all = {"train": {'token':[],"scene_id":[],"frame_index":[],"data_file":[]}}
+    data_files = ['man-mini',"man-full"] if args.data_file == 'both' else [args.data_file]
+    missing_files = {}
+    for data_file in data_files:
+        print(f"Processing data file: {data_file}")
+        sc_ids = list(range(10 if data_file == 'man-mini' else 597)) 
+        for sc_id in sc_ids:
+            cache_fname = f"man_{data_file}_{sc_id}_{args.cond_method}_{args.N}_{args.cond_mode}_{args.wan_frames}_{args.wan_frame_mode}_{args.wan_frame_stride}_{args.wan_edge_policy}.pkl"
+            cache_path = os.path.join(checkpoint_dir, cache_fname)
+            if not os.path.exists(cache_path):
+                if data_file not in missing_files:
+                    missing_files[data_file] = []
+                missing_files[data_file].append(sc_id)
+            # else:
+            #     with open(cache_path, "rb") as f:   
+            #         (x0sbn3_norm, cond_norm, doppler_norm, rcs_norm),frame_ids= pickle.load(f)
+            #     print(f"Sc {sc_id} len frame_ids['train']['token'] {len(frame_ids['train']['token'])} x0sbn3_norm shape {x0sbn3_norm.shape} cond_norm shape {cond_norm.shape if cond_norm is not None else None} doppler_norm shape {doppler_norm.shape if doppler_norm is not None else None} rcs_norm shape {rcs_norm.shape if rcs_norm is not None else None}")
+    print(f"Missing files: {missing_files}")
+    if sum(len(v) for v in missing_files.values()) > 0:
+        print(f"Error: {sum(len(v) for v in missing_files.values())} cache files are missing. Please run the preprocessing script to generate the missing cache files before training.")
+        exit(1)
+            
+
+
+    for data_file in data_files:
+        sc_ids = list(range(10 if data_file == 'man-mini' else 597)) 
+        for sc_id in sc_ids:
+            cache_fname = f"man_{data_file}_{sc_id}_{args.cond_method}_{args.N}_{args.cond_mode}_{args.wan_frames}_{args.wan_frame_mode}_{args.wan_frame_stride}_{args.wan_edge_policy}.pkl"
+            cache_path = os.path.join(checkpoint_dir, cache_fname)
+            # assert  os.path.exists(cache_path), f"Cache file {cache_fname} not found, need to run python /palakons/point_diffusion/preprocess_man.py --cond_method wan --wan_frames 5 --wan_frame_mode center --wan_frame_stride 1 --wan_edge_policy skip --N 128  --data_file man-mini --num_scenes 100 --from_scene_id 0"
+            with open(cache_path, "rb") as f:   
+                (x0sbn3_norm, cond_norm, doppler_norm, rcs_norm),frame_ids= pickle.load(f)
+                x0sbn3_norm_all.append(x0sbn3_norm)
+                cond_all.append(cond_norm)
+                doppler_all.append(doppler_norm)
+                rcs_all.append(rcs_norm)
+
+                frame_ids_all["train"]["token"].extend(frame_ids["train"]["token"])
+                frame_ids_all["train"]["scene_id"].extend(frame_ids["train"]["scene_id"])
+                frame_ids_all["train"]["frame_index"].extend(frame_ids["train"]["frame_index"])
+                frame_ids_all["train"]["data_file"].extend([data_file] * len(frame_ids["train"]["token"]))
+    x0sbn3_norm_all = torch.cat(x0sbn3_norm_all, dim=0)
+    cond_all = torch.cat(cond_all, dim=0) if cond_all[0] is not None else None
+    doppler_all = torch.cat(doppler_all, dim=0) if doppler_all[0] is not None else None
+    rcs_all = torch.cat(rcs_all, dim=0) if rcs_all[0] is not None else None
+
+    assert x0sbn3_norm_all.shape[0] == len(frame_ids_all["train"]["token"]) == len(frame_ids_all["train"]["scene_id"]) == len(frame_ids_all["train"]["frame_index"]), f"Mismatch in number of samples and frame IDs: {x0sbn3_norm_all.shape[0]} vs {len(frame_ids_all['train']['token'])}"
+    print(f"Loaded {x0sbn3_norm_all.shape} samples from {len(data_files)} data files.")
+    return x0sbn3_norm_all, cond_all, doppler_all, rcs_all,frame_ids_all
+
+            
 
 def train_eval_step(
     model,
@@ -774,31 +827,35 @@ if __name__ == "__main__":
     }
     frame_ids = None
 
+    x0sbn3_norm, cond_norm, doppler_norm, rcs_norm,frame_ids_all = gather_man_ds(args, checkpoint_dir)
+    all_frame_ids=frame_ids_all["train"] 
+    print(f"Gathered MAN dataset: {x0sbn3_norm.shape} samples, cond shape: {cond_norm.shape if cond_norm is not None else None}, doppler shape: {doppler_norm.shape if doppler_norm is not None else None}, rcs shape: {rcs_norm.shape if rcs_norm is not None else None}")
+    print(f"all_frame_ids: {all_frame_ids}")
 
 
     if args.shape_name == "man_heldout_split":
-        assert args.val_scene_id >= 0, f"Need to specify a validation scene ID with --val_scene_id when using the 'man_heldout_split' shape_name. Please provide a non-negative integer for --val_scene_id."
+        data_file = 'both'
+        # assert args.val_scene_id >= 0, f"Need to specify a validation scene ID with --val_scene_id when using the 'man_heldout_split' shape_name. Please provide a non-negative integer for --val_scene_id."
         seed = args.seed
-        cache_fname = f"man_one_dist_frame_ids_man-mini_288_{cond_method}_{cond_mode}_{args.wan_frames}_{args.wan_frame_mode}_{args.wan_frame_stride}_{args.wan_edge_policy}_seed{42}.pkl"
-        cache_path = os.path.join(checkpoint_dir, cache_fname)
-        assert  os.path.exists(cache_path), f"Cache file {cache_fname} not found"
 
-        with open(cache_path, "rb") as f:   
-            (x0sbn3_train_norm, cond_train_norm, doppler_train_norm, rcs_train_norm), (
-                x0sbn3_eval_norm,
-                cond_eval_norm,
-                doppler_eval_norm,
-                rcs_eval_norm,
-            ),(x0sbn3_test_norm, cond_test_norm, doppler_test_norm, rcs_test_norm),frame_ids = pickle.load(f)
-        #combine all to one big chunk, alsi frame ids
+        # cache_fname = f"man_one_dist_frame_ids_man-mini_288_{cond_method}_{cond_mode}_{args.wan_frames}_{args.wan_frame_mode}_{args.wan_frame_stride}_{args.wan_edge_policy}_seed{42}.pkl"
+        # cache_path = os.path.join(checkpoint_dir, cache_fname)
+        # assert  os.path.exists(cache_path), f"Cache file {cache_fname} not found"
 
-        x0sbn3_norm = torch.cat([x0sbn3_train_norm, x0sbn3_eval_norm, x0sbn3_test_norm  ], dim=0)
-        cond_norm = torch.cat([cond_train_norm, cond_eval_norm, cond_test_norm], dim=0) if cond_train_norm is not None else None
-        doppler_norm = torch.cat([doppler_train_norm, doppler_eval_norm, doppler_test_norm], dim=0) if doppler_train_norm is not None else None
-        rcs_norm = torch.cat([rcs_train_norm, rcs_eval_norm, rcs_test_norm], dim=0) if rcs_train_norm is not None else None
-        all_frame_ids = {"token": frame_ids["train"]["token"] + frame_ids["eval"]["token"] + frame_ids["test"]["token"], "scene_id": frame_ids["train"]["scene_id"] + frame_ids["eval"]["scene_id"] + frame_ids["test"]["scene_id"], "frame_index": frame_ids["train"]["frame_index"] + frame_ids["eval"]["frame_index"] + frame_ids["test"]["frame_index"] }
+        # with open(cache_path, "rb") as f:   
+        #     (x0sbn3_train_norm, cond_train_norm, doppler_train_norm, rcs_train_norm), (
+        #         x0sbn3_eval_norm,
+        #         cond_eval_norm,
+        #         doppler_eval_norm,
+        #         rcs_eval_norm,
+        #     ),(x0sbn3_test_norm, cond_test_norm, doppler_test_norm, rcs_test_norm),frame_ids = pickle.load(f)
+            
+        # x0sbn3_norm = torch.cat([x0sbn3_train_norm, x0sbn3_eval_norm, x0sbn3_test_norm  ], dim=0)
+        # cond_norm = torch.cat([cond_train_norm, cond_eval_norm, cond_test_norm], dim=0) if cond_train_norm is not None else None
+        # doppler_norm = torch.cat([doppler_train_norm, doppler_eval_norm, doppler_test_norm], dim=0) if doppler_train_norm is not None else None
+        # rcs_norm = torch.cat([rcs_train_norm, rcs_eval_norm, rcs_test_norm], dim=0) if rcs_train_norm is not None else None
+        # all_frame_ids = {"token": frame_ids["train"]["token"] + frame_ids["eval"]["token"] + frame_ids["test"]["token"], "scene_id": frame_ids["train"]["scene_id"] + frame_ids["eval"]["scene_id"] + frame_ids["test"]["scene_id"], "frame_index": frame_ids["train"]["frame_index"] + frame_ids["eval"]["frame_index"] + frame_ids["test"]["frame_index"] }
         assert x0sbn3_norm.shape[0] == len(all_frame_ids["token"]) == len(all_frame_ids["scene_id"]) == len(all_frame_ids["frame_index"]), f"Number of samples in x0sbn3_norm {x0sbn3_norm.shape[0]} does not match number of frame ids {len(all_frame_ids['token'])}"
-
 
         allids = list(range(x0sbn3_norm.shape[0]))
         val_scene_id = args.val_scene_id
@@ -811,13 +868,7 @@ if __name__ == "__main__":
         real_train_idx = train_allids[:n_scene]
         assert len(real_train_idx) == n_scene, f"Number of training scenes selected {len(real_train_idx)} does not match requested {n_scene}"
 
-
-
-
         print(f"ALL. frame_ids: {all_frame_ids}, shape of x0sbn3_norm: {x0sbn3_norm.shape}, shape of cond_norm: {cond_norm.shape if cond_norm is not None else None}, shape of doppler_norm: {doppler_norm.shape if doppler_norm is not None else None}, shape of rcs_norm: {rcs_norm.shape if rcs_norm is not None else None}")
-        
-        
-        
 
         (x0sbn3_train_norm, cond_train_norm, doppler_train_norm, rcs_train_norm) = x0sbn3_norm[ real_train_idx], cond_norm[real_train_idx] if cond_norm is not None else None, doppler_norm[real_train_idx] if doppler_norm is not None else None, rcs_norm[real_train_idx] if rcs_norm is not None else None
 
@@ -830,26 +881,27 @@ if __name__ == "__main__":
 
     elif args.shape_name == "man_proper_split_real" and args.man_one_distribution:
         seed = args.seed
-        cache_fname = f"man_one_dist_frame_ids_man-mini_288_{cond_method}_{cond_mode}_{args.wan_frames}_{args.wan_frame_mode}_{args.wan_frame_stride}_{args.wan_edge_policy}_seed{42}.pkl"
-        cache_path = os.path.join(checkpoint_dir, cache_fname)
-        if os.path.exists(cache_path):
-            print(f"Loading MAN dataset from cache: {cache_path}")
-            with open(cache_path, "rb") as f:   
-                (x0sbn3_train_norm, cond_train_norm, doppler_train_norm, rcs_train_norm), (
-                    x0sbn3_eval_norm,
-                    cond_eval_norm,
-                    doppler_eval_norm,
-                    rcs_eval_norm,
-                ),(x0sbn3_test_norm, cond_test_norm, doppler_test_norm, rcs_test_norm),frame_ids = pickle.load(f)
-            #combine all to one big chunk, alsi frame ids
-            # frame_ids = {"train": {'token':[train_ds[2][i]['frame_token'][:5] for i in range(train_ds[0].shape[0])],"scene_id":[train_ds[2][i]['scene_id'] for i in range(train_ds[0].shape[0])],"frame_index":[train_ds[2][i]['frame_index'] for i in range(train_ds[0].shape[0])]},"eval": {'token':[eval_ds[2][i]['frame_token'][:5] for i in range(eval_ds[0].shape[0])],"scene_id":[eval_ds[2][i]['scene_id'] for i in range(eval_ds[0].shape[0])],"frame_index":[eval_ds[2][i]['frame_index'] for i in range(eval_ds[0].shape[0])]},"test": {'token':[test_ds[2][i]['frame_token'][:5] for i in range(test_ds[0].shape[0])],"scene_id":[test_ds[2][i]['scene_id'] for i in range(test_ds[0].shape[0])],"frame_index":[test_ds[2][i]['frame_index'] for i in range(test_ds[0].shape[0])]} }
+        data_file = 'both'
+        # cache_fname = f"man_one_dist_frame_ids_man-mini_288_{cond_method}_{cond_mode}_{args.wan_frames}_{args.wan_frame_mode}_{args.wan_frame_stride}_{args.wan_edge_policy}_seed{42}.pkl"
+        # cache_path = os.path.join(checkpoint_dir, cache_fname)
+        if True or os.path.exists(cache_path):
+            # print(f"Loading MAN dataset from cache: {cache_path}")
+            # with open(cache_path, "rb") as f:   
+            #     (x0sbn3_train_norm, cond_train_norm, doppler_train_norm, rcs_train_norm), (
+            #         x0sbn3_eval_norm,
+            #         cond_eval_norm,
+            #         doppler_eval_norm,
+            #         rcs_eval_norm,
+            #     ),(x0sbn3_test_norm, cond_test_norm, doppler_test_norm, rcs_test_norm),frame_ids = pickle.load(f)
+            # #combine all to one big chunk, alsi frame ids
+            # # frame_ids = {"train": {'token':[train_ds[2][i]['frame_token'][:5] for i in range(train_ds[0].shape[0])],"scene_id":[train_ds[2][i]['scene_id'] for i in range(train_ds[0].shape[0])],"frame_index":[train_ds[2][i]['frame_index'] for i in range(train_ds[0].shape[0])]},"eval": {'token':[eval_ds[2][i]['frame_token'][:5] for i in range(eval_ds[0].shape[0])],"scene_id":[eval_ds[2][i]['scene_id'] for i in range(eval_ds[0].shape[0])],"frame_index":[eval_ds[2][i]['frame_index'] for i in range(eval_ds[0].shape[0])]},"test": {'token':[test_ds[2][i]['frame_token'][:5] for i in range(test_ds[0].shape[0])],"scene_id":[test_ds[2][i]['scene_id'] for i in range(test_ds[0].shape[0])],"frame_index":[test_ds[2][i]['frame_index'] for i in range(test_ds[0].shape[0])]} }
     
-            x0sbn3_norm = torch.cat([x0sbn3_train_norm, x0sbn3_eval_norm, x0sbn3_test_norm  ], dim=0)
-            cond_norm = torch.cat([cond_train_norm, cond_eval_norm, cond_test_norm], dim=0) if cond_train_norm is not None else None
-            doppler_norm = torch.cat([doppler_train_norm, doppler_eval_norm, doppler_test_norm], dim=0) if doppler_train_norm is not None else None
-            rcs_norm = torch.cat([rcs_train_norm, rcs_eval_norm, rcs_test_norm], dim=0) if rcs_train_norm is not None else None
-            all_frame_ids = {"token": frame_ids["train"]["token"] + frame_ids["eval"]["token"] + frame_ids["test"]["token"], "scene_id": frame_ids["train"]["scene_id"] + frame_ids["eval"]["scene_id"] + frame_ids["test"]["scene_id"], "frame_index": frame_ids["train"]["frame_index"] + frame_ids["eval"]["frame_index"] + frame_ids["test"]["frame_index"] }
-            assert x0sbn3_norm.shape[0] == len(all_frame_ids["token"]) == len(all_frame_ids["scene_id"]) == len(all_frame_ids["frame_index"]), f"Number of samples in x0sbn3_norm {x0sbn3_norm.shape[0]} does not match number of frame ids {len(all_frame_ids['token'])}"
+            # x0sbn3_norm = torch.cat([x0sbn3_train_norm, x0sbn3_eval_norm, x0sbn3_test_norm  ], dim=0)
+            # cond_norm = torch.cat([cond_train_norm, cond_eval_norm, cond_test_norm], dim=0) if cond_train_norm is not None else None
+            # doppler_norm = torch.cat([doppler_train_norm, doppler_eval_norm, doppler_test_norm], dim=0) if doppler_train_norm is not None else None
+            # rcs_norm = torch.cat([rcs_train_norm, rcs_eval_norm, rcs_test_norm], dim=0) if rcs_train_norm is not None else None
+            # all_frame_ids = {"token": frame_ids["train"]["token"] + frame_ids["eval"]["token"] + frame_ids["test"]["token"], "scene_id": frame_ids["train"]["scene_id"] + frame_ids["eval"]["scene_id"] + frame_ids["test"]["scene_id"], "frame_index": frame_ids["train"]["frame_index"] + frame_ids["eval"]["frame_index"] + frame_ids["test"]["frame_index"] }
+            # assert x0sbn3_norm.shape[0] == len(all_frame_ids["token"]) == len(all_frame_ids["scene_id"]) == len(all_frame_ids["frame_index"]), f"Number of samples in x0sbn3_norm {x0sbn3_norm.shape[0]} does not match number of frame ids {len(all_frame_ids['token'])}"
 
             allids = list(range(x0sbn3_norm.shape[0]))
             random.seed(seed)
@@ -874,29 +926,29 @@ if __name__ == "__main__":
                         "eval": {"token":[all_frame_ids["token"][ i] for i in allids[-real_eval_size:]],"scene_id":[all_frame_ids["scene_id"][ i] for i in allids[-real_eval_size:]],"frame_index":[all_frame_ids["frame_index"][ i] for i in allids[-real_eval_size:]]} }
             print(f"After splitting cached dataset: Training scenes: {x0sbn3_train_norm.shape[0]}, Evaluation scenes: {x0sbn3_eval_norm.shape[0]}, frame_ids: {frame_ids}")
              
-        elif args.shape_name == "man_proper_split":
-            raise NotImplementedError(f"Lets only use the cached dataset for the specific case of one distribution, 288 scenes, and the man-mini data file for now to avoid accidentally overwriting existing cache. Requested n_scene: {n_scene}, data_file: {data_file}, cond_method: {cond_method}, cond_mode: {cond_mode}, wan_frames: {args.wan_frames}, wan_frame_mode: {args.wan_frame_mode}, wan_frame_stride: {args.wan_frame_stride}, wan_edge_policy: {args.wan_edge_policy}")
+        # elif args.shape_name == "man_proper_split":
+        #     raise NotImplementedError(f"Lets only use the cached dataset for the specific case of one distribution, 288 scenes, and the man-mini data file for now to avoid accidentally overwriting existing cache. Requested n_scene: {n_scene}, data_file: {data_file}, cond_method: {cond_method}, cond_mode: {cond_mode}, wan_frames: {args.wan_frames}, wan_frame_mode: {args.wan_frame_mode}, wan_frame_stride: {args.wan_frame_stride}, wan_edge_policy: {args.wan_edge_policy}")
 
-            (x0sbn3_train_norm, cond_train_norm, doppler_train_norm, rcs_train_norm), (
-                x0sbn3_eval_norm,
-                cond_eval_norm,
-                doppler_eval_norm,
-                rcs_eval_norm,
-            ),test_ds,frame_ids = make_proper_man_dataset( N, cond_mode, cond_method, n_train_frames=n_scene, device=device, data_file=data_file,wan_spec={"wan_frames": args.wan_frames, "wan_frame_mode": args.wan_frame_mode, "wan_frame_stride": args.wan_frame_stride, "wan_edge_policy": args.wan_edge_policy}, split_ratio={"train":0.8, "eval":0.1, "test":0.1},split_seed=seed, scene_split_method="first", n_eval_frames=max(2, int(n_scene/8)), n_test_frames=max(2, int(n_scene/8)),one_distribution=args.man_one_distribution
-            )        
-            if args.man_one_distribution and n_scene == 288 and x0sbn3_train_norm.shape[0] == 288 and data_file == "man-mini":
-                if not os.path.exists(cache_path):
-                    with open(cache_path, "wb") as f:
-                        pickle.dump([(x0sbn3_train_norm, cond_train_norm, doppler_train_norm, rcs_train_norm), (
-                            x0sbn3_eval_norm,
-                            cond_eval_norm,
-                            doppler_eval_norm,
-                            rcs_eval_norm,
-                        ),test_ds,frame_ids], f)
-                    print(f"MAN dataset cached at {cache_path} for future runs")
-                else:
-                    print(f"MAN dataset already cached at {cache_path}")
-                    raise RuntimeError("This should not happen due to the earlier existence check, but just in case to avoid overwriting existing cache.")
+        #     (x0sbn3_train_norm, cond_train_norm, doppler_train_norm, rcs_train_norm), (
+        #         x0sbn3_eval_norm,
+        #         cond_eval_norm,
+        #         doppler_eval_norm,
+        #         rcs_eval_norm,
+        #     ),test_ds,frame_ids = make_proper_man_dataset( N, cond_mode, cond_method, n_train_frames=n_scene, device=device, data_file=data_file,wan_spec={"wan_frames": args.wan_frames, "wan_frame_mode": args.wan_frame_mode, "wan_frame_stride": args.wan_frame_stride, "wan_edge_policy": args.wan_edge_policy}, split_ratio={"train":0.8, "eval":0.1, "test":0.1},split_seed=seed, scene_split_method="first", n_eval_frames=max(2, int(n_scene/8)), n_test_frames=max(2, int(n_scene/8)),one_distribution=args.man_one_distribution
+        #     )        
+        #     if args.man_one_distribution and n_scene == 288 and x0sbn3_train_norm.shape[0] == 288 and data_file == "man-mini":
+        #         if not os.path.exists(cache_path):
+        #             with open(cache_path, "wb") as f:
+        #                 pickle.dump([(x0sbn3_train_norm, cond_train_norm, doppler_train_norm, rcs_train_norm), (
+        #                     x0sbn3_eval_norm,
+        #                     cond_eval_norm,
+        #                     doppler_eval_norm,
+        #                     rcs_eval_norm,
+        #                 ),test_ds,frame_ids], f)
+        #             print(f"MAN dataset cached at {cache_path} for future runs")
+        #         else:
+        #             print(f"MAN dataset already cached at {cache_path}")
+        #             raise RuntimeError("This should not happen due to the earlier existence check, but just in case to avoid overwriting existing cache.")
     else:
 
         (x0sbn3_train_norm, cond_train_norm, doppler_train_norm, rcs_train_norm), (
@@ -1272,7 +1324,8 @@ if __name__ == "__main__":
             print(f"Saving frame_ids to logger config: {frame_ids}")
             logger.log_text("frame_ids",json.dumps(frame_ids, indent=4),0)
             
-
+        print(f"Starting training loop from step {start_step} to {ddpm_iteration} skape x0sbn3_train_norm_rep: {x0sbn3_train_norm_rep.shape}, cond_train_norm_rep: {cond_train_norm_rep.shape if cond_train_norm_rep is not None else None}")
+        exit()
         for step in tt:
 
             loss, loss_dict = train_eval_step(
@@ -1305,8 +1358,8 @@ if __name__ == "__main__":
                     }
                 )
                 logger.log_train(step, loss_dict, log_group=False)
-
-            if step > start_step and  step % save_checkpoint_every == 0:
+            is_final_sample_eval = (step + 1 >= ddpm_iteration)
+            if step > start_step and  (step % save_checkpoint_every == 0 or is_final_sample_eval) :
                 save_checkpoint(
                     model, optimizer, scheduler, step, checkpoint_path, vars(args)
                 )
@@ -1315,7 +1368,7 @@ if __name__ == "__main__":
                 if True:
                     dir_name = f"{samples_dir}/step_{step:06d}"
                     os.makedirs(dir_name, exist_ok=True)
-                    
+
                     for set_name, set_cond, gt in tqdm(zip(
                         ["eval", "train"],
                         [cond_eval_norm, cond_train_norm],
@@ -1344,22 +1397,22 @@ if __name__ == "__main__":
                         #     ("nn_retrieval", None),
                         # ]
 
-                        for seed in tqdm([42, 43], desc=f"Seeds for {set_name}", leave=False):
+                        for seed in tqdm([42, 43] if is_final_sample_eval else [42], desc=f"Seeds for {set_name}", leave=False):
                             for c_name in tqdm(["correct_cond", "zero_cond", "shuffled_cond", "nn_retrieval"], desc=f"Conditions for {set_name}", leave=False):
                             # for c_name, c_value in tqdm(conditions, desc=f"Conditions for {set_name}", leave=False):
                                 if set_name == "train" and c_name == "nn_retrieval":
                                     continue
                                 if c_name == "nn_retrieval" and seed != 42:
                                     continue
-                                full_B = gt.shape[0]
+                                full_B = gt.shape[0] if is_final_sample_eval else min(8, gt.shape[0])
                                 full_cond = set_cond[:full_B]
                                 full_gt = gt[:full_B]
 
                                 shuffle_perm = None
                                 if c_name == "shuffled_cond":
-                                    shuffle_perm = torch.randperm(gt.shape[0])
-                                    while torch.equal(shuffle_perm, torch.arange(gt.shape[0])) and gt.shape[0] > 1:
-                                        shuffle_perm = torch.randperm(gt.shape[0])
+                                    shuffle_perm = torch.randperm(full_B)
+                                    while torch.equal(shuffle_perm, torch.arange(full_B)) and full_B > 1:
+                                        shuffle_perm = torch.randperm(full_B)
 
                                 pred_all, cond_used_all = sample_or_retrieve_in_batches(
 
@@ -1456,7 +1509,7 @@ if __name__ == "__main__":
                                 else:
                                     raise ValueError(f"Unknown set_name: {set_name}")
                                 try:
-                                    plot_B = min(8, pred_all.shape[0])
+                                    plot_B = min(8, pred_all.shape[0]) 
                                     pred_x = pred_all[:plot_B]
                                     extended_gt = full_gt[:plot_B]
                                     c_value_use = cond_used_all[:plot_B] if cond_used_all is not None else None

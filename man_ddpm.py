@@ -313,7 +313,8 @@ class MANDataset(Dataset):
                 len(self.data_bank) < self.keep_frames or self.keep_frames == 0
             ):
                 loaded_data = self.load_data(trucksc, frame_token, self.get_bb)
-                if self.wan_vae: #if wan, and cached, and the cahed wan tensor is [0], set loaded_data to None
+                # assert loaded_data is not None, f"Failed to load data for scene {scene_id} frame {pbar.n} token {frame_token}"
+                if self.wan_vae and loaded_data is not None: #if wan, and cached, and the cahed wan tensor is [0], set loaded_data to None
                     preprocessed_file_path = os.path.join( self.wan_preprocess_dir, loaded_data["camera_file_name"].split("/")[-1].replace(".jpg", f"_{latent_id}.pt") ) 
                     if os.path.exists(preprocessed_file_path):
                         loaded_wan = torch.load(preprocessed_file_path)
@@ -329,7 +330,7 @@ class MANDataset(Dataset):
                         "frame_index": pbar.n,
                         "frame_token": frame_token,
                         "camera_file_name": loaded_data["camera_file_name"],
-                    })
+                    }) #cache even no points
                     if (
                         self.point_preset == "uniform"
                     ):  # assign grid of x [0-200] y [-100, 100] z [-20, 20] to radar points, and only keep one point in each grid cell, if multiple points in one grid cell, keep the one with highest rcs
@@ -386,6 +387,7 @@ class MANDataset(Dataset):
                     missing_image_cache.append(item)
             print(f'Already processed {len(image_cache)-len(missing_image_cache)} cached images, {len(missing_image_cache)} images missing for VAE preprocessing')
 
+
             wan_latent =self.process_camera_front_to_wan(missing_image_cache) #return list
 
             #save wan_latent to preprocessed_file_path
@@ -404,8 +406,12 @@ class MANDataset(Dataset):
 
             print(f'len data_bank {len(self.data_bank)}')
             #clean up if record of databank with wan_vae_latent = tensor ([0]), skip
+            print(f'len data_bank before {len(self.data_bank)}')
             self.data_bank = [d for d in self.data_bank if d['wan_vae_latent'].shape != torch.Size([1])]
-            print(f'len data_bank after {len(self.data_bank)}')
+            print(f'len data_bank after wan_vae_latent (valid edge) {len(self.data_bank)}')
+            self.data_bank = [d for d in self.data_bank if d['filtered_radar_data'].shape[0] > 0]
+            print(f'len data_bank after filtered_radar_data (no point) {len(self.data_bank)}')
+
 
         if False:
             ## Create GIF from PNG frames
@@ -439,6 +445,9 @@ class MANDataset(Dataset):
             [d["filtered_radar_data"] for d in self.data_bank], dim=0
         )  # filtered_radar_data, d["filtered_radar_data"] will have different number of row (dim 0) for each frame
         print("all_radar_positions", all_radar_positions.shape)  # 1x 16 x1
+        for d in self.data_bank:
+            print(f"frame_token {d['frame_token']} filtered_radar_data shape {d['filtered_radar_data'].shape}")
+            
 
         # calculate means
         dims = all_radar_positions.shape
@@ -677,7 +686,11 @@ class MANDataset(Dataset):
             ok_indices = [i for i, indeces in enumerate(tiling_plan) if len(indeces) == self.wan_spec["wan_frames"]]
             print(f"tiled_list shape: {[(t.shape) for t in tiled_list]}")  # tiled_list shape: [torch.Size([3, 5, 480, 832]), torch.Size([3, 5, 480, 832]), torch.Size([3, 5, 480, 832]) ...
             print(f"ok_indices: {ok_indices}")  # ok_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38]
-            wan_tiled_images = torch.stack(tiled_list, dim=0)  # (B, C, F, H, W)
+            if len(tiled_list) == 0:
+                print("No valid images to tile for WAN VAE. Returning empty list.")
+                return []
+            wan_tiled_images = torch.stack(tiled_list, dim=0)  
+            # (B, C, F, H, W)
             print(f"wan_tiled_images shape after stack: {wan_tiled_images.shape}")  # tiled_list shape after stack: torch.Size([50, 3, 5, 480, 832])
        
         print("wan_tiled_images shape:", wan_tiled_images.shape )
@@ -1616,23 +1629,22 @@ class MANDataset(Dataset):
         # 6) keep or padding radar points to fixed number, self.n_p
         output_filtered_radar_data = filtered_radar_data
         output_uvz = points_uvz[mask]
-        if output_uvz.shape[0] == 0:
-            return None  # skip this frame if no radar points are left after filtering
-        assert (
-            output_filtered_radar_data.shape[0] == output_uvz.shape[0]
-        ), "Filtered radar data and UVZ points must have the same number of points"
-        if self.n_p == 0:
-            pass
-        elif output_uvz.shape[0] < self.n_p:
-            # RANDOM RESAMPLING (Replacement)
-            # This maintains the true distribution of the radar data instead of clustering at zero
-            indices = torch.randint(0, output_uvz.shape[0], (self.n_p,))
-            output_uvz = output_uvz[indices]
-            output_filtered_radar_data = output_filtered_radar_data[indices]
-        elif output_uvz.shape[0] > self.n_p:  # randomly pick self.n_p points
-            indices = torch.randperm(output_uvz.shape[0])[: self.n_p]
-            output_uvz = output_uvz[indices]
-            output_filtered_radar_data = output_filtered_radar_data[indices]
+        if output_uvz.shape[0] >0:
+            if self.n_p == 0:
+                pass
+            elif output_uvz.shape[0] < self.n_p:
+                # RANDOM RESAMPLING (Replacement)
+                # This maintains the true distribution of the radar data instead of clustering at zero
+                indices = torch.randint(0, output_uvz.shape[0], (self.n_p,))
+                output_uvz = output_uvz[indices]
+                output_filtered_radar_data = output_filtered_radar_data[indices]
+            elif output_uvz.shape[0] > self.n_p:  # randomly pick self.n_p points
+                indices = torch.randperm(output_uvz.shape[0])[: self.n_p]
+                output_uvz = output_uvz[indices]
+                output_filtered_radar_data = output_filtered_radar_data[indices]
+        else:
+            # if no points,  output empty tensor with shape (self.n_p, 3) or (self.n_p, 7) depending
+            output_filtered_radar_data = output_filtered_radar_data[[]]
         time_15 = time.time()
         # calculate percentage of time spent in each step
         time_diff = {
