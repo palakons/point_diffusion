@@ -249,6 +249,12 @@ def parse_args():
         default=10,
         help="Number of scenes to use for training",
     )
+    parser.add_argument(
+        "--sensor_side",
+        type=str,
+        default="left",
+        help="Sensor side to use for training: 'left' or 'right'",
+    )
     args = parser.parse_args()
 
 
@@ -269,7 +275,7 @@ if __name__ == "__main__":
 
 
     for sc_id in trange(args.from_scene_id, args.from_scene_id + args.num_scenes, desc="Processing scenes"):
-        cache_fname = f"man_{args.data_file}_{sc_id}_{args.cond_method}_{args.N}_{args.cond_mode}_{args.wan_frames}_{args.wan_frame_mode}_{args.wan_frame_stride}_{args.wan_edge_policy}.pkl"
+        cache_fname = f"man_{args.data_file}_{sc_id}_{args.sensor_side}_{args.cond_method}_{args.N}_{args.cond_mode}_{args.wan_frames}_{args.wan_frame_mode}_{args.wan_frame_stride}_{args.wan_edge_policy}.pkl"
         cache_path = os.path.join(checkpoint_dir, cache_fname)
             
         mands = make_man_pc(
@@ -279,7 +285,9 @@ if __name__ == "__main__":
             device=device,
             data_file=args.data_file,
             wan_spec=wan_spec,
-            get_wan_cond=True
+            get_wan_cond=True,
+            radar_channel = "RADAR_LEFT_FRONT" if args.sensor_side == "left" else "RADAR_RIGHT_FRONT",
+            camera_channel = "CAMERA_LEFT_FRONT" if args.sensor_side == "left" else "CAMERA_RIGHT_FRONT"
         )
 
 
@@ -301,14 +309,18 @@ if __name__ == "__main__":
         else:
             if args.cond_method == 'wan':
                 assert  mands[1] is not None, "wan_cond is None but cond_method is 'wan'."
-                wan_max = mands[1].abs().max() 
+                try:
+                    wan_max = mands[1].abs().max() 
+                except Exception as e:
+                    print(f"Error computing max absolute value of wan_cond: {e}. Setting wan_max to 1 to avoid division by zero.")
+                    wan_max = 1.0
                 if wan_max == 0:
                     print("Warning: max absolute value of wan_cond in mands is 0, which may cause division by zero during normalization. Setting wan_max to 1 to avoid this issue.")
                     wan_max = 1.0
 
                 mands[1] /= wan_max
                     
-                print(f"max abs wan_cond after normalization in ds: {mands[1].abs().max() if mands[1] is not None else 'N/A'}") # check the max abs value of wan_cond after normalization
+                print(f"max abs wan_cond after normalization in ds: {wan_max}") # check the max abs value of wan_cond after normalization
 
             elif args.cond_method == 'scene_id': #actually frame_id
                 total_scenes_num = frame_count["train"] + frame_count["eval"] + frame_count["test"]

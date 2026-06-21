@@ -369,6 +369,8 @@ class MANDataset(Dataset):
                             "frame_index": pbar.n,
                         }
                     )
+                else:
+                    print(f"Failed to load data for scene {scene_id} frame {pbar.n} token {frame_token}, skipping this frame. len data_bank {len(self.data_bank)}")
                 # print("loaded", i, "frame_token", frame_token)
                 frame_token = trucksc.get("sample", frame_token)["next"]
                 pbar.update(1)
@@ -436,89 +438,98 @@ class MANDataset(Dataset):
                 f"rm /home/palakons/from_scratch/man_ds_sample/samples/{self.camera_channel}/*.png"
             )
 
-        assert self.data_bank[0]["filtered_radar_data"].shape[1] in [
+        if len(self.data_bank) >0:
+            assert self.data_bank[0]["filtered_radar_data"].shape[1] in [
             3,
             7,
         ], "filtered_radar_data should have shape (N, 3) or (N, 7)"
 
-        all_radar_positions = torch.cat(
-            [d["filtered_radar_data"] for d in self.data_bank], dim=0
-        )  # filtered_radar_data, d["filtered_radar_data"] will have different number of row (dim 0) for each frame
-        print("all_radar_positions", all_radar_positions.shape)  # 1x 16 x1
-        for d in self.data_bank:
-            print(f"frame_token {d['frame_token']} filtered_radar_data shape {d['filtered_radar_data'].shape}")
-            
-
-        # calculate means
-        dims = all_radar_positions.shape
-
-        if self.normalize_type == "std":
-            self.data_mean = all_radar_positions.mean(axis=0)
-            raw_std = all_radar_positions.std(axis=0)
-            self.data_std = torch.ones_like(raw_std)
-
-            # 1. XYZ (0:3): Use uniform scale (max of X,Y,Z std) to preserve geometry
-            xyz_max_std = raw_std[:3].max()
-            self.data_std[:3] = xyz_max_std if xyz_max_std > 0 else 1.0
-
-            # 2. Doppler (3:6): Use uniform scale for velocity vectors if they exist
-            if len(raw_std) >= 6:
-                doppler_max_std = raw_std[3:6].max()
-                self.data_std[3:6] = doppler_max_std if doppler_max_std > 0 else 1.0
-
-            # 3. RCS (6): Use individual scale if it exists
-            if len(raw_std) >= 7:
-                self.data_std[6] = raw_std[6] if raw_std[6] > 0 else 1.0
-
-        elif self.normalize_type == "minmax":
-            min_vals = all_radar_positions.min(axis=0).values
-            max_vals = all_radar_positions.max(axis=0).values
-            self.data_mean = (min_vals + max_vals) / 2
-            raw_range = (max_vals - min_vals) / 2
-            self.data_std = torch.ones_like(raw_range)
-            xyz_max_range = raw_range[:3].max()
-            self.data_std[:3] = xyz_max_range
-            if len(raw_range) >= 6:
-                doppler_max_range = raw_range[3:6].max()
-                self.data_std[3:6] = doppler_max_range
-            if len(raw_range) >= 7:
-                self.data_std[6] = raw_range[6]
+        if len(self.data_bank) == 0:
+            print("No valid frames loaded into data_bank. Please check your dataset and preprocessing steps.")
+            self.data_mean = torch.zeros(3, device=self.device)
+            self.data_std = torch.ones(3, device=self.device)
+            self.uvz_mean = torch.zeros(3, device=self.device)
+            self.uvz_std = torch.ones(3, device=self.device)
+            all_radar_positions = torch.empty((0, 3), device=self.device)
         else:
-            raise ValueError(
-                f"Unknown normalize_type: {self.normalize_type}, must be 'std' or 'minmax'"
+            all_radar_positions = torch.cat(
+            [d["filtered_radar_data"] for d in self.data_bank], dim=0
+            )  # filtered_radar_data, d["filtered_radar_data"] will have different number of row (dim 0) for each frame
+            print("all_radar_positions", all_radar_positions.shape)  # 1x 16 x1
+            for d in self.data_bank:
+                print(f"frame_token {d['frame_token']} filtered_radar_data shape {d['filtered_radar_data'].shape}")
+                
+
+            # calculate means
+            dims = all_radar_positions.shape
+
+            if self.normalize_type == "std":
+                self.data_mean = all_radar_positions.mean(axis=0)
+                raw_std = all_radar_positions.std(axis=0)
+                self.data_std = torch.ones_like(raw_std)
+
+                # 1. XYZ (0:3): Use uniform scale (max of X,Y,Z std) to preserve geometry
+                xyz_max_std = raw_std[:3].max()
+                self.data_std[:3] = xyz_max_std if xyz_max_std > 0 else 1.0
+
+                # 2. Doppler (3:6): Use uniform scale for velocity vectors if they exist
+                if len(raw_std) >= 6:
+                    doppler_max_std = raw_std[3:6].max()
+                    self.data_std[3:6] = doppler_max_std if doppler_max_std > 0 else 1.0
+
+                # 3. RCS (6): Use individual scale if it exists
+                if len(raw_std) >= 7:
+                    self.data_std[6] = raw_std[6] if raw_std[6] > 0 else 1.0
+
+            elif self.normalize_type == "minmax":
+                min_vals = all_radar_positions.min(axis=0).values
+                max_vals = all_radar_positions.max(axis=0).values
+                self.data_mean = (min_vals + max_vals) / 2
+                raw_range = (max_vals - min_vals) / 2
+                self.data_std = torch.ones_like(raw_range)
+                xyz_max_range = raw_range[:3].max()
+                self.data_std[:3] = xyz_max_range
+                if len(raw_range) >= 6:
+                    doppler_max_range = raw_range[3:6].max()
+                    self.data_std[3:6] = doppler_max_range
+                if len(raw_range) >= 7:
+                    self.data_std[6] = raw_range[6]
+            else:
+                raise ValueError(
+                    f"Unknown normalize_type: {self.normalize_type}, must be 'std' or 'minmax'"
+                )
+
+            # Avoid divide-by-zero
+            self.data_std = torch.where(
+                self.data_std == 0, torch.ones_like(self.data_std), self.data_std
             )
 
-        # Avoid divide-by-zero
-        self.data_std = torch.where(
-            self.data_std == 0, torch.ones_like(self.data_std), self.data_std
-        )
-
-        print(
-            "all_radar_positions data_mean",
-            self.data_mean,
-        )
-        print(
-            "all_radar_positions data_std",
-            self.data_std,
-        )
-
-        # also the same for uvz mena/std
-        all_uvz = torch.cat(
-            [d["uvz"] for d in self.data_bank], dim=0
-        )  # filtered_radar_data, d["filtered_radar_data"] will have different number of row (dim 0) for each frame
-        self.uvz_mean = all_uvz.mean(axis=0)
-        self.uvz_std = all_uvz.std(axis=0)
-        if all_uvz.shape[0] == 1 or (self.uvz_std == 0).any():
-            self.uvz_std = torch.where(
-                self.uvz_std == 0, torch.ones_like(self.uvz_std), self.uvz_std
+            print(
+                "all_radar_positions data_mean",
+                self.data_mean,
+            )
+            print(
+                "all_radar_positions data_std",
+                self.data_std,
             )
 
-        # all_radar_positions torch.Size([1, 128, 3])
-        # all_vrel torch.Size([1, 128, 3])
-        # all_rcs torch.Size([1, 128, 1])
-        # data_mean tensor([79.6537,  5.0939,  0.3102]) data_std tensor([36.9492, 28.5173,  2.8060])
-        # vrel_mean tensor([-2.1093, -0.1453,  0.0066]) vrel_std tensor([0.3315, 0.7359, 0.1138])
-        # rcs_mean tensor([-2.3594]) rcs_std tensor([7.6742])
+            # also the same for uvz mena/std
+            all_uvz = torch.cat(
+                [d["uvz"] for d in self.data_bank], dim=0
+            )  # filtered_radar_data, d["filtered_radar_data"] will have different number of row (dim 0) for each frame
+            self.uvz_mean = all_uvz.mean(axis=0)
+            self.uvz_std = all_uvz.std(axis=0)
+            if all_uvz.shape[0] == 1 or (self.uvz_std == 0).any():
+                self.uvz_std = torch.where(
+                    self.uvz_std == 0, torch.ones_like(self.uvz_std), self.uvz_std
+                )
+
+            # all_radar_positions torch.Size([1, 128, 3])
+            # all_vrel torch.Size([1, 128, 3])
+            # all_rcs torch.Size([1, 128, 1])
+            # data_mean tensor([79.6537,  5.0939,  0.3102]) data_std tensor([36.9492, 28.5173,  2.8060])
+            # vrel_mean tensor([-2.1093, -0.1453,  0.0066]) vrel_std tensor([0.3315, 0.7359, 0.1138])
+            # rcs_mean tensor([-2.3594]) rcs_std tensor([7.6742])
 
         # Precompute histograms and visualize UVZ comparison
         if self.get_occ_grid:
@@ -1570,7 +1581,9 @@ class MANDataset(Dataset):
         time_115 = time.time()
         # 5) filter points
         # print("camera_front.shape", camera_front.shape) #[3, 943, 1980])
-
+        print(f"radar_data_all.shape: {radar_data_all.shape}")  # (N, 7)
+        print(f"radar_data_all_filter.shape: {radar_data_all_filter.shape}")  # (N, 7)
+        print(f"points_uvz.shape: {points_uvz.shape}")  # (N, 3)
         mask = (
             (points_uvz[:, 1] >= 0)
             # & (points_uvz[:, 1] < camera_front.shape[1])
@@ -1580,6 +1593,7 @@ class MANDataset(Dataset):
             & (points_uvz[:, 0] < 1980)
             & (points_uvz[:, 2] > 0)  # Ensure points are in front of the camera
         )
+        print(f"points shape after filtering: {points_uvz[mask].shape}")  # (N, 3)
         time_12 = time.time()
         filtered_radar_data = radar_data_all_filter[mask]
 

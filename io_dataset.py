@@ -29,7 +29,7 @@ def save_point_sample(path, pred, gt=None, condition=None, meta=None):
     np.savez_compressed(path, **data)
 
 def make_man_pc(
-    num_points=64, n_scene=1, device="cpu", is_dense=False, data_file="man-mini",wan_spec={"wan_frames":5, "wan_frame_mode":"repeat", "wan_frame_stride":1,"wan_edge_policy":"skip"},get_wan_cond=True,scene_ids=[]
+    num_points=64, n_scene=1, device="cpu", is_dense=False, data_file="man-mini",wan_spec={"wan_frames":5, "wan_frame_mode":"repeat", "wan_frame_stride":1,"wan_edge_policy":"skip"},get_wan_cond=True,scene_ids=[],radar_channel = "RADAR_LEFT_FRONT",camera_channel = "CAMERA_LEFT_FRONT",
 ):
     # B 128 128 pt 9.482Gi/15.992Gi
     import sys
@@ -54,7 +54,9 @@ def make_man_pc(
             z_range=[-2, 2],
             wan_preprocess_dir="/data/palakons/man_wan_preprocessed",
             coord_only=False,
-            wan_spec = wan_spec
+            wan_spec = wan_spec,
+            radar_channel = radar_channel,
+            camera_channel = camera_channel,
         )
 
         # print(f"keys in man dataset item: {ds[0].keys()}")  # keys
@@ -62,6 +64,17 @@ def make_man_pc(
 
         print(f"------- NOW will assume n_scene=len(ds) and stack the data -------")
         n_scene = len(ds)
+
+        if len(ds) == 0:
+            print("No data found for the specified scene_ids and data_file. Returning empty tensors.")
+
+            wan_cond = None
+            if get_wan_cond and wan_spec is not None: #sahpe wan cond 16,2,60,104 if wan_frames is 5, and wan frame mode is repeat, and wan edge policy is skip, since we will repeat the center frame 5 times, and each frame's latent is of shape 16,2,60,104
+                wan_cond = torch.empty(0, 16, (1 + wan_spec["wan_frames"]//4), 60, 104
+                ).to(
+                    device
+                )  # [B, latent_dim]
+            return torch.empty(0, num_points, 3), wan_cond, ds, torch.empty(0, num_points, 3), torch.empty(0, num_points, 1)
 
         npoints_originals =[ds[i]['npoints_original'] for i in range(n_scene)]
         npoints_after_distance_filter = [ds[i]['npoints_after_distance_filter'] for i in range(n_scene)]
@@ -327,6 +340,9 @@ def normalize_data(x, mean=None, max_half_range=None,save_filename_title=None):
     mean: optional precomputed mean to use for centering, 
     max_half_range: optional precomputed max_half_range to use for scaling,
     '''
+    if x.shape[0] == 0:
+        print("Warning: Received empty tensor for normalization. Returning the input tensor and None for mean and max_half_range.")
+        return x, 0,0
     is_train = mean is None 
     if mean is None:
         mean = x.mean(dim=[0, 1], keepdim=True)  # [1, 1, D]
@@ -354,16 +370,22 @@ def normalize_data(x, mean=None, max_half_range=None,save_filename_title=None):
         plt.savefig(fname)
         plt.close()
     return x_normalized, mean, max_half_range
-def duplicate_batch(x,target_batch_size):
-    # x: [B, ...]
-    B= x.shape[0]
-    repeat_factor = math.ceil(target_batch_size / B)
+# def sample_batch(x, B):
+#     n = x.shape[0]
+#     idx = torch.randint(0, n, (B,)) #works both for B<n and B>n
+#     # idx = torch.randperm(n)[:B]  # Randomly sample B indices without replacement
+#     xb = x[idx]
+#     return xb
+# def duplicate_batch(x,target_batch_size):
+#     # x: [B, ...]
+#     B= x.shape[0]
+#     repeat_factor = math.ceil(target_batch_size / B)
     
-    x_repeated = x.repeat(repeat_factor, *[1]*(len(x.shape)-1))  # Repeat along batch dimension
+#     x_repeated = x.repeat(repeat_factor, *[1]*(len(x.shape)-1))  # Repeat along batch dimension
 
-    x_repeated = x_repeated[:target_batch_size]  # Repeat and trim to target batch size
-    assert x_repeated.shape[0] == target_batch_size, f"Expected batch size {target_batch_size}, but got {x_repeated.shape[0]}"
-    return x_repeated
+#     x_repeated = x_repeated[:target_batch_size]  # Repeat and trim to target batch size
+#     assert x_repeated.shape[0] == target_batch_size, f"Expected batch size {target_batch_size}, but got {x_repeated.shape[0]}"
+#     return x_repeated
 
 def make_proper_man_dataset( N, cond_mode, cond_method, n_train_frames=None, device='cpu', data_file=None,wan_spec=None, split_ratio=None,split_seed=42,scene_split_method="random",n_eval_frames=None,n_test_frames=None,one_distribution= False): #random,first,last
     if wan_spec is None:
