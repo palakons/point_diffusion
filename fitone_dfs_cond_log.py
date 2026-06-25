@@ -203,6 +203,100 @@ def none_if_all_zero(x):
     if x is None:
         return None
     return None if torch.all(x == 0) else x
+
+def append_per_scene_eval_rows(
+    csv_path,
+    pred_all,
+    gt_all,
+    selected_idx,
+    all_frame_ids,
+    run_id,
+    exp_name,
+    step,
+    set_name,
+    condition_type,
+    seed,
+    args,
+):
+    """
+    Per-scene metrics from already generated pred_all.
+
+    pred_all:      [B, N, D], CPU or GPU
+    gt_all:        [B, N, D], CPU or GPU
+    selected_idx:  global indices into all_frame_ids, length B
+
+    Group key:
+        (data_file, scene_id)
+
+    This intentionally merges left/right side inside one scene.
+    """
+    selected_idx = selected_idx.cpu().long().tolist()
+
+    groups = {}
+    for local_j, global_i in enumerate(selected_idx):
+        key = (
+            str(all_frame_ids["data_file"][global_i]),
+            int(all_frame_ids["scene_id"][global_i]),
+        )
+        groups.setdefault(key, []).append(local_j)
+
+    for (data_file, scene_id), local_js in groups.items():
+        local_t = torch.as_tensor(local_js, dtype=torch.long)
+
+        pred_scene = pred_all[local_t].cpu()
+        gt_scene = gt_all[local_t].cpu()
+
+        global_js = [selected_idx[j] for j in local_js]
+        sensor_sides = sorted(set(str(all_frame_ids["sensor_side"][i]) for i in global_js))
+        frame_indices = [int(all_frame_ids["frame_index"][i]) for i in global_js]
+
+        try:
+            stat = calculate_pointset_stat(
+                pred_scene,
+                gt_scene,
+            )
+        except Exception as e:
+            print(
+                f"Per-scene metric error: set={set_name}, cond={condition_type}, "
+                f"seed={seed}, data_file={data_file}, scene_id={scene_id}: {e}"
+            )
+            stat = {
+                "cd": float("nan"),
+                "fidelity": float("nan"),
+                "diversity": float("nan"),
+            }
+
+        row = {
+            "date_time": datetime.now().isoformat(),
+            "run_id": run_id,
+            "exp_name": exp_name,
+            "step": step,
+            "set_name": set_name,
+            "data_file": data_file,
+            "scene_id": scene_id,
+            "sensor_sides": ",".join(sensor_sides),
+            "n_frames": len(local_js),
+            "frame_index_min": min(frame_indices) if len(frame_indices) > 0 else None,
+            "frame_index_max": max(frame_indices) if len(frame_indices) > 0 else None,
+            "condition_type": condition_type,
+            "seed": seed,
+            "model_name": args.model_name,
+            "cond_type": getattr(args, "set_cond_type", None),
+            "prediction_type": args.prediction_type,
+            "cd_mode": args.cd_mode,
+            "lambda_cd": args.lambda_cd,
+            "lambda_mse": args.lambda_mse,
+            "use_condition_pooling": getattr(args, "use_condition_pooling", False),
+            "condition_pool_kernel": getattr(args, "condition_pool_kernel", None),
+            "set_tx_dim": getattr(args, "set_tx_dim", None),
+        }
+
+        for k, v in stat.items():
+            if isinstance(v, torch.Tensor):
+                v = v.detach().cpu().item() if v.numel() == 1 else str(v.detach().cpu().tolist())
+            row[k] = v
+
+        append_eval_row(csv_path, row)
 def append_eval_row(csv_path, row: dict):
     os.makedirs(os.path.dirname(csv_path), exist_ok=True)
     file_exists = os.path.exists(csv_path)
@@ -320,6 +414,89 @@ def reconstruct_x0(pred, x_t, t, scheduler, prediction_type):
     alpha_bar = scheduler.alphas_cumprod[t].view(-1, 1, 1)
     return (x_t - torch.sqrt(1 - alpha_bar) * pred) / torch.sqrt(alpha_bar) , torch.sqrt((1 - alpha_bar)/alpha_bar)
 
+def _safe(s):
+    s = str(s)
+    s = s.replace("man-", "")
+    s = s.replace("man_", "")
+    s = s.replace("heldout_split", "held")
+    s = re.sub(r"[^A-Za-z0-9_.-]+", "", s)
+    return s
+
+
+def _k(num):
+    if num >= 1000 and num % 1000 == 0:
+        return f"{num // 1000}k"
+    return str(num)
+
+
+def _safe(s):
+    s = str(s)
+    s = s.replace("man-", "")
+    s = s.replace("man_", "")
+    s = s.replace("heldout_split", "held")
+    s = re.sub(r"[^A-Za-z0-9_.-]+", "", s)
+    return s
+
+
+def _run_cfg_hash(args, n=8):
+    """
+    Hash only config that defines model/data/training identity.
+    Exclude runtime-control fields so checkpoint resume still works.
+    """
+    ignore = {
+        "ddpm_iteration",
+        "mode",
+        "fps",
+        "num_train_log",
+        "num_checkpoints_save",
+        "num_eval",
+        "exp_name",
+        "checkpoint_dir",
+    }
+
+    d = {
+        k: v
+        for k, v in vars(args).items()
+        if k not in ignore
+    }
+
+    raw = json.dumps(d, sort_keys=True, default=str)
+    return hashlib.md5(raw.encode()).hexdigest()[:n]
+
+
+def _scene_spec_tag(spec, n_keys):
+    """
+    If explicit scene set is given:
+        man-mini:0,1+man-full:10,11 -> mi0.1_fu10.11
+
+    If empty:
+        random set -> r60
+    """
+    scene_set = parse_scene_set_spec(spec)
+
+    if len(scene_set) == 0:
+        return f"r{n_keys}"
+
+    return scene_set_tag(scene_set)
+
+
+def _float_tag(x):
+    return f"{x:g}"
+
+
+def shorten_run_id(out_id,  keep_len=200):
+
+    """
+    Keep visible prefix, append hash of the full original string.
+    Final length <= max_len.
+    """
+    if len(out_id) <= keep_len:
+        return out_id
+    hash_suffix = hashlib.md5(out_id[keep_len:].encode()).hexdigest()[:8]
+    # "_h" + 8 chars = 10 chars
+    suffix = f"_h{hash_suffix}"
+
+    return out_id[:keep_len] + suffix
 
 def make_run_id(args):
     cond_spec = f"_{args.cond_method}" if args.cond_method != "none" else ""
@@ -338,11 +515,25 @@ def make_run_id(args):
             model_spec += f"_pool_k{args.condition_pool_kernel}"
         if args.use_wan_pos_emb:
             model_spec += "_wanpe"
-        
 
-    shape_spec = f"_{args.data_file}" if args.shape_name in ['realman', 'man_proper_split', 'realman_dense'] else ""
-    if args.man_one_distribution:
-        shape_spec += "_1dist1eval"
+    shape_spec =""
+    if args.shape_name.startswith("man_"):
+        shape_spec = f"_{args.data_file}_side{args.sensor_side}"
+        split_str = f"_split{args.split_seed}" if args.split_seed != 42 else ""
+        
+        if args.shape_name in ['man_heldout_split', 'man_proper_split_real']:
+            shape_spec += f"{split_str}"
+        if args.man_one_distribution:
+            shape_spec += "_1dist1eval"
+        if args.shape_name == 'man_heldout_split':
+            eval_set = parse_scene_set_spec(args.eval_scene_set)
+            test_set = parse_scene_set_spec(args.test_scene_set)
+            eval_tag = scene_set_tag(eval_set)
+            test_tag = scene_set_tag(test_set)
+            #add n_eval_scene_keys, n_test_scene_keys
+            shape_spec += f"_held_e{args.n_eval_scene_keys}-{eval_tag}_t{args.n_test_scene_keys}-{test_tag}"
+        shape_spec += f"_minpts{args.min_frames_per_side}"
+        
 
     cd_spec = f"_cdmd{args.cd_mode}" if args.lambda_cd > 0 else ""
 
@@ -352,7 +543,13 @@ def make_run_id(args):
 
     scale_eps2x0_str = "_scaleeps2x0" if args.scale_eps2x0_conversion else ""
         
-    return f"{args.model_name}{model_spec}_{args.shape_name}{shape_spec}_train_sc{args.n_scene}_N{args.N}_B{args.B}_T{args.T}-{args.T_infer}_{args.prediction_type}-{args.sampler}{scale_eps2x0_str}_it{args.ddpm_iteration}_{args.cond_mode}{cond_spec}{wan_id}_weight{dop_rcs_loss_weight}_lmse{args.lambda_mse:1.3f}_lcd{args.lambda_cd:1.3f}{cd_spec}_sd{args.seed}"
+    out_id =  f"{args.model_name}{model_spec}_it{args.ddpm_iteration}_{args.shape_name}{shape_spec}_train_sc{args.n_scene}_N{args.N}_B{args.B}_T{args.T}-{args.T_infer}_{args.prediction_type}-{args.sampler}{scale_eps2x0_str}_{args.cond_mode}{cond_spec}{wan_id}_weight{dop_rcs_loss_weight}_lmse{args.lambda_mse:1.3f}_lcd{args.lambda_cd:1.3f}{cd_spec}_sd{args.seed}"
+
+    
+
+
+
+    return shorten_run_id(out_id, keep_len=200)
 
 
 @torch.no_grad()
@@ -411,11 +608,12 @@ def parse_args():
         "--N", type=int, default=128, help="Number of points in the point cloud"
     )
     parser.add_argument("--B", type=int, default=128, help="Batch size for training")
+    parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate for the optimizer")
     parser.add_argument(
         "--n_scene",
         type=int,
-        default=1,
-        help="Number of scenes to use from the dataset (for multi-scene datasets)",
+        default=-1,
+        help="Number of FRAMES to use from the dataset (for multi-scene datasets)",
     )
     parser.add_argument(
         "--T", type=int, default=1000, help="Number of diffusion steps during training"
@@ -620,29 +818,226 @@ def parse_args():
         help="Use a single distribution for all scenes in the MAN dataset.",
     )
     parser.add_argument(
-        "--seed",
+        "--split_seed",
         type=int,
         default=42,
         help="Random seed for reproducibility",
     )
     parser.add_argument(
-        "--val_scene_id",
+        "--seed",
         type=int,
-        default=-1,
-        help="Scene ID to use for validation",
+        default=42,
+        help="Random seed for reproducibility",
     )
+    # parser.add_argument(
+    #     "--val_scene_id",
+    #     type=int,
+    #     default=-1,
+    #     help="Scene ID to use for validation",
+    # )
     parser.add_argument(
         "--sensor_side",
         type=str,
         default="left",
         help="Sensor side to use for training: 'both', 'left' or 'right'",
     )
+    parser.add_argument(
+        "--eval_scene_set",
+        type=str,
+        default="",
+        help="Scene set for eval, e.g. 'man-mini:0,1+man-full:10,11'",
+    )
+    parser.add_argument(
+        "--test_scene_set",
+        type=str,
+        default="",
+        help="Scene set for test, e.g. 'man-mini:2,3+man-full:12,13'",
+    )
+    parser.add_argument(
+        "--min_frames_per_side",
+        type=int,
+        default=20,
+        help="Drop a (data_file, scene_id) if any loaded sensor side has fewer than this many frames.",
+    )
+    #add to run_id
+    parser.add_argument(
 
+        "--n_eval_scene_keys",
+
+        type=int,
+
+        default=60,
+
+        help="Number of random eval (data_file, scene_id) keys if --eval_scene_set is empty.",
+
+    )
+
+    parser.add_argument(
+
+        "--n_test_scene_keys",
+
+        type=int,
+
+        default=60,
+
+        help="Number of random test (data_file, scene_id) keys if --test_scene_set is empty.",
+
+    )
     args = parser.parse_args()
 
 
     return args
 
+def auto_fill_scene_sets(
+    valid_scene_keys,
+    eval_scene_set,
+    test_scene_set,
+    n_eval_scene_keys,
+    n_test_scene_keys,
+    seed,
+):
+    """
+    Randomly fill missing eval/test scene sets from valid_scene_keys.
+
+    valid_scene_keys: set of (data_file, scene_id)
+    """
+    eval_scene_set = set(eval_scene_set)
+    test_scene_set = set(test_scene_set)
+
+    overlap = eval_scene_set & test_scene_set
+    assert len(overlap) == 0, f"eval/test overlap before auto-fill: {overlap}"
+
+    remaining = sorted(list(valid_scene_keys - eval_scene_set - test_scene_set))
+
+    rng = random.Random(seed)
+    rng.shuffle(remaining)
+
+    p = 0
+
+    if len(eval_scene_set) == 0:
+        assert len(remaining) >= n_eval_scene_keys, (
+            f"Need {n_eval_scene_keys} eval scene keys, only {len(remaining)} available"
+        )
+        eval_scene_set = set(remaining[p:p + n_eval_scene_keys])
+        p += n_eval_scene_keys
+
+    if len(test_scene_set) == 0:
+        assert len(remaining) - p >= n_test_scene_keys, (
+            f"Need {n_test_scene_keys} test scene keys, only {len(remaining) - p} available"
+        )
+        test_scene_set = set(remaining[p:p + n_test_scene_keys])
+        p += n_test_scene_keys
+
+    overlap = eval_scene_set & test_scene_set
+    assert len(overlap) == 0, f"eval/test overlap after auto-fill: {overlap}"
+
+    return eval_scene_set, test_scene_set
+
+def filter_valid_scene_keys(all_frame_ids, min_frames_per_side=20):
+    """
+    Keep only (data_file, scene_id) where every present sensor_side
+    has at least min_frames_per_side frames.
+
+    If left is below threshold, both left/right for that scene are removed.
+    """
+    counts = {}
+
+    n = len(all_frame_ids["scene_id"])
+
+    for i in range(n):
+        key = (
+            str(all_frame_ids["data_file"][i]),
+            int(all_frame_ids["scene_id"][i]),
+        )
+        side = str(all_frame_ids["sensor_side"][i])
+
+        if key not in counts:
+            counts[key] = {}
+
+        counts[key][side] = counts[key].get(side, 0) + 1
+
+    valid_keys = set()
+    bad_keys = {}
+
+    for key, side_counts in counts.items():
+        min_count = min(side_counts.values())
+
+        if min_count >= min_frames_per_side:
+            valid_keys.add(key)
+        else:
+            bad_keys[key] = side_counts
+    print(f"Valid scene keys (with at least {min_frames_per_side} frames per present sensor side): {valid_keys}"
+          f"\nBad scene keys and their sensor side counts: {bad_keys}")
+    return valid_keys, bad_keys
+
+def parse_scene_set_spec(spec):
+    """
+    Parse:
+        'man-mini:0,1;man-full:10,11'
+    Returns:
+        set of (data_file, scene_id)
+    """
+    if spec is None or spec.strip() == "":
+        return set()
+    out = set()
+    for group in spec.split("+"):
+        group = group.strip()
+        if not group:
+            continue
+        assert ":" in group, f"Bad scene set group '{group}', expected data_file:id,id"
+        data_file, ids_str = group.split(":", 1)
+        data_file = data_file.strip()
+        sids =[]
+        for sid in ids_str.split(","):
+            sid = sid.strip()
+            sids.append(int(sid))
+            if sid:
+                out.add((data_file, int(sid)))
+    return out 
+import hashlib
+def _compress_ids(ids, max_items=6):
+    ids = sorted(set(int(x) for x in ids))
+    if len(ids) == 0:
+        return "none"
+    if len(ids) <= max_items:
+        return ".".join(str(x) for x in ids)
+    h = hashlib.md5(",".join(map(str, ids)).encode()).hexdigest()[:6]
+    return f"{ids[0]}..{ids[-1]}n{len(ids)}h{h}"
+
+def scene_set_tag(scene_set):
+
+    """
+    scene_set: set of (data_file, scene_id)
+    Example:
+        {("man-mini",0),("man-mini",1),("man-full",10),("man-full",11)}
+        -> 'mi0.1_fu10.11'
+    """
+    if scene_set is None or len(scene_set) == 0:
+        return "none"
+    abbr = {
+        "man-mini": "mi",
+        "man-full": "fu",
+    }
+    parts = []
+    for data_file in ["man-mini", "man-full"]:
+        ids = [sid for df, sid in scene_set if df == data_file]
+        if len(ids) > 0:
+            parts.append(f"{abbr[data_file]}{_compress_ids(ids)}")
+    return "_".join(parts) if len(parts) > 0 else "none"
+def frame_key(all_frame_ids, i):
+    # Split key deliberately excludes sensor_side.
+    return (
+        str(all_frame_ids["data_file"][i]),
+        int(all_frame_ids["scene_id"][i]),
+    )
+
+def take_frame_ids(all_frame_ids, idxs):
+    keys = ["token", "scene_id", "frame_index", "sensor_side", "data_file"]
+    return {
+        k: [all_frame_ids[k][int(i)] for i in idxs]
+        for k in keys
+        if k in all_frame_ids
+    }
 def gather_man_ds(args, checkpoint_dir):
     if args.cond_method in [ "wan", "scene_id"]:
         cond_method = args.cond_method
@@ -704,8 +1099,8 @@ def gather_man_ds(args, checkpoint_dir):
                     frame_ids_all["train"]["frame_index"].extend(frame_ids["train"]["frame_index"])
                     frame_ids_all["train"]["sensor_side"].extend([sensor_side] * len(frame_ids["train"]["token"]))
                     frame_ids_all["train"]["data_file"].extend([data_file] * len(frame_ids["train"]["token"]))
-                    if 36 > x0sbn3_norm.shape[0]:
-                        print(f"{x0sbn3_norm.shape[0]} samples loaded for {sc_id}-{sensor_side}{data_file}")
+                    if  x0sbn3_norm.shape[0] < 36:
+                        print(f"{x0sbn3_norm.shape[0]} samples loaded for {sc_id}-{sensor_side}-{data_file}")
     x0sbn3_norm_all = torch.cat(x0sbn3_norm_all, dim=0)
     cond_all = torch.cat(cond_all, dim=0) if cond_all[0] is not None else None
     if args.cond_method == "none":
@@ -952,6 +1347,7 @@ if __name__ == "__main__":
     checkpoint_path = os.path.join(checkpoint_dir, f"latest_{run_id}.pt")
     exists = {'tb_dir': os.path.exists(tb_dir), 'data_dir': os.path.exists(data_dir),"checkpoint_file": os.path.exists(checkpoint_path)}
     print(f"Directories and checkpoint existence: {exists}")
+    print(f"checkpoint_path: {checkpoint_path}")
     assert not exists['tb_dir'] , f"TensorBoard log directory {tb_dir} already exists. Please choose a different experiment name or remove the existing logs to avoid overwriting."
     # creat dir, nested if not exist
     os.makedirs(temp_dir, exist_ok=True)
@@ -989,53 +1385,149 @@ if __name__ == "__main__":
 
 
     if args.shape_name == "man_heldout_split":
-        data_file = 'both'
-        # assert args.val_scene_id >= 0, f"Need to specify a validation scene ID with --val_scene_id when using the 'man_heldout_split' shape_name. Please provide a non-negative integer for --val_scene_id."
-        seed = args.seed
+        split_seed = args.split_seed 
 
-        assert x0sbn3_norm.shape[0] == len(all_frame_ids["token"]) == len(all_frame_ids["scene_id"]) == len(all_frame_ids["frame_index"]), f"Number of samples in x0sbn3_norm {x0sbn3_norm.shape[0]} does not match number of frame ids {len(all_frame_ids['token'])}"
-
-        allids = list(range(x0sbn3_norm.shape[0]))
-        val_scene_id = args.val_scene_id
-        val_frame_idx = [i for i, sid in enumerate(all_frame_ids["scene_id"]) if sid == val_scene_id]
-        assert len(val_frame_idx) > 0, f"No eval frames found for val_scene_id={val_scene_id}"
-        train_allids = [i for i in allids if i not in val_frame_idx]
+        assert x0sbn3_norm.shape[0] == len(all_frame_ids["token"])== len(all_frame_ids["scene_id"]) == len(all_frame_ids["frame_index"]) == len(all_frame_ids["data_file"]) == len(all_frame_ids["sensor_side"]), f"Mismatch in number of samples and frame IDs: {x0sbn3_norm.shape[0]} vs {len(all_frame_ids['token'])}"
         
-        random.seed(seed)
-        random.shuffle(train_allids)
+        allids = list(range(x0sbn3_norm.shape[0]))
 
-        real_train_idx = train_allids[:n_scene]
-        assert len(real_train_idx) == n_scene, f"Number of training scenes selected {len(real_train_idx)} does not match requested {n_scene}"
+        valid_scene_keys, bad_scene_keys = filter_valid_scene_keys(
+            all_frame_ids,
+            min_frames_per_side=args.min_frames_per_side,
+        )
 
-        print(f"ALL. len frame id {len(all_frame_ids['token'])}, shape of x0sbn3_norm: {x0sbn3_norm.shape}, shape of cond_norm: {cond_norm.shape if cond_norm is not None else None}, shape of doppler_norm: {doppler_norm.shape if doppler_norm is not None else None}, shape of rcs_norm: {rcs_norm.shape if rcs_norm is not None else None}")
+        print(
+            f"Scene quality filter: kept {len(valid_scene_keys)} scene keys, "
+            f"dropped {len(bad_scene_keys)} scene keys with min_frames_per_side={args.min_frames_per_side}"
+        )
 
-        train_idx_pool = torch.as_tensor(real_train_idx, dtype=torch.long)
-        eval_idx_pool = torch.as_tensor(val_frame_idx, dtype=torch.long)
+        if len(bad_scene_keys) > 0:
+            print("First bad scene keys:")
+            for k, v in list(bad_scene_keys.items())[:20]:
+                print(f"  {k}: {v}")
+
+        
+
+        eval_scene_set = parse_scene_set_spec(args.eval_scene_set)
+        test_scene_set = parse_scene_set_spec(args.test_scene_set)
+        eval_scene_set, test_scene_set = auto_fill_scene_sets(
+            valid_scene_keys=valid_scene_keys,
+            eval_scene_set=eval_scene_set,
+            test_scene_set=test_scene_set,
+            n_eval_scene_keys=args.n_eval_scene_keys,
+            n_test_scene_keys=args.n_test_scene_keys,
+            seed=split_seed,
+        )
+
+        overlap = eval_scene_set & test_scene_set
+        assert len(overlap) == 0, f"eval_scene_set and test_scene_set overlap: {overlap}"
+
+        train_indices,eval_indices,test_indices = [], [], []
+
+        for i in allids:
+            k = frame_key(all_frame_ids, i)
+
+            # Drop all frames from bad scene keys.
+            # This removes both sides if either side is below threshold.
+            if k not in valid_scene_keys:
+                continue
+            if k in eval_scene_set:
+                eval_indices.append(i)
+            elif k in test_scene_set:
+                test_indices.append(i)
+            else:
+                train_indices.append(i)
+
+        dropped_eval = eval_scene_set - valid_scene_keys
+        dropped_test = test_scene_set - valid_scene_keys
+
+        assert len(dropped_eval) == 0, (
+            f"Some eval_scene_set keys were dropped by min_frames_per_side={args.min_frames_per_side}: "
+            f"{sorted(list(dropped_eval))}"
+        )
+
+        assert len(dropped_test) == 0, (
+            f"Some test_scene_set keys were dropped by min_frames_per_side={args.min_frames_per_side}: "
+            f"{sorted(list(dropped_test))}"
+        )
+
+        assert len(eval_indices) > 0, f"No eval frames found for eval_scene_set={eval_scene_set}"
+
+        if len(test_scene_set) > 0:
+
+            assert len(test_indices) > 0, f"No test frames found for test_scene_set={test_scene_set}"
+
+        random.seed(split_seed)
+
+        random.shuffle(train_indices)
+
+
+
+        if n_scene > 0:
+            assert n_scene <= len(train_indices), f"Requested  {n_scene}, change n_scene to {len(train_indices)} or change the eval/test scene sets to free up more training scenes." 
+            train_indices = train_indices[:n_scene]
+
+
+
+        train_idx_pool = torch.as_tensor(train_indices, dtype=torch.long)
+
+        eval_idx_pool = torch.as_tensor(eval_indices, dtype=torch.long)
+
+        test_idx_pool = torch.as_tensor(test_indices, dtype=torch.long) if len(test_indices) > 0 else None
+
+
+        # Keep references to full base tensors. No train/eval/test tensor copies.
 
         x0sbn3_train_norm = x0sbn3_norm
+
         cond_train_norm = cond_norm
+
         doppler_train_norm = doppler_norm
+
         rcs_train_norm = rcs_norm
 
         x0sbn3_eval_norm = x0sbn3_norm
+
         cond_eval_norm = cond_norm
+
         doppler_eval_norm = doppler_norm
+
         rcs_eval_norm = rcs_norm
 
-        frame_ids = {"train": {"token":[all_frame_ids["token"][ i] for i in real_train_idx],"scene_id":[all_frame_ids["scene_id"][ i] for i in real_train_idx],"frame_index":[all_frame_ids["frame_index"][ i] for i in real_train_idx], "sensor_side":[all_frame_ids["sensor_side"][ i] for i in real_train_idx], "data_file":[all_frame_ids["data_file"][ i] for i in real_train_idx]},
-                    "eval": {"token":[all_frame_ids["token"][ i] for i in val_frame_idx],"scene_id":[all_frame_ids["scene_id"][ i] for i in val_frame_idx],"frame_index":[all_frame_ids["frame_index"][ i] for i in val_frame_idx], "sensor_side":[all_frame_ids["sensor_side"][ i] for i in val_frame_idx], "data_file":[all_frame_ids["data_file"][ i] for i in val_frame_idx]} }
+
+
+
+        # frame_ids = {"train": {"token":[all_frame_ids["token"][ int(i)] for i in train_idx_pool],"scene_id":[all_frame_ids["scene_id"][ int(i)] for i in train_idx_pool],"frame_index":[all_frame_ids["frame_index"][ int(i)] for i in train_idx_pool], "sensor_side":[all_frame_ids["sensor_side"][ int(i)] for i in train_idx_pool], "data_file":[all_frame_ids["data_file"][ int(i)] for i in train_idx_pool]}, "eval": {"token":[all_frame_ids["token"][ int(i)] for i in eval_idx_pool],"scene_id":[all_frame_ids["scene_id"][ int(i)] for i in eval_idx_pool],"frame_index":[all_frame_ids["frame_index"][ int(i)] for i in eval_idx_pool], "sensor_side":[all_frame_ids["sensor_side"][ int(i)] for i in eval_idx_pool], "data_file":[all_frame_ids["data_file"][ int(i)] for i in eval_idx_pool]} , "test": {"token":[all_frame_ids["token"][ int(i)] for i in test_idx_pool],"scene_id":[all_frame_ids["scene_id"][ int(i)] for i in test_idx_pool],"frame_index":[all_frame_ids["frame_index"][ int(i)] for i in test_idx_pool], "sensor_side":[all_frame_ids["sensor_side"][ int(i)] for i in test_idx_pool], "data_file":[all_frame_ids["data_file"][ int(i)] for i in test_idx_pool]} if test_idx_pool is not None else None}
+
+        frame_ids = {
+            "split_method": "man_heldout_split",
+            "split_key": "data_file,scene_id",
+            "split_seed": split_seed,
+            "eval_scene_set": sorted(list(eval_scene_set)),
+            "test_scene_set": sorted(list(test_scene_set)),
+            "train": take_frame_ids(all_frame_ids, train_idx_pool),
+            "eval": take_frame_ids(all_frame_ids, eval_idx_pool),
+            "test": take_frame_ids(all_frame_ids, test_idx_pool) if test_idx_pool is not None else None,
+        }
         print("-#-----")
-        print(f"After splitting cached dataset: Training scenes: {x0sbn3_train_norm.shape[0]}, Evaluation scenes: {x0sbn3_eval_norm.shape[0]}, frame_ids: {frame_ids}")
+        print(
+            f"After split: full={x0sbn3_norm.shape[0]}, "
+            f"train_frames={train_idx_pool.numel()}, "
+            f"eval_frames={eval_idx_pool.numel()}, "
+            f"test_frames={0 if test_idx_pool is None else test_idx_pool.numel()}"
+        )
+        print(f"eval_scene_set={sorted(list(eval_scene_set))}")
+        print(f"test_scene_set={sorted(list(test_scene_set))}")
 
     elif args.shape_name == "man_proper_split_real" and args.man_one_distribution:
-        seed = args.seed
+        split_seed = args.split_seed
         data_file = 'both'
         # cache_fname = f"man_one_dist_frame_ids_man-mini_288_{cond_method}_{cond_mode}_{args.wan_frames}_{args.wan_frame_mode}_{args.wan_frame_stride}_{args.wan_edge_policy}_seed{42}.pkl"
         # cache_path = os.path.join(checkpoint_dir, cache_fname)
         if True or os.path.exists(cache_path):
             
             allids = list(range(x0sbn3_norm.shape[0]))
-            random.seed(seed)
+            random.seed(split_seed)
             random.shuffle(allids)
 
             print(f"shape of x0sbn3_norm: {x0sbn3_norm.shape}, shape of cond_norm: {cond_norm.shape if cond_norm is not None else None}, shape of doppler_norm: {doppler_norm.shape if doppler_norm is not None else None}, shape of rcs_norm: {rcs_norm.shape if rcs_norm is not None else None}")
@@ -1078,19 +1570,13 @@ if __name__ == "__main__":
         f"Eval indexed frames: {eval_idx_pool.numel()}"
     )
 
-    print(
-        f"Dataset created. Full samples: {x0sbn3_train_norm.shape[0]}, "
-        f"Train indexed frames: {train_idx_pool.numel()}, "
-        f"Eval indexed frames: {eval_idx_pool.numel()}"
-    )
 
     # assert x0sbn3_train_norm.shape[0] >= n_scene, f"Not enough training scenes in the dataset. Requested: {n_scene}, available: {x0sbn3_train_norm.shape[0]}"
     n_scene = train_idx_pool.numel()
     print(
         f"shapes after dataset creation: x0sbn3_norm {x0sbn3_train_norm.shape}, cond {cond_train_norm.shape if cond_train_norm is not None else None}, doppler_norm {doppler_train_norm.shape if doppler_train_norm is not None else None}, rcs_norm {rcs_train_norm.shape if rcs_train_norm is not None else None}"
     )
-    print(f"train shapes:  {x0sbn3_train_norm.shape},  {cond_train_norm.shape if cond_train_norm is not None else None},  {doppler_train_norm.shape if doppler_train_norm is not None else None},  {rcs_train_norm.shape if rcs_train_norm is not None else None}")
-    print(f"eval shapes:  {x0sbn3_eval_norm.shape},  {cond_eval_norm.shape if cond_eval_norm is not None else None},  {doppler_eval_norm.shape if doppler_eval_norm is not None else None},  {rcs_eval_norm.shape if rcs_eval_norm is not None else None}")
+    
 
 
     if args.train_rcs_doppler:
@@ -1111,7 +1597,7 @@ if __name__ == "__main__":
 
     model = make_model(device, args)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
     if args.sampler == "ddpm":
         scheduler = DDPMScheduler(
@@ -1167,23 +1653,22 @@ if __name__ == "__main__":
     if args.mode == "eval":
         raise NotImplementedError("Evaluation mode is not implemented yet. Please use 'train' or 'interpolate' modes.")
     elif args.mode == "train":
+        seed = args.seed
 
         check_tensor( "x0sbn3_train_norm",x0sbn3_train_norm)
         # x0sbn3_train_norm shape= (40, 128, 5) type= <class 'torch.Tensor'> dtype= torch.float32 device= cpu requires_grad= False min= -0.8094146251678467 max= 1.0 nan= False
 
         print(f"Whole data shape x0sbn3_train_norm: {x0sbn3_train_norm.shape}, x0sbn3_eval_norm: {x0sbn3_eval_norm.shape}, cond_train_norm: {cond_train_norm.shape if cond_train_norm is not None else None}, cond_eval_norm: {cond_eval_norm.shape if cond_eval_norm is not None else None}")
-        print(f"pinning mem.")
 
-        print("Keeping full tensors in normal CPU memory; no full pin_memory().")
+        print(f"indices length: train_idx_pool {train_idx_pool.numel()}, eval_idx_pool {eval_idx_pool.numel()} test_idx_pool {0 if test_idx_pool is None else test_idx_pool.numel()}")
 
         x0sbn3_train_norm = x0sbn3_train_norm.contiguous()
         x0sbn3_eval_norm = x0sbn3_eval_norm.contiguous()
-        
+        print(f"made x0sbn3_train_norm and x0sbn3_eval_norm contiguous, make date sits in one piece in memory for faster random access during training and evaluation.")
 
         torch.manual_seed(seed)
         np.random.seed(seed)
         random.seed(seed)
-        
 
         tt = tqdm(
             range(start_step, ddpm_iteration),
@@ -1203,7 +1688,9 @@ if __name__ == "__main__":
         logger = ExperimentLogger(tb_dir, data_dir, vars(args))
 
         summary_csv = os.path.join(data_dir+"/..", "condition_eval_summary.csv")
+        per_scene_csv = os.path.join(data_dir + "/..", "condition_eval_per_scene.csv")
         logger.log_text("total_parameters", f"{sum(p.numel() for p in model.parameters())}",0)
+        logger.log_text("checkpoint_path", checkpoint_path, 0)
         
         param_groups = {}
         for name, param in model.named_parameters():
@@ -1220,7 +1707,45 @@ if __name__ == "__main__":
             print(f"Saving frame_ids to logger config: (first 8 frames)")
             print(f"train: token:{frame_ids['train']['token'][:8]}, scene_id: {frame_ids['train']['scene_id'][:8]}, frame_index: {frame_ids['train']['frame_index'][:8]};")
             print(f"eval:  token:{frame_ids['eval']['token'][:8]}, scene_id: {frame_ids['eval']['scene_id'][:8]}, frame_index: {frame_ids['eval']['frame_index'][:8]}")
-            logger.log_text("frame_ids",json.dumps(frame_ids, indent=4),0)
+            # logger.log_text("frame_ids",json.dumps(frame_ids, indent=4),0)
+            print("Saving frame_ids to JSON file, not TensorBoard text.")
+
+            frame_ids_path = os.path.join(data_dir, "frame_ids.json")
+            with open(frame_ids_path, "w") as f:
+                json.dump(frame_ids, f, indent=2, default=str)
+            frame_ids_hash = hashlib.md5(
+                json.dumps(frame_ids, sort_keys=True, default=str).encode()
+            ).hexdigest()[:12]
+            frame_ids_summary = {
+                "frame_ids_path": frame_ids_path,
+                "frame_ids_hash": frame_ids_hash,
+                "split_method": frame_ids.get("split_method"),
+                "split_key": frame_ids.get("split_key"),
+                "split_seed": frame_ids.get("split_seed"),
+                "n_train": len(frame_ids["train"]["token"]) if frame_ids.get("train") else 0,
+                "n_eval": len(frame_ids["eval"]["token"]) if frame_ids.get("eval") else 0,
+                "n_test": len(frame_ids["test"]["token"]) if frame_ids.get("test") else 0,
+                "eval_scene_set": frame_ids.get("eval_scene_set"),
+                "test_scene_set": frame_ids.get("test_scene_set"),
+                "train_first8": {
+                    "scene_id": frame_ids["train"]["scene_id"][:8],
+                    "frame_index": frame_ids["train"]["frame_index"][:8],
+                    "sensor_side": frame_ids["train"]["sensor_side"][:8],
+                    "data_file": frame_ids["train"]["data_file"][:8],
+                },
+                "eval_first8": {
+                    "scene_id": frame_ids["eval"]["scene_id"][:8],
+                    "frame_index": frame_ids["eval"]["frame_index"][:8],
+                    "sensor_side": frame_ids["eval"]["sensor_side"][:8],
+                    "data_file": frame_ids["eval"]["data_file"][:8],
+                },
+            }
+            logger.log_text(
+                "frame_ids_summary",
+                json.dumps(frame_ids_summary, indent=2, default=str),
+                0,
+            )
+            
             
         # print(f"Starting training loop from step {start_step} to {ddpm_iteration} skape x0sbn3_train_norm_rep: {x0sbn3_train_norm_rep.shape}, cond_train_norm_rep: {cond_train_norm_rep.shape if cond_train_norm_rep is not None else None}")
         g_eval = torch.Generator().manual_seed(seed + 999)
@@ -1285,7 +1810,7 @@ if __name__ == "__main__":
 
                         for sample_seed in tqdm([42, 43] if is_final_sample_eval else [42], desc=f"Seeds for {set_name}", leave=False):
                             for c_name in tqdm(["correct_cond", "zero_cond", "shuffled_cond", "nn_retrieval"] if set_cond is not None else ["none"], desc=f"Conditions for {set_name}", leave=False):
-                                # print(f"---===--==--- {set_name}/{sample_seed}/{c_name}/{step}...")
+                                # print(f"-=-===--==--- {set_name}/{sample_seed}/{c_name}/{step}...")
                                 if set_name == "train" and c_name == "nn_retrieval":
                                     # print(f"skip")
                                     continue
@@ -1330,7 +1855,7 @@ if __name__ == "__main__":
                                 )
                                 try:
                                     point_stat_output = calculate_pointset_stat(
-                                        pred_all.cpu(), full_gt.cpu(), c_name, sample_seed
+                                        pred_all.cpu(), full_gt.cpu(), prefix=f"{c_name}_{sample_seed}_"
                                     )
                                 except Exception as e:
                                     print(f"Error calculating point set statistics at step {step} for {set_name} with condition {c_name} and seed {sample_seed}: {e}")
@@ -1344,6 +1869,7 @@ if __name__ == "__main__":
                                 summary_row = {
                                     "date_time": datetime.now().isoformat(),
                                     "run_id": run_id,
+                                    "exp_name": args.exp_name,
                                     "step": step,
                                     "n_scene": args.n_scene,
                                     "set_name": set_name,              # train/eval
@@ -1366,6 +1892,21 @@ if __name__ == "__main__":
                                 if is_final_sample_eval:
                                     print(f"final step {step}/{set_name}/{c_name}/seed{sample_seed}: {summary_row}")
                                     append_eval_row(summary_csv, summary_row)
+                                    if set_name in ["eval", "test"]:
+                                        append_per_scene_eval_rows(
+                                            csv_path=per_scene_csv,
+                                            pred_all=pred_all,
+                                            gt_all=full_gt,
+                                            selected_idx=selected_idx,
+                                            all_frame_ids=all_frame_ids,
+                                            run_id=run_id,
+                                            exp_name=args.exp_name,
+                                            step=step,
+                                            set_name=set_name,
+                                            condition_type=c_name,
+                                            seed=sample_seed,
+                                            args=args,
+                                        )
 
                                 if (
                                     set_name == "eval"
@@ -1376,7 +1917,10 @@ if __name__ == "__main__":
                                 else:
                                     raise ValueError(f"Unknown set_name: {set_name}")
                                 try:
-                                    plot_B = min(8, pred_all.shape[0]) 
+                                    if is_final_sample_eval:
+                                        plot_B =  pred_all.shape[0]
+                                    else:
+                                        plot_B = min(8, pred_all.shape[0]) 
                                     pred_x = pred_all[:plot_B]
                                     extended_gt = full_gt[:plot_B]
                                     c_value_use = cond_used_all[:plot_B] if cond_used_all is not None else None
@@ -1401,7 +1945,11 @@ if __name__ == "__main__":
                                         .view(plot_B, -1)
                                         .mean(dim=1)
                                     ] if c_value_use is not None else [f"N/A" for _ in range(plot_B)]
-                                    # print(f"batch_titles: {batch_titles}")
+                                    batch_id_titles = [
+                                        f"sc:{all_frame_ids['scene_id'][int(i)]}, frame:{all_frame_ids['frame_index'][int(i)]}"
+                                        for i in selected_idx[:plot_B]
+                                    ]
+                                    batch_titles =   [f"{t}- {bt}" for t, bt in zip(batch_titles, batch_id_titles)]
                                     plot_pc_batch(
                                         pred_x,
                                         gt=extended_gt,
@@ -1461,21 +2009,27 @@ if __name__ == "__main__":
             checkpoint_path,
             vars(args),
         )
+        logger.close()
         for set_name in ["eval", "train"]:
-            for seed in [42, 43]:
+            for seed in [42, 43]:# only seed 42 get animation!
                 for c_name in ["correct_cond", "zero_cond", "shuffled_cond", "nn_retrieval"]:
 
                     if set_name == "train" and c_name == "nn_retrieval":
                         continue
                     if c_name == "nn_retrieval" and seed != 42:
                         continue
-                    os.system(
-                        f"ls -v {temp_dir}/denoised_{set_name}_{c_name}_{seed}_*.png | xargs cat | ffmpeg -y -framerate {fps} -f image2pipe -i - {temp_dir}/../{set_name}_{c_name}_{seed}.gif"
-                    )
-                    #scale=640:-1
-                    os.system(
-                        f"ls -v {temp_dir}/denoised_{set_name}_{c_name}_{seed}_*.png | xargs cat | ffmpeg -y -f image2pipe -vcodec png -i - -vf \"fps=10,scale=640:-1:flags=lanczos,split[s0][s1];[s0]palettegen=max_colors=128[p];[s1][p]paletteuse=dither=bayer:bayer_scale=3\" {temp_dir}/../{set_name}_{c_name}_{seed}_scaled.gif"
-                    )
+                    if seed ==42:
+                        os.system(
+                            f"ls -v {temp_dir}/denoised_{set_name}_{c_name}_{seed}_*.png | xargs cat | ffmpeg -y -framerate {fps} -f image2pipe -i - {temp_dir}/../{set_name}_{c_name}_{seed}.gif"
+                        )
+                        #scale=640:-1
+                        os.system(
+                            f"ls -v {temp_dir}/denoised_{set_name}_{c_name}_{seed}_*.png | xargs cat | ffmpeg -y -f image2pipe -vcodec png -i - -vf \"fps=10,scale=640:-1:flags=lanczos,split[s0][s1];[s0]palettegen=max_colors=128[p];[s1][p]paletteuse=dither=bayer:bayer_scale=3\" {temp_dir}/../{set_name}_{c_name}_{seed}_scaled.gif"
+                        )
+                    else:#just copy over
+                        os.system(
+                            f"cp {temp_dir}/denoised_{set_name}_{c_name}_{seed}_*.png {temp_dir}/../"
+                        )
                     os.system(
                         f"rm {temp_dir}/denoised_{set_name}_{c_name}_{seed}_*.png"
                     )
