@@ -1,3 +1,4 @@
+from glob import glob
 import json
 import re
 import time
@@ -103,7 +104,7 @@ def sample_or_retrieve_in_batches(
 
     for s in trange(0, total, batch_size, leave=False, desc=f"Sampling batch with {c_name}"):
         e = min(s + batch_size, total)
-        cond_b = cond_all[s:e] if cond_all is not None else None
+        cond_b = cond_all[s:e].float() if cond_all is not None else None
         b = e - s
         shapes_b = (b, N, inout_dim)
 
@@ -210,12 +211,12 @@ def append_per_scene_eval_rows(
     gt_all,
     selected_idx,
     all_frame_ids,
-    run_id,
+    full_run_id,
     exp_name,
     step,
     set_name,
     condition_type,
-    seed,
+    sample_seed,
     args,
 ):
     """
@@ -258,7 +259,7 @@ def append_per_scene_eval_rows(
         except Exception as e:
             print(
                 f"Per-scene metric error: set={set_name}, cond={condition_type}, "
-                f"seed={seed}, data_file={data_file}, scene_id={scene_id}: {e}"
+                f"sample_seed={sample_seed}, data_file={data_file}, scene_id={scene_id}: {e}"
             )
             stat = {
                 "cd": float("nan"),
@@ -268,7 +269,7 @@ def append_per_scene_eval_rows(
 
         row = {
             "date_time": datetime.now().isoformat(),
-            "run_id": run_id,
+            "full_run_id": full_run_id,
             "exp_name": exp_name,
             "step": step,
             "set_name": set_name,
@@ -279,7 +280,7 @@ def append_per_scene_eval_rows(
             "frame_index_min": min(frame_indices) if len(frame_indices) > 0 else None,
             "frame_index_max": max(frame_indices) if len(frame_indices) > 0 else None,
             "condition_type": condition_type,
-            "seed": seed,
+            "sample_seed": sample_seed,
             "model_name": args.model_name,
             "cond_type": getattr(args, "set_cond_type", None),
             "prediction_type": args.prediction_type,
@@ -539,17 +540,28 @@ def make_run_id(args):
 
 
     stridge_str = f"_str{args.wan_frame_stride}_edge{args.wan_edge_policy}" if args.wan_frame_mode != "repeat" else ""
-    wan_id = f"_fr{args.wan_frames}_mode{args.wan_frame_mode}{stridge_str}" if args.cond_method == "wan" else ""
+    wan_id =''
+    if args.cond_method == "wan":
+        wan_id = f"_fr{args.wan_frames}_mode{args.wan_frame_mode}{stridge_str}" 
+        if args.cond_ram_dtype != "fp32":
+            wan_id += f"_ram{args.cond_ram_dtype}"
 
-    scale_eps2x0_str = "_scaleeps2x0" if args.scale_eps2x0_conversion else ""
+    if args.prediction_type == "epsilon" and args.lambda_cd >0 and args.scale_eps2x0_conversion:
+        scale_eps2x0_str = "_scaleeps2x0" 
+    else:
+        scale_eps2x0_str = ""
+
+    lr_sche_str = f"_{args.lr_schedule}" if args.lr_schedule != "constant" else ""
+    if args.lr_schedule == "cosine" and args.lr_eta_min_ratio != 0.1:
+        lr_sche_str += f"_minetaf{args.lr_eta_min_ratio:.1e}"
         
-    out_id =  f"{args.model_name}{model_spec}_it{args.ddpm_iteration}_{args.shape_name}{shape_spec}_train_sc{args.n_scene}_N{args.N}_B{args.B}_T{args.T}-{args.T_infer}_{args.prediction_type}-{args.sampler}{scale_eps2x0_str}_{args.cond_mode}{cond_spec}{wan_id}_weight{dop_rcs_loss_weight}_lmse{args.lambda_mse:1.3f}_lcd{args.lambda_cd:1.3f}{cd_spec}_sd{args.seed}"
+    out_id =  f"{args.model_name}{model_spec}_it{args.ddpm_iteration}_{args.shape_name}{shape_spec}_train_sc{args.n_scene}_N{args.N}_B{args.B}_T{args.T}-{args.T_infer}_{args.prediction_type}-{args.sampler}{scale_eps2x0_str}_{args.cond_mode}{cond_spec}{wan_id}_weight{dop_rcs_loss_weight}_lmse{args.lambda_mse:1.3f}_lcd{args.lambda_cd:1.3f}{cd_spec}_sd{args.seed}_lr{args.lr:.1e}{lr_sche_str}"
 
     
 
 
 
-    return shorten_run_id(out_id, keep_len=200)
+    return shorten_run_id(out_id, keep_len=200),out_id
 
 
 @torch.no_grad()
@@ -861,28 +873,44 @@ def parse_args():
     )
     #add to run_id
     parser.add_argument(
-
         "--n_eval_scene_keys",
-
         type=int,
-
         default=60,
-
         help="Number of random eval (data_file, scene_id) keys if --eval_scene_set is empty.",
-
     )
-
     parser.add_argument(
-
         "--n_test_scene_keys",
-
         type=int,
-
         default=60,
-
         help="Number of random test (data_file, scene_id) keys if --test_scene_set is empty.",
+    )
+    parser.add_argument(
+        "--lr_schedule",
+        type=str,
+        default="constant",
+        choices=["constant", "cosine"],
+        help="Learning rate schedule.",
 
     )
+    parser.add_argument(
+        "--lr_eta_min_ratio",
+        type=float,
+        default=0.1,
+        help="Factor multiplying LR to get min LR for cosine schedule. Only used if --lr_schedule is 'cosine'."
+    )
+    parser.add_argument(
+        "--cond_ram_dtype",
+        type=str,
+        default="fp32",
+        choices=["fp32", "fp16", "bf16"],
+        help="Data type for RAM storage of WAN condition. Only used if --cond_method is 'wan'.",
+    )
+    parser.add_argument(
+        "--fresh_run"
+,        action="store_true",
+        help="If set, do not resume from existing checkpoints, start fresh.",
+    )
+
     args = parser.parse_args()
 
 
@@ -966,7 +994,7 @@ def filter_valid_scene_keys(all_frame_ids, min_frames_per_side=20):
             valid_keys.add(key)
         else:
             bad_keys[key] = side_counts
-    print(f"Valid scene keys (with at least {min_frames_per_side} frames per present sensor side): {valid_keys}"
+    print(f"Valid scene keys (with at least {min_frames_per_side} frames per present sensor side): {len(valid_keys)}"
           f"\nBad scene keys and their sensor side counts: {bad_keys}")
     return valid_keys, bad_keys
 
@@ -1089,6 +1117,16 @@ def gather_man_ds(args, checkpoint_dir):
                 # assert  os.path.exists(cache_path), f"Cache file {cache_fname} not found, need to run python /palakons/point_diffusion/preprocess_man.py --cond_method wan --wan_frames 5 --wan_frame_mode center --wan_frame_stride 1 --wan_edge_policy skip --N 128  --data_file man-mini --num_scenes 100 --from_scene_id 0"
                 with open(cache_path, "rb") as f:   
                     (x0sbn3_norm, cond_norm, doppler_norm, rcs_norm),frame_ids= pickle.load(f)
+
+                    # args.cond_ram_dtype : ["fp32", "fp16", "bf16"]
+                    # print(f"cond_norm dtype  before loading: {cond_norm.dtype if cond_norm is not None else None}")
+                    if args.cond_method == "wan" and cond_norm is not None:
+                        cond_norm = cond_norm.to(torch.float32 if args.cond_ram_dtype == "fp32" else torch.float16 if args.cond_ram_dtype == "fp16" else torch.bfloat16)
+                    else:
+                        cond_norm = cond_norm
+                    # print(f"cond_norm dtype after loading: {cond_norm.dtype if cond_norm is not None else None}")
+                    # exit()
+
                     x0sbn3_norm_all.append(x0sbn3_norm)
                     cond_all.append(cond_norm)
                     doppler_all.append(doppler_norm)
@@ -1114,14 +1152,86 @@ def gather_man_ds(args, checkpoint_dir):
 
             
 
-def train_eval_step(
+def eval_multi_batch(
     model,
     optimizer,
-    scheduler,
+    ddpm_scheduler,
     x0sbn3_norm_all,
     scene_condition_all,
     T,
-    B,
+    device,
+    loss_weights,
+    inout_dim,
+    eval_idx_pool,
+    eval_batch_size,
+    num_eval_batches,
+    lambda_mse=1.0,
+    lambda_cd=0.0,
+    cd_mode="xyz_attr",
+    prediction_type="epsilon",
+    scale_eps2x0_conversion=False,
+):
+    model.eval()
+
+    n_eval_total = min(
+        eval_batch_size * num_eval_batches,
+        eval_idx_pool.numel(),
+    )
+
+    # eval_idx_pool is already fixed/shuffled once outside if you want deterministic subset
+    eval_idx_use = eval_idx_pool[:n_eval_total]
+
+    val_accum = {}
+
+    with torch.no_grad():
+        for s in range(0, n_eval_total, eval_batch_size):
+            idx_batch = eval_idx_use[s:s + eval_batch_size]
+
+            _, val_dict_i = train_eval_step(
+                model=model,
+                optimizer=optimizer,
+                ddpm_scheduler=ddpm_scheduler,
+                x0sbn3_norm_all=x0sbn3_norm_all,
+                scene_condition_all=scene_condition_all,
+                T=T,
+                device=device,
+                loss_weights=loss_weights,
+                inout_dim=inout_dim,
+                is_train=False,
+                lambda_mse=lambda_mse,
+                lambda_cd=lambda_cd,
+                cd_mode=cd_mode,
+                prediction_type=prediction_type,
+                scale_eps2x0_conversion=scale_eps2x0_conversion,
+                idx_pool=idx_batch,
+                lr_scheduler=None,
+            )
+
+            for k, v in val_dict_i.items():
+                if isinstance(v, (int, float)):
+                    val_accum.setdefault(k, []).append(float(v))
+
+    val_dict = {}
+
+    for k, vals in val_accum.items():
+        vals = np.asarray(vals, dtype=np.float64)
+        val_dict[f"{k}_mean"] = float(vals.mean())
+        val_dict[f"{k}_std"] = float(vals.std())
+        val_dict[f"{k}_min"] = float(vals.min())
+        val_dict[f"{k}_max"] = float(vals.max())
+
+    val_dict["num_eval_batches"] = int(math.ceil(n_eval_total / eval_batch_size))
+    val_dict["num_eval_frames"] = int(n_eval_total)
+    val_dict["eval_batch_size"] = int(eval_batch_size)
+
+    return val_dict
+def train_eval_step(
+    model,
+    optimizer,
+    ddpm_scheduler,
+    x0sbn3_norm_all,
+    scene_condition_all,
+    T,
     device,
     loss_weights,
     inout_dim,
@@ -1131,28 +1241,15 @@ def train_eval_step(
     cd_mode = "xyz_attr",
     prediction_type="epsilon",
     scale_eps2x0_conversion=False,
-    eval_idx_fixed=None,
     idx_pool=None,
-    
-):
-    num_samples = x0sbn3_norm_all.shape[0]
+    lr_scheduler=None
+):    
 
-    if idx_pool is None:
-        idx_pool = torch.arange(num_samples, device="cpu")
-    else:
-        idx_pool = idx_pool.cpu()
-    if is_train:
+    idx = idx_pool.cpu()
+    if is_train: #if train sample to B frames
         model.train()
-        num_pool = idx_pool.numel()
-        if num_pool >= B:
-            local_idx = torch.randperm(num_pool, device="cpu")[:B]
-        else:
-            local_idx = torch.randint(0, num_pool, (B,), device="cpu")
-        idx = idx_pool[local_idx]
-    else:
+    else: #if eval, use what ever frame set
         model.eval()
-        assert eval_idx_fixed is not None, "eval_idx_fixed must be provided for eval"
-        idx = eval_idx_fixed.cpu()
 
     # x0 = x0sbn3_norm_rep[idx][:B].to(device)  # [B, N, 3]
     # cond = scene_condition_rep[idx][:B].to(device)
@@ -1163,14 +1260,23 @@ def train_eval_step(
 
     if scene_condition_all is not None:
         cond_cpu = scene_condition_all[idx]
-        cond = cond_cpu.to(device, non_blocking=True)
+        cond = cond_cpu.to(device, non_blocking=True).float()
     else:
         cond = None
 
-    t = torch.randint(0, T, (x0.shape[0],), device=device)
-    noise = torch.randn_like(x0)
+    # t = torch.randint(0, T, (x0.shape[0],), device=device)
+    # noise = torch.randn_like(x0)
 
-    x_t = scheduler.add_noise(x0, noise, t)
+    if is_train:
+        t = torch.randint(0, T, (x0.shape[0],), device=device)
+        noise = torch.randn_like(x0)
+    else: #less noisy when inference
+        g = torch.Generator(device=device)
+        g.manual_seed(123456)
+        t = torch.randint(0, T, (x0.shape[0],), device=device, generator=g)
+        noise = torch.randn(x0.shape, device=device, dtype=x0.dtype, generator=g)
+
+    x_t = ddpm_scheduler.add_noise(x0, noise, t)
     if prediction_type == "epsilon":
         target = noise
     elif prediction_type == "sample":
@@ -1223,13 +1329,13 @@ def train_eval_step(
     if lambda_cd > 0.0:  # include CD loss
 
         with torch.set_grad_enabled(is_train):
-            scheduler.set_timesteps(
+            ddpm_scheduler.set_timesteps(
                 T, device=device
             )  # set timesteps to max T for get_x0_from_noise
 
-            alpha_bar = scheduler.alphas_cumprod[t].view(-1, 1, 1)
+            alpha_bar = ddpm_scheduler.alphas_cumprod[t].view(-1, 1, 1)
             x0_hat_o = (x_t - torch.sqrt(1 - alpha_bar) * pred) / torch.sqrt(alpha_bar)
-            x0_hat,conversion_scale = reconstruct_x0(pred, x_t, t, scheduler, prediction_type)
+            x0_hat,conversion_scale = reconstruct_x0(pred, x_t, t, ddpm_scheduler, prediction_type)
             if False:
                 from matplotlib import pyplot as plt
                 print(f"t: {t}, conversion_scale {conversion_scale.shape}: {conversion_scale.view(-1) if conversion_scale is not None else None}") #conversion_scale torch.Size([1024, 1, 1])
@@ -1325,10 +1431,10 @@ def train_eval_step(
             error_if_nonfinite=True,
         )
         loss_dict["grad_norm"] = grad_norm.item()
-        
-
 
         optimizer.step()
+        if lr_scheduler is not None:
+            lr_scheduler.step()
     return loss, loss_dict
 
 
@@ -1337,17 +1443,22 @@ if __name__ == "__main__":
     # Example setup
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    run_id = make_run_id(args)
-    system_key = "ddpm_cond_5"
+    run_id,full_run_id = make_run_id(args)
+    system_key = "ddpm_cond_slow"
     data_dir = f"/data/palakons/{system_key}/{args.exp_name}"
     tb_dir = f"/home/palakons/logs/tb_log/{system_key}/{args.exp_name}"
     temp_dir = f"{data_dir}/temp"
     samples_dir = f"{data_dir}/samples"
     checkpoint_dir = f"/data/palakons/{system_key}/checkpoints/"
+    cache_dir = f"/data/palakons/{system_key}/cache/"
     checkpoint_path = os.path.join(checkpoint_dir, f"latest_{run_id}.pt")
     exists = {'tb_dir': os.path.exists(tb_dir), 'data_dir': os.path.exists(data_dir),"checkpoint_file": os.path.exists(checkpoint_path)}
     print(f"Directories and checkpoint existence: {exists}")
     print(f"checkpoint_path: {checkpoint_path}")
+    #            re.sub(r"it\d+", "it*", checkpoint_path)
+    ceckpoint_path_pattern = re.sub(r"it\d+", "it*", checkpoint_path)
+    print(f"checkpoint_path pattern: {ceckpoint_path_pattern}")
+    print(f"exists wild card checkpoint: {glob(ceckpoint_path_pattern)}")
     assert not exists['tb_dir'] , f"TensorBoard log directory {tb_dir} already exists. Please choose a different experiment name or remove the existing logs to avoid overwriting."
     # creat dir, nested if not exist
     os.makedirs(temp_dir, exist_ok=True)
@@ -1375,7 +1486,7 @@ if __name__ == "__main__":
     }
     frame_ids = None
 
-    x0sbn3_norm, cond_norm, doppler_norm, rcs_norm,frame_ids_all = gather_man_ds(args, checkpoint_dir)
+    x0sbn3_norm, cond_norm, doppler_norm, rcs_norm,frame_ids_all = gather_man_ds(args, cache_dir)
     all_frame_ids=frame_ids_all["train"] 
     print(f"Gathered MAN dataset: {x0sbn3_norm.shape} samples, cond shape: {cond_norm.shape if cond_norm is not None else None}, doppler shape: {doppler_norm.shape if doppler_norm is not None else None}, rcs shape: {rcs_norm.shape if rcs_norm is not None else None}")
     
@@ -1598,9 +1709,19 @@ if __name__ == "__main__":
     model = make_model(device, args)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    if args.lr_schedule == "cosine":
+        lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=args.ddpm_iteration,
+            eta_min=args.lr * args.lr_eta_min_ratio,
+        )
+    elif args.lr_schedule == "constant":
+        lr_scheduler = None
+    else:
+        raise ValueError(f"Unsupported lr_schedule: {args.lr_schedule}")
 
     if args.sampler == "ddpm":
-        scheduler = DDPMScheduler(
+        ddpm_scheduler = DDPMScheduler(
             num_train_timesteps=T,
             beta_start=1e-4,
             beta_end=0.02,
@@ -1611,7 +1732,7 @@ if __name__ == "__main__":
     elif args.sampler == "ddim":
         from diffusers import DDIMScheduler
 
-        scheduler = DDIMScheduler(
+        ddpm_scheduler = DDIMScheduler(
             num_train_timesteps=T,
             beta_start=1e-4,
             beta_end=0.02,
@@ -1624,15 +1745,17 @@ if __name__ == "__main__":
         raise ValueError(f"Unsupported sampler: {args.sampler}")
 
     # Load checkpoint if exists
-    start_step, config = load_checkpoint(
-        model,
-        optimizer,
-        scheduler,
-        re.sub(r"it\d+", "it*", checkpoint_path),
-        ddpm_iteration,
-        device=device,
-    )
-    # start_step, config = 0,{}
+    if  args.fresh_run:
+        start_step, config = 0,{}
+    else:
+        start_step, config = load_checkpoint(
+            model,
+            optimizer,
+            re.sub(r"it\d+", "it*", checkpoint_path),
+            ddpm_iteration,
+            device=device,
+            lr_scheduler=lr_scheduler,
+        )
     if config:
         assert (
             config.get("N", N) == N
@@ -1701,6 +1824,7 @@ if __name__ == "__main__":
         for group_name, num_params in param_groups.items():
             logger.log_text(f"num_parameters_{group_name}", f"{num_params}", 0)
         logger.log_text("run_id", run_id, 0)
+        logger.log_text("full_run_id", full_run_id, 0)
         logger.log_text("system_key", system_key, 0)
         logger.log_text("node_name", os.uname().nodename, 0)
         if frame_ids is not None:
@@ -1748,22 +1872,35 @@ if __name__ == "__main__":
             
             
         # print(f"Starting training loop from step {start_step} to {ddpm_iteration} skape x0sbn3_train_norm_rep: {x0sbn3_train_norm_rep.shape}, cond_train_norm_rep: {cond_train_norm_rep.shape if cond_train_norm_rep is not None else None}")
-        g_eval = torch.Generator().manual_seed(seed + 999)
+        # g_eval = torch.Generator().manual_seed(seed + 999)
+        # eval_local = torch.randperm(eval_idx_pool.numel(), generator=g_eval)[:min(B, eval_idx_pool.numel())]
+        # eval_idx_fixed = eval_idx_pool[eval_local]
+        # #log eval index 
+        # logger.log_text("eval_idx_fixed", str(eval_idx_fixed.tolist()), 0)
 
-        eval_local = torch.randperm(eval_idx_pool.numel(), generator=g_eval)[:min(B, eval_idx_pool.numel())]
-        eval_idx_fixed = eval_idx_pool[eval_local]
+        # eval_fixed_size = min(1024, eval_idx_pool.numel())
+        # g_eval = torch.Generator(device="cpu").manual_seed(seed + 999)
+        # eval_local = torch.randperm(eval_idx_pool.numel(), generator=g_eval)[:eval_fixed_size]
+        # eval_idx_fixed = eval_idx_pool[eval_local]
+        # logger.log_text("eval_idx_fixed", str(eval_idx_fixed.tolist()), 0)
+        # print(f"eval_idx_fixed: {eval_idx_fixed[:min(16, eval_idx_pool.numel())]}")
 
         for step in tt:
-            is_final_sample_eval = step + 1 >= ddpm_iteration
-            
+            # is_final_sample_eval = step + save_checkpoint_every >= ddpm_iteration
+            is_final_sample_eval = (step == ddpm_iteration - 1)
+            # print(f"Step {step}/{ddpm_iteration}, is_final_sample_eval: {is_final_sample_eval}")
+
+            assert len(train_idx_pool) >= B,f"len(train_idx_pool) >= B"
+            train_local = torch.randperm(train_idx_pool.numel(), device="cpu")[:B]
+            train_idx_batch = train_idx_pool[train_local]
+
             loss, loss_dict = train_eval_step(
                 model=model,
                 optimizer=optimizer,
-                scheduler=scheduler,
+                ddpm_scheduler=ddpm_scheduler,
                 x0sbn3_norm_all=x0sbn3_train_norm,
                 scene_condition_all=cond_train_norm,
                 T=T,
-                B=B,
                 device=device,
                 loss_weights=loss_weights,
                 inout_dim=inout_dim,
@@ -1773,8 +1910,8 @@ if __name__ == "__main__":
                 lambda_mse=args.lambda_mse,
                 prediction_type=args.prediction_type,
                 scale_eps2x0_conversion=args.scale_eps2x0_conversion,
-                eval_idx_fixed=None,
-                idx_pool=train_idx_pool
+                idx_pool=train_idx_batch,
+                lr_scheduler=lr_scheduler
             )
 
             if step % log_train_every == 0:
@@ -1790,7 +1927,7 @@ if __name__ == "__main__":
                 logger.log_train(step, loss_dict, log_group=False)
             if step > start_step and  (step % save_checkpoint_every == 0 or is_final_sample_eval) :
                 save_checkpoint(
-                    model, optimizer, scheduler, step, checkpoint_path, vars(args)
+                    model, optimizer,  step, checkpoint_path, vars(args),lr_scheduler=lr_scheduler
                 )
 
                 model.eval()
@@ -1809,7 +1946,11 @@ if __name__ == "__main__":
                         
 
                         for sample_seed in tqdm([42, 43] if is_final_sample_eval else [42], desc=f"Seeds for {set_name}", leave=False):
-                            for c_name in tqdm(["correct_cond", "zero_cond", "shuffled_cond", "nn_retrieval"] if set_cond is not None else ["none"], desc=f"Conditions for {set_name}", leave=False):
+                            if is_final_sample_eval:
+                                c_list = ["correct_cond", "zero_cond", "shuffled_cond", "nn_retrieval"] if set_cond is not None else ["none"]
+                            else:
+                                c_list = ["correct_cond"] if set_cond is not None else ["none"]
+                            for c_name in tqdm(c_list, desc=f"Conditions for {set_name}", leave=False):
                                 # print(f"-=-===--==--- {set_name}/{sample_seed}/{c_name}/{step}...")
                                 if set_name == "train" and c_name == "nn_retrieval":
                                     # print(f"skip")
@@ -1818,10 +1959,14 @@ if __name__ == "__main__":
                                     # print(f"skip")
                                     continue
                                 # full_B = gt.shape[0] if is_final_sample_eval else min(8, gt.shape[0])
-                                if is_final_sample_eval and set_name == "eval":
+                                # if is_final_sample_eval and set_name == "eval":
+                                #     selected_idx = set_idx_pool
+                                # else:
+                                #     selected_idx = set_idx_pool[:min(8, set_idx_pool.numel())]
+                                if  set_name == "eval": #always full set on eval
                                     selected_idx = set_idx_pool
-                                else:
-                                    selected_idx = set_idx_pool[:min(8, set_idx_pool.numel())]
+                                else: #the same training frame for CD
+                                    selected_idx = train_idx_batch
 
                                 full_B = selected_idx.numel()
                                 full_gt = gt[selected_idx]
@@ -1831,14 +1976,15 @@ if __name__ == "__main__":
 
                                 shuffle_perm = None
                                 if c_name == "shuffled_cond":
-                                    shuffle_perm = torch.randperm(full_B)
+                                    g_shuffle = torch.Generator(device="cpu").manual_seed(sample_seed + 12345)
+                                    shuffle_perm = torch.randperm(full_B, generator=g_shuffle)
                                     while torch.equal(shuffle_perm, torch.arange(full_B)) and full_B > 1:
-                                        shuffle_perm = torch.randperm(full_B)
+                                        shuffle_perm = torch.randperm(full_B, generator=g_shuffle)
 
                                 pred_all, cond_used_all = sample_or_retrieve_in_batches(
 
                                     model=model,
-                                    scheduler=scheduler,
+                                    scheduler=ddpm_scheduler,
                                     gt_all=full_gt,
                                     cond_all=full_cond,
                                     cond_train_norm=cond_train_norm,
@@ -1849,7 +1995,7 @@ if __name__ == "__main__":
                                     inout_dim=inout_dim,
                                     T_infer=T_infer,
                                     device=device,
-                                    batch_size=32,   # tune this
+                                    batch_size=256,   # tune this
                                     shuffle_perm=shuffle_perm,
                                     train_idx_pool=train_idx_pool,   # REQUIRED
                                 )
@@ -1868,13 +2014,13 @@ if __name__ == "__main__":
 
                                 summary_row = {
                                     "date_time": datetime.now().isoformat(),
-                                    "run_id": run_id,
+                                    "full_run_id": full_run_id,
                                     "exp_name": args.exp_name,
                                     "step": step,
                                     "n_scene": args.n_scene,
                                     "set_name": set_name,              # train/eval
                                     "condition_type": c_name,          # correct/zero/shuffled/nn
-                                    "seed": sample_seed,
+                                    "sample_seed": sample_seed,
                                     "model_name": args.model_name,
                                     "cond_type": getattr(args, "set_cond_type", None),
                                     "prediction_type": args.prediction_type,
@@ -1899,12 +2045,12 @@ if __name__ == "__main__":
                                             gt_all=full_gt,
                                             selected_idx=selected_idx,
                                             all_frame_ids=all_frame_ids,
-                                            run_id=run_id,
+                                            full_run_id=full_run_id,
                                             exp_name=args.exp_name,
                                             step=step,
                                             set_name=set_name,
                                             condition_type=c_name,
-                                            seed=sample_seed,
+                                            sample_seed=sample_seed,
                                             args=args,
                                         )
 
@@ -1917,10 +2063,7 @@ if __name__ == "__main__":
                                 else:
                                     raise ValueError(f"Unknown set_name: {set_name}")
                                 try:
-                                    if is_final_sample_eval:
-                                        plot_B =  pred_all.shape[0]
-                                    else:
-                                        plot_B = min(8, pred_all.shape[0]) 
+                                    plot_B = min(8, pred_all.shape[0]) 
                                     pred_x = pred_all[:plot_B]
                                     extended_gt = full_gt[:plot_B]
                                     c_value_use = cond_used_all[:plot_B] if cond_used_all is not None else None
@@ -1978,37 +2121,59 @@ if __name__ == "__main__":
 
             if step % eval_every == 0:
 
-                _, val_dict = train_eval_step(
+                val_dict = eval_multi_batch(
                     model=model,
                     optimizer=optimizer,
-                    scheduler=scheduler,
+                    ddpm_scheduler=ddpm_scheduler,
                     x0sbn3_norm_all=x0sbn3_eval_norm,
                     scene_condition_all=cond_eval_norm,
                     T=T,
-                    B=B,
                     device=device,
                     loss_weights=loss_weights,
                     inout_dim=inout_dim,
-                    is_train=False,
+                    # eval_idx_pool=eval_idx_fixed,
+                    eval_idx_pool=eval_idx_pool,   # full eval set
+                    eval_batch_size=B,
+                    num_eval_batches=math.ceil(eval_idx_pool.numel() / B),
+                    lambda_mse=args.lambda_mse,
                     lambda_cd=args.lambda_cd,
                     cd_mode=args.cd_mode,
-                    lambda_mse=args.lambda_mse,
                     prediction_type=args.prediction_type,
                     scale_eps2x0_conversion=args.scale_eps2x0_conversion,
-                    eval_idx_fixed=eval_idx_fixed
                 )
+
                 logger.log_val(step, val_dict, log_group=False)
+
+                # _, val_dict = train_eval_step(
+                #     model=model,
+                #     optimizer=optimizer,
+                #     ddpm_scheduler=ddpm_scheduler,
+                #     x0sbn3_norm_all=x0sbn3_eval_norm,
+                #     scene_condition_all=cond_eval_norm,
+                #     T=T,
+                #     device=device,
+                #     loss_weights=loss_weights,
+                #     inout_dim=inout_dim,
+                #     is_train=False,
+                #     lambda_cd=args.lambda_cd,
+                #     cd_mode=args.cd_mode,
+                #     lambda_mse=args.lambda_mse,
+                #     prediction_type=args.prediction_type,
+                #     scale_eps2x0_conversion=args.scale_eps2x0_conversion,
+                #     idx_pool=eval_idx_fixed,
+                #     lr_scheduler=None
+                # )
+                # logger.log_val(step, val_dict, log_group=False)
 
             tt.set_description(f"Loss: {loss.item():.1e}")
 
-        save_checkpoint(
-            model,
-            optimizer,
-            scheduler,
-            ddpm_iteration,
-            checkpoint_path,
-            vars(args),
-        )
+        # save_checkpoint(
+        #     model,
+        #     optimizer,
+        #     ddpm_iteration,
+        #     checkpoint_path,
+        #     vars(args),lr_scheduler=lr_scheduler
+        # )
         logger.close()
         for set_name in ["eval", "train"]:
             for seed in [42, 43]:# only seed 42 get animation!

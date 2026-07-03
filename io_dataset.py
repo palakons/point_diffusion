@@ -277,7 +277,7 @@ def make_various_pc(num_points=64, device="cpu", n_shapes=7,wan_spec={"wan_frame
         data = data / data.abs().max(dim=1, keepdim=True)[0].max(dim=2, keepdim=True)[0]
     return data[:n_shapes, :num_points, :]
 
-def save_checkpoint(model, optimizer, scheduler, step, checkpoint_path, config):
+def save_checkpoint(model, optimizer,  step, checkpoint_path, config,lr_scheduler=None):
     """Save training checkpoint."""
     os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
     checkpoint = {
@@ -285,12 +285,13 @@ def save_checkpoint(model, optimizer, scheduler, step, checkpoint_path, config):
         "model_state": model.state_dict(),
         "optimizer_state": optimizer.state_dict(),
         "config": config,
+        "lr_scheduler_state": lr_scheduler.state_dict() if lr_scheduler is not None else None,
     }
     torch.save(checkpoint, checkpoint_path)
     # print(f"Checkpoint saved at step {step}: {checkpoint_path}")
 
 
-def load_checkpoint(model, optimizer, scheduler, checkpoint_path, epoch, device="cuda"):
+def load_checkpoint(model, optimizer,  checkpoint_path, epoch, device="cuda",config=None,lr_scheduler=None):
     """Load training checkpoint and return the step to resume from.
     checkpoint_path: wildcard path to checkpoint file, e.g., "checkpoints/latest*.pt". The function will load the most recent checkpoint matching the pattern.
     """
@@ -317,6 +318,7 @@ def load_checkpoint(model, optimizer, scheduler, checkpoint_path, epoch, device=
                         f"Checkpoint step {loaded_checkpoint['step']} is greater than current epoch {epoch}. Skipping this checkpoint in file {match}."
                     )
                     continue
+                
                 latest_step = loaded_checkpoint["step"]
                 checkpoint = loaded_checkpoint
         except Exception as e:
@@ -328,7 +330,8 @@ def load_checkpoint(model, optimizer, scheduler, checkpoint_path, epoch, device=
 
     model.load_state_dict(checkpoint["model_state"])
     optimizer.load_state_dict(checkpoint["optimizer_state"])
-    # scheduler.load_state_dict(checkpoint['scheduler_state'])
+    if "lr_scheduler_state" in checkpoint and checkpoint["lr_scheduler_state"] is not None and lr_scheduler is not None:
+        lr_scheduler.load_state_dict(checkpoint["lr_scheduler_state"])
     step = checkpoint["step"]
     config = checkpoint.get("config", {})
     print(f"Checkpoint loaded from: {checkpoint_path} (resuming from step {step})")
