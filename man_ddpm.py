@@ -28,7 +28,6 @@ if False:
     from openpoints.cpp.chamfer_dist import ChamferFunction, ChamferDistanceL2
 
 sys.path.insert(0, "/home/palakons/Wan2.2")
-from wan.modules.vae2_1 import Wan2_1_VAE
 
 
 class SimplePerspectiveCamera:
@@ -210,7 +209,8 @@ class MANDataset(Dataset):
         point_preset="uniform",  # "uniform" or "original", "l-shape"
         normalize_type="std",  # "std" or "minmax", if "std", return mean, std, if "minmax", return mean(min,max), range
         x_range=None, y_range=None, z_range=None,
-        wan_preprocess_dir=None
+        wan_preprocess_dir=None,
+        trucksc = None
     ):  # load all frames from scene_id, of data_file, particular radar and camera channel
         self.device = device
         self.data_file = data_file
@@ -256,6 +256,8 @@ class MANDataset(Dataset):
 
         if self.wan_vae:
             print(f"Loading VAE from checkpoint: {self.wan_vae_checkpoint}")
+
+            from wan.modules.vae2_1 import Wan2_1_VAE
             self.vae21 = Wan2_1_VAE(
                 vae_pth=self.wan_vae_checkpoint,
                 device=self.device,
@@ -266,11 +268,11 @@ class MANDataset(Dataset):
         if self.data_file == "man-mini":
             print("Loading MAN mini dataset...")
             self.data_root = "/data/palakons/new_dataset/MAN/mini/man-truckscenes"
-            trucksc = TruckScenes("v1.0-mini", self.data_root, False)
+            trucksc = TruckScenes("v1.0-mini", self.data_root, False) if trucksc is None else trucksc
         elif self.data_file == "man-full":
             print("Loading MAN full dataset...")
             self.data_root = "/data/palakons/new_dataset/MAN/man-truckscenes"
-            trucksc = TruckScenes("v1.0-trainval", self.data_root, False)
+            trucksc = TruckScenes("v1.0-trainval", self.data_root, False) if trucksc is None else trucksc
         else:
             raise ValueError(f"Unknown data_file: {self.data_file}")
 
@@ -397,12 +399,14 @@ class MANDataset(Dataset):
             for item, latent in tqdm(zip(missing_image_cache, wan_latent), desc="Saving preprocessed VAE latents", total=len(missing_image_cache)):
                 preprocessed_file_path = os.path.join( self.wan_preprocess_dir, item["camera_file_name"].split("/")[-1].replace(".jpg", f"_{latent_id}.pt") ) 
                 torch.save(latent.cpu(), preprocessed_file_path)
+                print(f"saved preprocessed VAE latent for scene {item['scene_id']} frame {item['frame_index']} token {item['frame_token']} to {preprocessed_file_path}")
 
             for idx_db,item in tqdm(enumerate(image_cache), desc="Loading preprocessed VAE latents", total=len(image_cache)):
-                preprocessed_file_path = os.path.join( self.wan_preprocess_dir, item["camera_file_name"].split("/")[-1].replace(".jpg", f"_{latent_id}.pt") )   
-                assert os.path.exists(preprocessed_file_path), f"Preprocessed VAE latent file {preprocessed_file_path} does not exist. Please run WAN preprocessing first to generate VAE latent files."
-
-                wan_vae_latent = torch.load(preprocessed_file_path).to(self.device)
+                preprocessed_file_path = os.path.join( self.wan_preprocess_dir, item["camera_file_name"].split("/")[-1].replace(".jpg", f"_{latent_id}.pt") )  
+                if os.path.exists(preprocessed_file_path):
+                    wan_vae_latent = torch.load(preprocessed_file_path).to(self.device)
+                else:
+                    wan_vae_latent = torch.tensor([0], device=self.device)  # placeholder for missing latent
 
                 self.data_bank[idx_db]['wan_vae_latent'] = wan_vae_latent
 

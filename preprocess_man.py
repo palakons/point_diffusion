@@ -4,6 +4,7 @@ import pickle
 from io_dataset import normalize_data,make_man_pc
 # from fitone_dfs_cond_log import parse_args
 from tqdm import trange
+from truckscenes import TruckScenes
 
 
 def parse_args():
@@ -267,31 +268,44 @@ if __name__ == "__main__":
 
 
 
-    system_key = "ddpm_cond_5"
-    checkpoint_dir = f"/data/palakons/{system_key}/checkpoints/"
+    system_key = "ddpm_cond_slow"
+    checkpoint_dir = f"/data/palakons/{system_key}/cache/"
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     wan_spec = {"wan_frames": args.wan_frames, "wan_frame_mode": args.wan_frame_mode, "wan_frame_stride": args.wan_frame_stride, "wan_edge_policy": args.wan_edge_policy}
 
+    tc_mini = TruckScenes("v1.0-mini", "/data/palakons/new_dataset/MAN/mini/man-truckscenes", False) 
+    tc_full = TruckScenes("v1.0-trainval", "/data/palakons/new_dataset/MAN/man-truckscenes", False) 
+    total_scenes = 10 if args.data_file == "man-mini" else 597
 
-    for sc_id in trange(args.from_scene_id, args.from_scene_id + args.num_scenes, desc="Processing scenes"):
-        cache_fname = f"man_{args.data_file}_{sc_id}_{args.sensor_side}_{args.cond_method}_{args.N}_{args.cond_mode}_{args.wan_frames}_{args.wan_frame_mode}_{args.wan_frame_stride}_{args.wan_edge_policy}.pkl"
+
+
+    for sc_id in trange(args.from_scene_id,min(args.from_scene_id + args.num_scenes, total_scenes), desc="Processing scenes", total=min(args.num_scenes, total_scenes - args.from_scene_id)):
+ 
+        cache_fname = f"man_{args.data_file}_{sc_id}{f'_right' if args.sensor_side =='right' else ''}_{args.cond_method}_{args.N}_{args.cond_mode}_{args.wan_frames}_{args.wan_frame_mode}_{args.wan_frame_stride}_{args.wan_edge_policy}.pkl"
         cache_path = os.path.join(checkpoint_dir, cache_fname)
-            
-        mands = make_man_pc(
-            num_points=args.N,scene_ids= [sc_id],
-            n_scene=40,
-            is_dense=True,
-            device=device,
-            data_file=args.data_file,
-            wan_spec=wan_spec,
-            get_wan_cond=True,
-            radar_channel = "RADAR_LEFT_FRONT" if args.sensor_side == "left" else "RADAR_RIGHT_FRONT",
-            camera_channel = "CAMERA_LEFT_FRONT" if args.sensor_side == "left" else "CAMERA_RIGHT_FRONT"
-        )
+        print(f"Processing scene {sc_id} with cache path: {cache_path}")
+        try:    
+            mands = make_man_pc(
+                num_points=args.N,scene_ids= [sc_id],
+                n_scene=40,
+                is_dense=True,
+                device=device,
+                data_file=args.data_file,
+                wan_spec=wan_spec,
+                get_wan_cond=True,
+                # get_wan_cond=False,
+                radar_channel = "RADAR_LEFT_FRONT" if args.sensor_side == "left" else "RADAR_RIGHT_FRONT",
+                camera_channel = "CAMERA_LEFT_FRONT" if args.sensor_side == "left" else "CAMERA_RIGHT_FRONT",
+                trucksc= tc_mini if args.data_file == "man-mini" else tc_full   
+            )
+        except Exception as e:
+            print(f"Error processing scene {sc_id} {args.data_file} {args.sensor_side}: {e}. Skipping this scene.")
+            exit()
+            continue
 
 
-        frame_ids = {"train": {'token':[mands[2][i]['frame_token'][:5] for i in range(len(mands[0]))],"scene_id":[mands[2][i]['scene_id'] for i in range(len(mands[0]))],"frame_index":[mands[2][i]['frame_index'] for i in range(len(mands[0]))]} }
+        frame_ids = {"train": {'token':[mands[2][i]['frame_token'] for i in range(len(mands[0]))],"scene_id":[mands[2][i]['scene_id'] for i in range(len(mands[0]))],"frame_index":[mands[2][i]['frame_index'] for i in range(len(mands[0]))]} }
         mands = [mands[0], mands[1], torch.norm(mands[3], p=2, dim=-1, keepdim=True), mands[4]] #x0sbn3, wan_cond, doppler, rcs
 
         
@@ -299,45 +313,71 @@ if __name__ == "__main__":
         print(f"sizes of train_ds: {mands[0].shape}") # should be [n_scene, num_points, 3]
 
         if os.path.exists(cache_path):
-            print(f"Cache file {cache_path} already exists. Loading from cache.")
+            # print(f"Cache file {cache_path} already exists. Loading from cache.")
+            loaded_data = pickle.load(open(cache_path, "rb"))
+            mands, frame_ids_loaded = loaded_data
+            print(f"shapes of loaded mands: {[m.shape if m is not None else None for m in mands]} len(frame_ids_loaded['train']['token']): {len(frame_ids_loaded['train']['token'])}") # should be [n_scene, num_points, 3]
+            # assert len(frame_ids_loaded['train']['token']) == len(frame_ids['train']['token']), f"Mismatch in number of frame IDs: {len(frame_ids_loaded['train']['token'])} vs {len(frame_ids['train']['token'])}" #36 vs 40
+
+            old_loaded = frame_ids_loaded["train"]["token"].copy()
+            
+            # print(f"old frame IDs loaded from cache: {frame_ids_loaded['train']['token'][:5]} ... ")
+            # print(f"new frame IDs loaded from cache: {frame_ids['train']['token'][:5]} ... ")
+            for i in range(len(frame_ids['train']['token'])):
+                for j in range(len(frame_ids_loaded['train']['token'])):
+                    
+                    if frame_ids['train']['token'][i].startswith(frame_ids_loaded['train']['token'][j]) and frame_ids['train']['token'][i] != frame_ids_loaded['train']['token'][j]   :
+                        frame_ids_loaded['train']['token'][j] = frame_ids['train']['token'][i]
+                        # print(f"{i}/{j}")
+            for a,b in zip(frame_ids_loaded['train']['token'], old_loaded):
+                if len(a) != len(b):
+                    print(f"old: {b}, new: {a}")
+                else:
+                    print(f"{len(a)}.",end="")
+                    assert len(a)==32,f"Len should be 32, but got {len(a)} for {a} vs {b}"
+            assert len(frame_ids_loaded['train']['token']) == len(old_loaded), f"Mismatch in number of frame IDs after update: {len(frame_ids_loaded['train']['token'])} vs {len(old_loaded)}"
+            with open(cache_path, "wb") as f:            
+                pickle.dump([ mands,frame_ids_loaded], f)
+        else:
+            print (f"Cache file {cache_path} does not exist. Creating new cache.")
             continue
 
-        if args.cond_mode =='none':
-            print("cond_mode is 'none', setting wan_cond to zeros.")
-            mands[1] =  torch.zeros(( mands[0].shape[0] , 1), device='cpu').float()
+            if args.cond_mode =='none':
+                print("cond_mode is 'none', setting wan_cond to zeros.")
+                mands[1] =  torch.zeros(( mands[0].shape[0] , 1), device='cpu').float()
 
-        else:
-            if args.cond_method == 'wan':
-                assert  mands[1] is not None, "wan_cond is None but cond_method is 'wan'."
-                try:
-                    wan_max = mands[1].abs().max() 
-                except Exception as e:
-                    print(f"Error computing max absolute value of wan_cond: {e}. Setting wan_max to 1 to avoid division by zero.")
-                    wan_max = 1.0
-                if wan_max == 0:
-                    print("Warning: max absolute value of wan_cond in mands is 0, which may cause division by zero during normalization. Setting wan_max to 1 to avoid this issue.")
-                    wan_max = 1.0
+            else:
+                if args.cond_method == 'wan':
+                    assert  mands[1] is not None, "wan_cond is None but cond_method is 'wan'."
+                    try:
+                        wan_max = mands[1].abs().max() 
+                    except Exception as e:
+                        print(f"Error computing max absolute value of wan_cond: {e}. Setting wan_max to 1 to avoid division by zero.")
+                        wan_max = 1.0
+                    if wan_max == 0:
+                        print("Warning: max absolute value of wan_cond in mands is 0, which may cause division by zero during normalization. Setting wan_max to 1 to avoid this issue.")
+                        wan_max = 1.0
 
-                mands[1] /= wan_max
-                    
-                print(f"max abs wan_cond after normalization in ds: {wan_max}") # check the max abs value of wan_cond after normalization
+                    mands[1] /= wan_max
+                        
+                    print(f"max abs wan_cond after normalization in ds: {wan_max}") # check the max abs value of wan_cond after normalization
 
-            elif args.cond_method == 'scene_id': #actually frame_id
-                total_scenes_num = frame_count["train"] + frame_count["eval"] + frame_count["test"]
-                mands[1] = ((torch.arange(0, 0+mands[0].shape[0], device='cpu').float() / total_scenes_num)*2-1).unsqueeze(1)  # [n_scene], normalized to [-1,1]
-        
-        
-        for i, name in enumerate(["x0sbn3", "wan_cond", "doppler","rcs"]): #assume no None
-            print(f"{name} {i}  shape: {mands[i].shape}, dtype: {mands[i].dtype}, device: {mands[i].device}") 
-            mands[i] = mands[i].cpu()
-            print(f"{name} {i}  shape: {mands[i].shape}, dtype: {mands[i].dtype}, device: {mands[i].device}")  #must be on cpu for the following preprocessing steps to save GPU memory??
-            assert mands[i].device == torch.device('cpu'), f"{name}  {i} is not on CPU, but on {mands[i].device}. Please move it to CPU before proceeding."
-
-        for data_name,idx in zip(["x0sbn3","doppler","rcs"], [0,2,3]):
-            mean, max_half_range = None, None
+                elif args.cond_method == 'scene_id': #actually frame_id
+                    total_scenes_num = frame_count["train"] + frame_count["eval"] + frame_count["test"]
+                    mands[1] = ((torch.arange(0, 0+mands[0].shape[0], device='cpu').float() / total_scenes_num)*2-1).unsqueeze(1)  # [n_scene], normalized to [-1,1]
             
-            mands[idx], mean_, max_half_range_ = normalize_data(mands[idx], save_filename_title=(f"/home/palakons/point_diffusion/output/sample/{args.data_file}_{sc_id}_{data_name}_data_normalization.png", f"{args.data_file} sc{sc_id} {data_name} data normalization"))
+            
+            for i, name in enumerate(["x0sbn3", "wan_cond", "doppler","rcs"]): #assume no None
+                print(f"{name} {i}  shape: {mands[i].shape}, dtype: {mands[i].dtype}, device: {mands[i].device}") 
+                mands[i] = mands[i].cpu()
+                print(f"{name} {i}  shape: {mands[i].shape}, dtype: {mands[i].dtype}, device: {mands[i].device}")  #must be on cpu for the following preprocessing steps to save GPU memory??
+                assert mands[i].device == torch.device('cpu'), f"{name}  {i} is not on CPU, but on {mands[i].device}. Please move it to CPU before proceeding."
 
-        with open(cache_path, "wb") as f:            
-            pickle.dump([ mands,frame_ids], f)
+            for data_name,idx in zip(["x0sbn3","doppler","rcs"], [0,2,3]):
+                mean, max_half_range = None, None
+                
+                mands[idx], mean_, max_half_range_ = normalize_data(mands[idx], save_filename_title=(f"/home/palakons/point_diffusion/output/sample/{args.data_file}_{sc_id}_{data_name}_data_normalization.png", f"{args.data_file} sc{sc_id} {data_name} data normalization"))
+
+            with open(cache_path, "wb") as f:            
+                pickle.dump([ mands,frame_ids], f)
         print(f"Saved frame IDs to {cache_path}")
