@@ -6,6 +6,7 @@ import sys,csv
 import pickle,random
 from datetime import datetime
 import hashlib
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -1686,17 +1687,22 @@ def plot_combo(image_rgb_path,pred,gt,save_path,title)  :
     axs[0].imshow(img)
     axs[0].set_title(title)
     axs[0].axis('off')
-    #plot gt/pred top view  
-    axs[1].scatter(gt[:,0], gt[:,1], c='blue', s=1, label='GT')
-    axs[1].scatter(pred[:,0], pred[:,1], c='red', s=1, label='Pred')
+    #plot gt/pred top view  , y is horizontal, x is vertical
+    axs[1].scatter(gt[:,1], gt[:,0], c='blue', s=1, label='GT')
+    # x_range=[0, 50],
+
+    # y_range=[-50, 50],
+    axs[1].scatter(pred[:,1], pred[:,0], c='red', s=1, label='Pred')
     axs[1].set_title(f"Top View: GT (blue) vs Pred (red)")
-    axs[1].set_xlabel("X")
-    axs[1].set_ylabel("Y")
+    axs[1].set_xlabel("Y")
+    axs[1].set_ylabel("X")
     #set equal aspect ratio
-    axs[1].set_aspect('equal', adjustable='box')
+    # axs[1].set_aspect('equal', adjustable='box')
     #set lim -1,1
     axs[1].set_xlim(-1,1)
-    axs[1].set_ylim(-.5,.5)
+    axs[1].set_ylim(-1,1)
+
+
     axs[1].legend()
     plt.tight_layout()
     plt.savefig(save_path)
@@ -2049,35 +2055,49 @@ if __name__ == "__main__":
     if args.mode == "eval":
         print(f"Starting evaluation mode.")
 
-
-
         if True:
+            c_name = "correct_cond" 
+            sampling_seed = 42
+            sampled_batch_cache_fname = f"sampled_batch_cache_{c_name}_sd{sampling_seed}.pkl"
+            sampled_batch_cache_path = os.path.join(inference_dir, sampled_batch_cache_fname)
+            if os.path.exists(sampled_batch_cache_path):
+                print(f"Loading sampled batch cache from {sampled_batch_cache_path}")
+                with open(sampled_batch_cache_path, "rb") as f:
+                    sampled_batch_cache = pickle.load(f)
+                pred_all = sampled_batch_cache["pred_all"]
+                cond_used_all = sampled_batch_cache["cond_used_all"]
+            else:            
+                gt_all = x0sbn3_all_5d[eval_idx_pool]
+                cond_all = cond_norm[eval_idx_pool] if cond_norm is not None else None
 
-            
-            gt_all = x0sbn3_all_5d[eval_idx_pool]
-            cond_all = cond_norm[eval_idx_pool] if cond_norm is not None else None
+                pred_all, cond_used_all = sample_or_retrieve_in_batches(
+                    model=model,
+                    scheduler=ddpm_scheduler,
+                    gt_all= gt_all,
+                    cond_all= cond_all if cond_all is not None else None,
+                    # gt_all= gt_all[:8],
+                    # cond_all= cond_all[:8] if cond_all is not None else None,
+                    cond_train_norm=None,
+                    x0sbn3_train_norm=None,
+                    c_name=c_name,
+                    seed=sampling_seed,
+                    N=N,
+                    inout_dim=inout_dim,
+                    T_infer=T_infer,
+                    device=device,
+                    batch_size=512,   # tune this
+                    shuffle_perm=None,
+                    train_idx_pool=train_idx_pool,   # REQUIRED
+                )
 
-
-            pred_all, cond_used_all = sample_or_retrieve_in_batches(
-                model=model,
-                scheduler=ddpm_scheduler,
-                gt_all= gt_all,
-                cond_all= cond_all if cond_all is not None else None,
-                # gt_all= gt_all[:8],
-                # cond_all= cond_all[:8] if cond_all is not None else None,
-                cond_train_norm=None,
-                x0sbn3_train_norm=None,
-                c_name="correct_cond",
-                seed=42,
-                N=N,
-                inout_dim=inout_dim,
-                T_infer=T_infer,
-                device=device,
-                batch_size=512,   # tune this
-                shuffle_perm=None,
-                train_idx_pool=train_idx_pool,   # REQUIRED
-            )
-
+                with open(sampled_batch_cache_path, "wb") as f:
+                    pickle.dump(
+                        {
+                            "pred_all": pred_all,
+                            "cond_used_all": cond_used_all,
+                        },
+                        f,
+                    )
             print(f"pred_all, cond_used_all shapes: {pred_all.shape}, {cond_used_all.shape if cond_used_all is not None else None}, eval_idx_pool numel: {eval_idx_pool.numel()}")
             # pred_all, cond_used_all shapes: torch.Size([4320, 128, 5]), torch.Size([8, 16, 2, 60, 104])  
             # assert pred_all.shape[0] == eval_idx_pool.numel(), f"pred_all shape {pred_all.shape} does not match eval_idx_pool numel {eval_idx_pool.numel()}"
@@ -2114,7 +2134,11 @@ if __name__ == "__main__":
         trucksc_all={'man-mini': {"data_root": "/data/palakons/new_dataset/MAN/mini/man-truckscenes", "version": "v1.0-mini","sc_class": TruckScenes("v1.0-mini", "/data/palakons/new_dataset/MAN/mini/man-truckscenes", False)},
                     'man-full': {"data_root": "/data/palakons/new_dataset/MAN/man-truckscenes", "version": "v1.0-trainval","sc_class": TruckScenes("v1.0-trainval", "/data/palakons/new_dataset/MAN/man-truckscenes", False)}}
 
-        for frame_token, scene_id, frame_index, sensor_side, data_file,pred,gt in zip(frame_ids['eval']['token'], frame_ids['eval']['scene_id'], frame_ids['eval']['frame_index'], frame_ids['eval']['sensor_side'], frame_ids['eval']['data_file'], pred_all, x0sbn3_all_5d[eval_idx_pool]):
+        per_frame_cds = []
+        sampled_batch_cd_fname = f"sampled_cds.csv"
+        sampled_batch_cd_path = os.path.join(inference_dir, sampled_batch_cd_fname)
+        
+        for frame_token, scene_id, frame_index, sensor_side, data_file,pred,gt in tqdm(zip(frame_ids['eval']['token'], frame_ids['eval']['scene_id'], frame_ids['eval']['frame_index'], frame_ids['eval']['sensor_side'], frame_ids['eval']['data_file'], pred_all, x0sbn3_all_5d[eval_idx_pool]), desc="Processing frames"):
             # print(f"Token: {frame_token}, Scene ID: {scene_id}, Frame Index: {frame_index}, Sensor Side: {sensor_side}, Data File: {data_file}, Pred Shape: {pred.shape}, GT Shape: {gt.shape}")
             trucksc = trucksc_all[data_file]["sc_class"]
             frame = trucksc.get("sample", frame_token)
@@ -2129,14 +2153,33 @@ if __name__ == "__main__":
                 print(f"Image file does not exist: {image_rgb_path}")
                 raise FileNotFoundError(f"Image file does not exist: {image_rgb_path}")
             else:
-                print(f"Image file path: {image_rgb_path}, token: {frame_token}, scene_id: {scene_id}, frame_index: {frame_index}, sensor_side: {sensor_side}, data_file: {data_file}")
+                if True:
+                
+                    print(f"Image file path: {image_rgb_path}, token: {frame_token}, scene_id: {scene_id}, frame_index: {frame_index}, sensor_side: {sensor_side}, data_file: {data_file}")
+                    #plot image, gt, pred
+                    save_fname =  f"combo_{data_file}_{sensor_side}_sc-{scene_id}_fr-{frame_index}.png"
+                    save_path = os.path.join(inference_dir, save_fname)
+                    title=f"RGB Image: {data_file}, {sensor_side}, scene {scene_id}, frame {frame_index}"
 
-                #plot image, gt, pred
-                save_fname =  f"combo_{data_file}_{sensor_side}_sc-{scene_id}_fr-{frame_index}.png"
-                save_path = os.path.join(inference_dir, save_fname)
-                title=f"RGB Image: {data_file}, {sensor_side}, scene {scene_id}, frame {frame_index}"
+                    plot_combo(image_rgb_path,pred,gt,save_path,title)
 
-                plot_combo(image_rgb_path,pred,gt,save_path,title)
+                xyz_cd = calculate_pointset_stat(pred.unsqueeze(0), gt.unsqueeze(0))['xyz_cd']
+                per_frame_cds.append({'data_file': data_file, 'sensor_side': sensor_side, 'scene_id': scene_id, 'frame_index': frame_index, 'token': frame_token, 'xyz_cd': xyz_cd})
+        #save csv
+        sampled_batch_cd_df = pd.DataFrame(per_frame_cds)
+        sampled_batch_cd_df.to_csv(sampled_batch_cd_path, index=False)
+        print(f"Saved per-frame Chamfer distances to {sampled_batch_cd_path}")
+
+        #aggregate per-scene Chamfer distances
+        per_scene_cds = []
+        for (data_file, sensor_side, scene_id), group in sampled_batch_cd_df.groupby(['data_file', 'sensor_side', 'scene_id']):
+            mean_cd = group['xyz_cd'].mean()
+            std_cd = group['xyz_cd'].std()
+            per_scene_cds.append({'data_file': data_file, 'sensor_side': sensor_side, 'scene_id': scene_id, 'mean_cd': mean_cd, 'std_cd': std_cd})
+        best_sc = min(per_scene_cds, key=lambda x: x['mean_cd'])
+        print(f"Best scene: {best_sc}")
+        worst_sc = max(per_scene_cds, key=lambda x: x['mean_cd'])
+        print(f"Worst scene: {worst_sc}")
 
                 
     elif args.mode == "train":
