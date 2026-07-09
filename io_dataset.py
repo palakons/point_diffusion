@@ -28,7 +28,7 @@ def save_point_sample(path, pred, gt=None, condition=None, meta=None):
     np.savez_compressed(path, **data)
 
 def make_man_pc(
-    num_points=64, n_scene=1, device="cpu", is_dense=False, data_file="man-mini",wan_spec={"wan_frames":5, "wan_frame_mode":"repeat", "wan_frame_stride":1,"wan_edge_policy":"skip"},get_wan_cond=True,scene_ids=[],radar_channel = "RADAR_LEFT_FRONT",camera_channel = "CAMERA_LEFT_FRONT",trucksc = None
+    num_points=64, n_scene=1, device="cpu", is_dense=False, data_file="man-mini",wan_spec={"wan_frames":5, "wan_frame_mode":"repeat", "wan_frame_stride":1,"wan_edge_policy":"skip"},get_wan_cond=True,scene_ids=[],radar_channel = "RADAR_LEFT_FRONT",camera_channel = "CAMERA_LEFT_FRONT",trucksc = None,wan_vae21_object = None
 ):
     # B 128 128 pt 9.482Gi/15.992Gi
     import sys
@@ -56,7 +56,8 @@ def make_man_pc(
             wan_spec = wan_spec,
             radar_channel = radar_channel,
             camera_channel = camera_channel,
-            trucksc = trucksc
+            trucksc = trucksc,
+            wan_vae21_object = wan_vae21_object 
         )
 
         # print(f"keys in man dataset item: {ds[0].keys()}")  # keys
@@ -121,7 +122,8 @@ def make_man_pc(
                 z_range=[-2, 2],
                 wan_preprocess_dir="/data/palakons/man_wan_preprocessed",
             wan_spec = wan_spec,
-            coord_only=False
+                coord_only=False,
+                wan_vae21_object = wan_vae21_object
             )
             for i in range(n_scene)
         ]

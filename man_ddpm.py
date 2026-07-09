@@ -210,7 +210,7 @@ class MANDataset(Dataset):
         normalize_type="std",  # "std" or "minmax", if "std", return mean, std, if "minmax", return mean(min,max), range
         x_range=None, y_range=None, z_range=None,
         wan_preprocess_dir=None,
-        trucksc = None
+        trucksc = None, wan_vae21_object = None
     ):  # load all frames from scene_id, of data_file, particular radar and camera channel
         self.device = device
         self.data_file = data_file
@@ -236,6 +236,7 @@ class MANDataset(Dataset):
         self.grid_binary_range = grid_binary_range
         self.keep_frames = keep_frames
         self.get_bb = get_bb
+        self.vae21 = wan_vae21_object
 
         self.get_clip = get_clip
         self.get_depth = get_depth
@@ -254,7 +255,7 @@ class MANDataset(Dataset):
         if self.wan_preprocess_dir is not None:
             os.makedirs(self.wan_preprocess_dir, exist_ok=True)
 
-        if self.wan_vae:
+        if self.wan_vae and self.vae21 is None:
             print(f"Loading VAE from checkpoint: {self.wan_vae_checkpoint}")
 
             from wan.modules.vae2_1 import Wan2_1_VAE
@@ -460,8 +461,8 @@ class MANDataset(Dataset):
             [d["filtered_radar_data"] for d in self.data_bank], dim=0
             )  # filtered_radar_data, d["filtered_radar_data"] will have different number of row (dim 0) for each frame
             print("all_radar_positions", all_radar_positions.shape)  # 1x 16 x1
-            for d in self.data_bank:
-                print(f"frame_token {d['frame_token']} filtered_radar_data shape {d['filtered_radar_data'].shape}")
+            # for d in self.data_bank:
+            #     print(f"frame_token {d['frame_token']} filtered_radar_data shape {d['filtered_radar_data'].shape}")
                 
 
             # calculate means
@@ -1585,9 +1586,6 @@ class MANDataset(Dataset):
         time_115 = time.time()
         # 5) filter points
         # print("camera_front.shape", camera_front.shape) #[3, 943, 1980])
-        print(f"radar_data_all.shape: {radar_data_all.shape}")  # (N, 7)
-        print(f"radar_data_all_filter.shape: {radar_data_all_filter.shape}")  # (N, 7)
-        print(f"points_uvz.shape: {points_uvz.shape}")  # (N, 3)
         mask = (
             (points_uvz[:, 1] >= 0)
             # & (points_uvz[:, 1] < camera_front.shape[1])
@@ -1597,7 +1595,7 @@ class MANDataset(Dataset):
             & (points_uvz[:, 0] < 1980)
             & (points_uvz[:, 2] > 0)  # Ensure points are in front of the camera
         )
-        print(f"points shape after filtering: {points_uvz[mask].shape}")  # (N, 3)
+        print(f"# points {radar_data_all.shape[0]} -(user-defined ROI)-> {radar_data_all_filter.shape[0]} -(visible in camera view)-> {points_uvz[mask].shape[0]}")
         time_12 = time.time()
         filtered_radar_data = radar_data_all_filter[mask]
 

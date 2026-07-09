@@ -20,14 +20,9 @@ from models import FullSetTransformerDenoiser, make_model
 from diffusers import DDPMScheduler
 from plot_utils import plot_pc_batch, azm_easing, calculate_pointset_stat
 from io_dataset import (
-    make_various_pc,
-    make_man_pc,
-    normalize_data,
+    normalize_data, #will need this
     load_checkpoint,
     save_checkpoint,
-    # sample_batch,
-    make_dataset,
-    save_point_sample,make_proper_man_dataset
 )
 def find_nn_cond_exact_chunked(cond_b, cond_all, train_idx_pool=None, train_chunk=32):
     """
@@ -182,7 +177,8 @@ def sample_or_retrieve_in_batches(
             )
 
             c_value_use = cond_train_norm[nn_idx].to(device)
-            pred_b = x0sbn3_train_norm[nn_idx].to(device)
+            # pred_b = x0sbn3_train_norm[nn_idx].to(device)
+            pred_b = x0sbn3_train_norm[nn_idx][:, :, :inout_dim].to(device)
 
         else:
             raise ValueError(f"Unknown condition type: {c_name}")
@@ -407,83 +403,12 @@ def chamfer_xyz_with_matched_attrs(
     }
     return loss_dict
 
-
 def reconstruct_x0(pred, x_t, t, scheduler, prediction_type):
     # return x0 and scale factor for epsilon to x0 conversion if applicable
     if prediction_type == "sample":
         return pred, None
     alpha_bar = scheduler.alphas_cumprod[t].view(-1, 1, 1)
     return (x_t - torch.sqrt(1 - alpha_bar) * pred) / torch.sqrt(alpha_bar) , torch.sqrt((1 - alpha_bar)/alpha_bar)
-
-def _safe(s):
-    s = str(s)
-    s = s.replace("man-", "")
-    s = s.replace("man_", "")
-    s = s.replace("heldout_split", "held")
-    s = re.sub(r"[^A-Za-z0-9_.-]+", "", s)
-    return s
-
-
-def _k(num):
-    if num >= 1000 and num % 1000 == 0:
-        return f"{num // 1000}k"
-    return str(num)
-
-
-def _safe(s):
-    s = str(s)
-    s = s.replace("man-", "")
-    s = s.replace("man_", "")
-    s = s.replace("heldout_split", "held")
-    s = re.sub(r"[^A-Za-z0-9_.-]+", "", s)
-    return s
-
-
-def _run_cfg_hash(args, n=8):
-    """
-    Hash only config that defines model/data/training identity.
-    Exclude runtime-control fields so checkpoint resume still works.
-    """
-    ignore = {
-        "ddpm_iteration",
-        "mode",
-        "fps",
-        "num_train_log",
-        "num_checkpoints_save",
-        "num_eval",
-        "exp_name",
-        "checkpoint_dir",
-    }
-
-    d = {
-        k: v
-        for k, v in vars(args).items()
-        if k not in ignore
-    }
-
-    raw = json.dumps(d, sort_keys=True, default=str)
-    return hashlib.md5(raw.encode()).hexdigest()[:n]
-
-
-def _scene_spec_tag(spec, n_keys):
-    """
-    If explicit scene set is given:
-        man-mini:0,1+man-full:10,11 -> mi0.1_fu10.11
-
-    If empty:
-        random set -> r60
-    """
-    scene_set = parse_scene_set_spec(spec)
-
-    if len(scene_set) == 0:
-        return f"r{n_keys}"
-
-    return scene_set_tag(scene_set)
-
-
-def _float_tag(x):
-    return f"{x:g}"
-
 
 def shorten_run_id(out_id,  keep_len=200):
 
@@ -533,11 +458,11 @@ def make_run_id(args):
             test_tag = scene_set_tag(test_set)
             #add n_eval_scene_keys, n_test_scene_keys
             shape_spec += f"_held_e{args.n_eval_scene_keys}-{eval_tag}_t{args.n_test_scene_keys}-{test_tag}"
-        shape_spec += f"_minpts{args.min_frames_per_side}"
         
+        shape_spec += f"_minpts{args.min_frames_per_side}"
+       
 
     cd_spec = f"_cdmd{args.cd_mode}" if args.lambda_cd > 0 else ""
-
 
     stridge_str = f"_str{args.wan_frame_stride}_edge{args.wan_edge_policy}" if args.wan_frame_mode != "repeat" else ""
     wan_id =''
@@ -556,15 +481,14 @@ def make_run_id(args):
         lr_sche_str += f"_minetaf{args.lr_eta_min_ratio:.1e}"
 
     clip_str = f"_clip{args.clip_until_step}" if args.clip_until_step != 0 else ""
+
+    norm_str = f"" if args.norm_per_scene else "_trainnorm"
         
-    out_id =  f"{args.model_name}{model_spec}_it{args.ddpm_iteration}_{args.shape_name}{shape_spec}_train_sc{args.n_scene}_N{args.N}_B{args.B}_T{args.T}-{args.T_infer}_{args.prediction_type}-{args.sampler}{scale_eps2x0_str}_{args.cond_mode}{cond_spec}{wan_id}_weight{dop_rcs_loss_weight}_lmse{args.lambda_mse:1.3f}_lcd{args.lambda_cd:1.3f}{cd_spec}_sd{args.seed}_lr{args.lr:.1e}{lr_sche_str}{clip_str}"
+    out_id =  f"{args.model_name}{model_spec}_it{args.ddpm_iteration}_{args.shape_name}{shape_spec}_train_sc{args.n_scene}_N{args.N}_B{args.B}_T{args.T}-{args.T_infer}_{args.prediction_type}-{args.sampler}{scale_eps2x0_str}_{args.cond_mode}{cond_spec}{wan_id}_weight{dop_rcs_loss_weight}_lmse{args.lambda_mse:1.3f}_lcd{args.lambda_cd:1.3f}{cd_spec}_sd{args.seed}_lr{args.lr:.1e}{lr_sche_str}{clip_str}{norm_str}"
 
     
 
-
-
     return shorten_run_id(out_id, keep_len=200),out_id
-
 
 @torch.no_grad()
 def p_sample_loop(
@@ -610,7 +534,6 @@ def p_sample_loop(
     finally:
         model.train(prev_mode)
     return x
-
 
 def parse_args():
     import argparse
@@ -918,10 +841,18 @@ def parse_args():
         default=0,
         help="If > 0, clip gradients to this value for the first N steps. to clip all gradients, set to 0. If < 0, do not clip gradients.",
     )
-
+    parser.add_argument(
+        "--lazy_npy",
+        action="store_true",
+        help="If set, do not precompute WAN condition for all frames, compute on-the-fly during training. This saves RAM but may slow down training.",
+    )
+    parser.add_argument(
+        "--norm_per_scene",
+        action="store_true",
+        help="If set, normalize WAN condition per scene instead of globally.",
+    )
 
     args = parser.parse_args()
-
 
     return args
 
@@ -1085,8 +1016,8 @@ def gather_man_ds(args, checkpoint_dir):
 
         cond_string = f"pdnorm_only_5_center_1_skip"
     
-    x0sbn3_norm_all, cond_all, doppler_all, rcs_all = [], [], [], []
-    frame_ids_all = {"train": {'token':[],"scene_id":[],"frame_index":[],"data_file":[],"sensor_side":[]}}
+    x0sbn3_all, cond_all, doppler_all, rcs_all = [], [], [], []
+    frame_ids_all = {'token':[],"scene_id":[],"frame_index":[],"data_file":[],"sensor_side":[]}
     data_files = ['man-mini',"man-full"] if args.data_file == 'both' else [args.data_file]
     missing_files = {}
     for data_file in data_files:
@@ -1096,17 +1027,14 @@ def gather_man_ds(args, checkpoint_dir):
             sensor_sides = ["left", "right"] if args.sensor_side == "both" else [args.sensor_side]
             for sensor_side in sensor_sides:
                 side_str = "" if sensor_side == "left" else f"_{sensor_side}"
-                cache_fname = f"man_{data_file}_{sc_id}{side_str}_{cond_method}_{args.N}_{cond_string}.pkl"
+                # cache_fname = f"man_{data_file}_{sc_id}{side_str}_{cond_method}_{args.N}_{cond_string}.pkl"
+                cache_fname = f"man_{data_file}_{sc_id}{side_str}_{cond_method}_{args.N}_{cond_string}_unnorm.pkl"
                 cache_path = os.path.join(checkpoint_dir, cache_fname)
                 if not os.path.exists(cache_path):
                     if data_file not in missing_files:
                         missing_files[data_file] = []
                     print(f"Missing cache file: {cache_path}")
                     missing_files[data_file].append(f"{sc_id}_{sensor_side}")
-                # else:
-                #     with open(cache_path, "rb") as f:   
-                #         (x0sbn3_norm, cond_norm, doppler_norm, rcs_norm),frame_ids= pickle.load(f)
-                #     print(f"Sc {sc_id} len frame_ids['train']['token'] {len(frame_ids['train']['token'])} x0sbn3_norm shape {x0sbn3_norm.shape} cond_norm shape {cond_norm.shape if cond_norm is not None else None} doppler_norm shape {doppler_norm.shape if doppler_norm is not None else None} rcs_norm shape {rcs_norm.shape if rcs_norm is not None else None}")
 
     print(f"Missing files: {missing_files}")
     if sum(len(v) for v in missing_files.values()) > 0:
@@ -1121,45 +1049,156 @@ def gather_man_ds(args, checkpoint_dir):
             sensor_sides = ["left", "right"] if args.sensor_side == "both" else [args.sensor_side]
             for sensor_side in sensor_sides:
                 side_str = "" if sensor_side == "left" else f"_{sensor_side}"
-                cache_fname = f"man_{data_file}_{sc_id}{side_str}_{cond_method}_{args.N}_{cond_string}.pkl"
+                # cache_fname = f"man_{data_file}_{sc_id}{side_str}_{cond_method}_{args.N}_{cond_string}.pkl"
+                cache_fname = f"man_{data_file}_{sc_id}{side_str}_{cond_method}_{args.N}_{cond_string}_unnorm.pkl"
                 cache_path = os.path.join(checkpoint_dir, cache_fname)
-                # assert  os.path.exists(cache_path), f"Cache file {cache_fname} not found, need to run python /palakons/point_diffusion/preprocess_man.py --cond_method wan --wan_frames 5 --wan_frame_mode center --wan_frame_stride 1 --wan_edge_policy skip --N 128  --data_file man-mini --num_scenes 100 --from_scene_id 0"
+                assert  os.path.exists(cache_path), f"Cache file {cache_fname} not found, need to run python /palakons/point_diffusion/preprocess_man.py --cond_method wan --wan_frames 5 --wan_frame_mode center --wan_frame_stride 1 --wan_edge_policy skip --N 128  --data_file man-mini --num_scenes 100 --from_scene_id 0"
                 with open(cache_path, "rb") as f:   
-                    (x0sbn3_norm, cond_norm, doppler_norm, rcs_norm),frame_ids= pickle.load(f)
+                    # (x0sbn3_norm, cond_norm, doppler_norm, rcs_norm),frame_ids= pickle.load(f)
+                    (x0sbn3_file, cond_file, doppler_file, rcs_file),frame_ids= pickle.load(f)
 
                     # args.cond_ram_dtype : ["fp32", "fp16", "bf16"]
-                    # print(f"cond_norm dtype  before loading: {cond_norm.dtype if cond_norm is not None else None}")
-                    if args.cond_method == "wan" and cond_norm is not None:
-                        cond_norm = cond_norm.to(torch.float32 if args.cond_ram_dtype == "fp32" else torch.float16 if args.cond_ram_dtype == "fp16" else torch.bfloat16)
+                    if args.cond_method == "wan" and cond_file is not None:
+                        cond_file = cond_file.to(torch.float32 if args.cond_ram_dtype == "fp32" else torch.float16 if args.cond_ram_dtype == "fp16" else torch.bfloat16)
                     else:
-                        cond_norm = cond_norm
-                    # print(f"cond_norm dtype after loading: {cond_norm.dtype if cond_norm is not None else None}")
-                    # exit()
+                        cond_file = cond_file
 
-                    x0sbn3_norm_all.append(x0sbn3_norm)
-                    cond_all.append(cond_norm)
-                    doppler_all.append(doppler_norm)
-                    rcs_all.append(rcs_norm)
+                    x0sbn3_all.append(x0sbn3_file)
+                    if args.cond_method == "none":
+                        cond_all.append(None)
+                    else:
+                        cond_all.append(cond_file)
+                    doppler_all.append(doppler_file)
+                    rcs_all.append(rcs_file)
 
-                    frame_ids_all["train"]["token"].extend(frame_ids["train"]["token"])
-                    frame_ids_all["train"]["scene_id"].extend(frame_ids["train"]["scene_id"])
-                    frame_ids_all["train"]["frame_index"].extend(frame_ids["train"]["frame_index"])
-                    frame_ids_all["train"]["sensor_side"].extend([sensor_side] * len(frame_ids["train"]["token"]))
-                    frame_ids_all["train"]["data_file"].extend([data_file] * len(frame_ids["train"]["token"]))
-                    if  x0sbn3_norm.shape[0] < 36:
-                        print(f"{x0sbn3_norm.shape[0]} samples loaded for {sc_id}-{sensor_side}-{data_file}")
-    x0sbn3_norm_all = torch.cat(x0sbn3_norm_all, dim=0)
-    cond_all = torch.cat(cond_all, dim=0) if cond_all[0] is not None else None
+                    frame_ids_all["token"].extend(frame_ids["token"])
+                    frame_ids_all["scene_id"].extend(frame_ids["scene_id"])
+                    frame_ids_all["frame_index"].extend(frame_ids["frame_index"])
+                    frame_ids_all["sensor_side"].extend([sensor_side] * len(frame_ids["token"]))
+                    frame_ids_all["data_file"].extend([data_file] * len(frame_ids["token"]))
+                    if  x0sbn3_file.shape[0] < 36: #just to check, <36 = less perfect for the common case
+                        print(f"{x0sbn3_file.shape[0]} samples loaded for {sc_id}-{sensor_side}-{data_file}")
+
+    x0sbn3_all = torch.cat(x0sbn3_all, dim=0)
     if args.cond_method == "none":
         cond_all = None
+    else:
+        cond_all = torch.cat(cond_all, dim=0) if cond_all[0] is not None else None
+
     doppler_all = torch.cat(doppler_all, dim=0) if doppler_all[0] is not None else None
     rcs_all = torch.cat(rcs_all, dim=0) if rcs_all[0] is not None else None
 
-    assert x0sbn3_norm_all.shape[0] == len(frame_ids_all["train"]["token"]) == len(frame_ids_all["train"]["scene_id"]) == len(frame_ids_all["train"]["frame_index"]), f"Mismatch in number of samples and frame IDs: {x0sbn3_norm_all.shape[0]} vs {len(frame_ids_all['train']['token'])}"
-    print(f"Loaded {x0sbn3_norm_all.shape} samples from {len(data_files)} data files.")
-    return x0sbn3_norm_all, cond_all, doppler_all, rcs_all,frame_ids_all
+    assert x0sbn3_all.shape[0] == len(frame_ids_all["token"]) == len(frame_ids_all["scene_id"]) == len(frame_ids_all["frame_index"]), f"Mismatch in number of samples and frame IDs: {x0sbn3_all.shape[0]} vs {len(frame_ids_all['token'])}"
+    print(f"Loaded {x0sbn3_all.shape} samples from {len(data_files)} data files.")
+    
 
-            
+
+
+    # x0sbn3_norm_all, cond_norm_all, doppler_norm_all, rcs_norm_all, stat_dict = normalize_all_data(x0sbn3_all, cond_all,doppler_all, rcs_all)
+    # print(f"Data normalization statistics: {stat_dict}")#{'x0sbn3': {'mean': [28.74150848388672, 4.547235488891602, -0.0046195280738174915], 'max_half_range': 45.444610595703125}, 'doppler': {'mean': [8.53986930847168], 'max_half_range': 84.40284729003906}, 'rcs': {'mean': [-7.473166465759277], 'max_half_range': 45.473167419433594}, 'cond_max': 5.805410385131836}
+    return x0sbn3_all, cond_all,doppler_all, rcs_all, frame_ids_all
+def compute_norm_stats_from_train(
+    x0sbn5_src,
+    cond_src,
+    train_idx_pool,
+    chunk_size=512,
+):
+    """
+    Compute normalization stats from train frames only.
+
+    x0sbn5_src: LazyNpyArray or Tensor, shape [F, N, 5]
+    cond_src:   LazyNpyArray/Tensor/None, shape [F, ...]
+    """
+    train_idx_sorted = torch.sort(train_idx_pool.cpu().long()).values
+    n = train_idx_sorted.numel()
+
+    xyz_sum = torch.zeros(3, dtype=torch.float64)
+    doppler_sum = torch.zeros(1, dtype=torch.float64)
+    rcs_sum = torch.zeros(1, dtype=torch.float64)
+
+    xyz_count = 0
+    doppler_count = 0
+    rcs_count = 0
+
+    cond_absmax = torch.tensor(0.0, dtype=torch.float32)
+
+    # First pass: means + cond absmax
+    for s in tqdm(range(0, n, chunk_size), desc="Norm stats pass 1"):
+        idx = train_idx_sorted[s:s + chunk_size]
+
+        x = x0sbn5_src[idx].float()
+
+        xyz = x[..., :3]
+        doppler = x[..., 3:4]
+        rcs = x[..., 4:5]
+
+        xyz_sum += xyz.double().sum(dim=(0, 1)).cpu()
+        doppler_sum += doppler.double().sum(dim=(0, 1)).cpu()
+        rcs_sum += rcs.double().sum(dim=(0, 1)).cpu()
+
+        xyz_count += xyz.shape[0] * xyz.shape[1]
+        doppler_count += doppler.shape[0] * doppler.shape[1]
+        rcs_count += rcs.shape[0] * rcs.shape[1]
+
+        if cond_src is not None:
+            c = cond_src[idx]
+            cond_absmax = torch.maximum(
+                cond_absmax,
+                c.abs().float().max().cpu(),
+            )
+
+        del x
+
+    xyz_mean = (xyz_sum / xyz_count).float()
+    doppler_mean = (doppler_sum / doppler_count).float()
+    rcs_mean = (rcs_sum / rcs_count).float()
+
+    xyz_max_half_range = torch.tensor(0.0, dtype=torch.float32)
+    doppler_max_half_range = torch.tensor(0.0, dtype=torch.float32)
+    rcs_max_half_range = torch.tensor(0.0, dtype=torch.float32)
+
+    # Second pass: max absolute centered value
+    for s in tqdm(range(0, n, chunk_size), desc="Norm stats pass 2"):
+        idx = train_idx_sorted[s:s + chunk_size]
+
+        x = x0sbn5_src[idx].float()
+
+        xyz_max_half_range = torch.maximum(
+            xyz_max_half_range,
+            (x[..., :3] - xyz_mean.view(1, 1, 3)).abs().max().cpu(),
+        )
+
+        doppler_max_half_range = torch.maximum(
+            doppler_max_half_range,
+            (x[..., 3:4] - doppler_mean.view(1, 1, 1)).abs().max().cpu(),
+        )
+
+        rcs_max_half_range = torch.maximum(
+            rcs_max_half_range,
+            (x[..., 4:5] - rcs_mean.view(1, 1, 1)).abs().max().cpu(),
+        )
+
+        del x
+
+    stats = {
+        "x0sbn3": {
+            "mean": xyz_mean.reshape(-1).tolist(),
+            "max_half_range": float(xyz_max_half_range.clamp_min(1e-8)),
+        },
+        "doppler": {
+            "mean": doppler_mean.reshape(-1).tolist(),
+            "max_half_range": float(doppler_max_half_range.clamp_min(1e-8)),
+        },
+        "rcs": {
+            "mean": rcs_mean.reshape(-1).tolist(),
+            "max_half_range": float(rcs_max_half_range.clamp_min(1e-8)),
+        },
+        "cond_absmax": float(cond_absmax.clamp_min(1e-8)) if cond_src is not None else None,
+        "norm_source": "train_only",
+        "n_train_frames_for_norm": int(n),
+    }
+
+    return stats
 
 def eval_multi_batch(
     model,
@@ -1238,7 +1277,6 @@ def eval_multi_batch(
 
     return val_dict
 
-
 class TimeRecorder:
     def __init__(self, insert_order=True, cuda_sync=False):
         self.insert_order = insert_order
@@ -1313,7 +1351,7 @@ def train_eval_step(
     # cond = scene_condition_rep[idx][:B].to(device)
 
     time_recrod.record("change_mode")
-    x0_cpu = x0sbn3_norm_all[idx]
+    x0_cpu = x0sbn3_norm_all[idx][:,:,:inout_dim]  # [B, N, inout_dim]
     time_recrod.record("indexing_x0")
     x0 = x0_cpu.to(device, non_blocking=True)
     assert not torch.isnan(x0).any() and not torch.isinf(x0).any(), f"NaN or Inf detected in x0 after moving to device: {x0}"
@@ -1322,7 +1360,8 @@ def train_eval_step(
     if scene_condition_all is not None:
         cond_cpu = scene_condition_all[idx]
         time_recrod.record("indexing_cond")
-        cond = cond_cpu.to(device, non_blocking=True).float()
+        cond = cond_cpu.to(device, non_blocking=True)
+        # cond = cond_cpu.to(device, non_blocking=True).float()
         time_recrod.record("to_device_cond")
     else:
         cond = None
@@ -1351,34 +1390,8 @@ def train_eval_step(
         raise ValueError(f"Unknown prediction_type: {prediction_type}")
 
     with torch.set_grad_enabled(is_train):
-        # try, if fail reduce batch size by half and retry, until batch pass,
-        # report the batch size that finally pass, exit if the passing batch is not desired batch size
-        bs = x_t.shape[0]
-        org_bs = bs
 
-        while bs > 0:
-            try:
-                pred = model(x_t, t, condition=cond)
-            except RuntimeError as e:
-                if "out of memory" in str(e):
-                    print(f"CUDA out of memory with batch size {bs}, reducing batch size by half and retrying...")
-                    torch.cuda.empty_cache()
-                    bs = bs // 1.5
-                    x_t = x_t[:bs]
-                    t = t[:bs]
-                    if cond is not None:
-                        cond = cond[:bs]
-                    continue
-                else:
-                    raise e
-            break
-        else:
-            raise RuntimeError("Batch size reduced to 0, cannot proceed.")
-        if bs != org_bs:
-            print(f"Batch size reduced from {org_bs} to {bs} due to memory constraints.")
-            if bs < org_bs:
-                print(f"Warning: Batch size reduced to {bs}, which is less than the original batch size {org_bs}. This may affect training stability.")
-                
+        pred = model(x_t, t, condition=cond)
         
         time_recrod.record("model_forward")
 
@@ -1676,7 +1689,134 @@ def append_per_frame_eval_rows(
             row[k] = v
 
         append_eval_row(csv_path, row)
+def check_data_source(name, x):
 
+    if isinstance(x, LazyNpyArray):
+
+        print(
+
+            name,
+
+            "type=LazyNpyArray",
+
+            "shape=", x.shape,
+
+            "np_dtype=", x.arr.dtype,
+
+            "path=", x.npy_path,
+
+        )
+
+    else:
+
+        check_tensor(name, x)
+class NormalizedX0Array:
+    """
+    Wrap raw x0sbn5 source and lazily normalize requested batches.
+
+    raw source returns [B, N, 5]:
+      xyz     channels 0:3
+      doppler channel  3:4
+      rcs     channel  4:5
+    """
+    def __init__(self, src, stats):
+        self.src = src
+        self.shape = src.shape
+
+        self.xyz_mean = torch.as_tensor(stats["x0sbn3"]["mean"], dtype=torch.float32).view(1, 1, 3)
+        self.xyz_scale = torch.tensor(stats["x0sbn3"]["max_half_range"], dtype=torch.float32).clamp_min(1e-8)
+
+        self.doppler_mean = torch.as_tensor(stats["doppler"]["mean"], dtype=torch.float32).view(1, 1, 1)
+        self.doppler_scale = torch.tensor(stats["doppler"]["max_half_range"], dtype=torch.float32).clamp_min(1e-8)
+
+        self.rcs_mean = torch.as_tensor(stats["rcs"]["mean"], dtype=torch.float32).view(1, 1, 1)
+        self.rcs_scale = torch.tensor(stats["rcs"]["max_half_range"], dtype=torch.float32).clamp_min(1e-8)
+
+    def __len__(self):
+        return self.shape[0]
+
+    @property
+    def ndim(self):
+        return len(self.shape)
+
+    def __getitem__(self, idx):
+        x = self.src[idx].float()
+
+        # Important: clone so non-lazy Tensor slices are not modified in-place.
+        x = x.clone()
+
+        x[..., :3] = (x[..., :3] - self.xyz_mean.to(x.device)) / self.xyz_scale.to(x.device)
+
+        if x.shape[-1] > 3:
+            x[..., 3:4] = (x[..., 3:4] - self.doppler_mean.to(x.device)) / self.doppler_scale.to(x.device)
+
+        if x.shape[-1] > 4:
+            x[..., 4:5] = (x[..., 4:5] - self.rcs_mean.to(x.device)) / self.rcs_scale.to(x.device)
+
+        return x
+
+
+class NormalizedCondArray:
+    """
+    Wrap raw WAN condition and lazily divide by train-set absmax.
+    """
+    def __init__(self, src, cond_absmax):
+        self.src = src
+        self.shape = src.shape
+        self.cond_absmax = torch.tensor(float(cond_absmax), dtype=torch.float32).clamp_min(1e-8)
+
+    def __len__(self):
+        return self.shape[0]
+
+    @property
+    def ndim(self):
+        return len(self.shape)
+
+    def __getitem__(self, idx):
+        c = self.src[idx]
+
+        # Preserve fp16/bf16 if source is fp16/bf16.
+        scale = self.cond_absmax.to(dtype=c.dtype, device=c.device)
+        return c / scale
+class LazyNpyArray:
+    def __init__(self, npy_path, torch_dtype=None):
+        self.npy_path = str(npy_path)
+        self.arr = np.load(self.npy_path, mmap_mode="r", allow_pickle=False)
+        self.shape = self.arr.shape
+        self.dtype = self.arr.dtype
+        self.torch_dtype = torch_dtype
+
+    def __len__(self):
+        return self.shape[0]
+
+    @property
+    def ndim(self):
+        return len(self.shape)
+
+    def _convert_index(self, idx):
+        if isinstance(idx, torch.Tensor):
+            return idx.detach().cpu().long().numpy()
+        if isinstance(idx, list):
+            return np.asarray(idx, dtype=np.int64)
+        return idx
+
+    def __getitem__(self, idx):
+        if isinstance(idx, tuple):
+            idx = tuple(self._convert_index(i) for i in idx)
+        else:
+            idx = self._convert_index(idx)
+
+        # Materialize only the requested slice.
+        x = np.asarray(self.arr[idx])
+
+        # copy() avoids non-writable memmap warnings from torch.from_numpy.
+        t = torch.from_numpy(x.copy())
+
+        if self.torch_dtype is not None:
+            t = t.to(self.torch_dtype)
+
+        return t
+    
 if __name__ == "__main__":
     args = parse_args()
     # Example setup
@@ -1689,7 +1829,8 @@ if __name__ == "__main__":
     temp_dir = f"{data_dir}/temp"
     samples_dir = f"{data_dir}/samples"
     checkpoint_dir = f"/data/palakons/{system_key}/checkpoints/"
-    cache_dir = f"/data/palakons/{system_key}/cache/"
+    # cache_dir = f"/data/palakons/{system_key}/cache/"
+    cache_dir = f"/data/palakons/{system_key}/cache_unnorm/"
     checkpoint_path = os.path.join(checkpoint_dir, f"latest_{run_id}.pt")
     exists = {'tb_dir': os.path.exists(tb_dir), 'data_dir': os.path.exists(data_dir),"checkpoint_file": os.path.exists(checkpoint_path)}
     print(f"Directories and checkpoint existence: {exists}")
@@ -1704,7 +1845,6 @@ if __name__ == "__main__":
     os.makedirs(tb_dir, exist_ok=True)
     os.makedirs(checkpoint_dir, exist_ok=True)
     os.makedirs(samples_dir, exist_ok=True)
-
 
     shape_name = args.shape_name
     data_file = args.data_file
@@ -1725,21 +1865,98 @@ if __name__ == "__main__":
     }
     frame_ids = None
 
-    x0sbn3_norm, cond_norm, doppler_norm, rcs_norm,frame_ids_all = gather_man_ds(args, cache_dir)
-    all_frame_ids=frame_ids_all["train"] 
-    print(f"Gathered MAN dataset: {x0sbn3_norm.shape} samples, cond shape: {cond_norm.shape if cond_norm is not None else None}, doppler shape: {doppler_norm.shape if doppler_norm is not None else None}, rcs shape: {rcs_norm.shape if rcs_norm is not None else None}")
+    if True:
+
+        if args.cond_method in [ "wan", "scene_id"]:
+            cond_method = args.cond_method
+            cond_string = f"{args.cond_mode}_{args.wan_frames}_{args.wan_frame_mode}_{args.wan_frame_stride}_{args.wan_edge_policy}"
+        elif args.cond_method == "none": #get "wan", then set to None
+            cond_method = "wan"
+            cond_string = f"pdnorm_only_5_center_1_skip"
+            
+        data_key = f"{args.data_file}_side{args.sensor_side}_{cond_method}_{args.N}_{cond_string}"
+        print(f"data_key: {data_key}")
+        gather_cahce_dir = os.path.join(cache_dir, data_key )
+        os.makedirs(gather_cahce_dir, exist_ok=True)
+
+        whole_ds_cache_fname= {k: f"man_{k}.npy" for k in ["x0sbn5_all", "cond_all"]}
+        whole_ds_cache_fname.update({"frame_ids_all": f"man_frame_ids_all.json"})
+
+        if not all(os.path.exists(os.path.join(gather_cahce_dir, fname)) for fname in whole_ds_cache_fname.values()): #prepare for lazy loading through NPY's MemMap
+            print(f"some cache files are missing, gathering MAN dataset from individual scene cache files. This may take a while...")
+            #which fiel not exist, print them
+            for k, v in whole_ds_cache_fname.items():
+                if not os.path.exists(os.path.join(gather_cahce_dir, v)):
+                    print(f"Missing cache file: {v}")
+            x0sbn3_all, cond_all, doppler_all, rcs_all,frame_ids_all = gather_man_ds(args, cache_dir)
+            x0sbn5_all= torch.cat([x0sbn3_all, doppler_all, rcs_all], dim=-1) 
+
+            all_frame_ids=frame_ids_all
+
+            # Loaded torch.Size([720, 128, 3]) samples from 1 data files.                                                                                                                                            
+            # Gathered MAN dataset: torch.Size([720, 128, 3]) samples, cond shape: torch.Size([720, 16, 2, 60, 104]), doppler shape: torch.Size([720, 128, 1]), rcs shape: torch.Size([720, 128, 1]) frame_ids: 720 tokens, 720 scene_ids, 720 frame_indices, 720 sensor_sides, 720 data_files
+
+            #save eachof the tensors to a separate npy, to ahve memMap in the future
+            for k, v in whole_ds_cache_fname.items():
+                if k  in["frame_ids_all"]:
+                    with open(os.path.join(gather_cahce_dir, v), "w") as f:
+                        json.dump(eval(k), f)
+                        print(f"saved {k} to {os.path.join(gather_cahce_dir, v)}")
+                else:
+                    np.save(os.path.join(gather_cahce_dir, v), eval(k).detach().cpu().numpy(),allow_pickle=False)
+                    print(f"saved {k} to {os.path.join(gather_cahce_dir, v)}")
+            del x0sbn3_all,  doppler_all, rcs_all
+
+            import gc
+
+            gc.collect()
+
+            print(f"MAN dataset saved to cache: {whole_ds_cache_fname}")
+            print(f"Gathered MAN dataset: {x0sbn5_all.shape} samples") 
+            # print(f"cond : {cond_all}")
+            print(f"cond shape: {cond_all.shape if cond_all is not None else None}") 
+            print(f"frame_ids: {len(all_frame_ids['token'])} tokens") 
+            print(f"{len(all_frame_ids['scene_id'])} scene_ids") 
+            print(f"{len(all_frame_ids['frame_index'])} frame_indices") 
+            print(f"{len(all_frame_ids['sensor_side'])} sensor_sides") 
+            print(f"{len(all_frame_ids['data_file'])} data_files key {data_key}")
+        else:
+            print(f"Loading MAN dataset from cache: {whole_ds_cache_fname}")
+
+            time_recorder = TimeRecorder(insert_order=True, cuda_sync=True)
+            if args.lazy_npy:
+                x0sbn5_all, cond_all= [ LazyNpyArray(os.path.join(gather_cahce_dir, whole_ds_cache_fname[k])) for k in ["x0sbn5_all", "cond_all"]]
+            else:#load all to RAM
+                x0sbn5_all, cond_all = [torch.as_tensor(np.load(os.path.join(gather_cahce_dir, whole_ds_cache_fname[k]), allow_pickle=False)) for k in ["x0sbn5_all", "cond_all"]]
+            with open(os.path.join(gather_cahce_dir, whole_ds_cache_fname["frame_ids_all"]), "r") as f:
+                frame_ids_all = json.load(f)         
+
+
+            all_frame_ids=frame_ids_all
+            time_recorder.record("load_from_cache")
+            print(f"Loaded MAN dataset from cache in {time_recorder.get_records()}  with {'LazyNpyArray' if args.lazy_npy else 'non-Lazy'}")
+            
+            print(f"Gathered MAN dataset: {x0sbn5_all.shape} samples") 
+            # print(f"cond : {cond_all}")
+            print(f"cond shape: {cond_all.shape if cond_all is not None else None}") 
+            print(f"frame_ids: {len(all_frame_ids['token'])} tokens") 
+            print(f"{len(all_frame_ids['scene_id'])} scene_ids") 
+            print(f"{len(all_frame_ids['frame_index'])} frame_indices")
+            print(f"{len(all_frame_ids['sensor_side'])} sensor_sides") 
+            print(f"{len(all_frame_ids['data_file'])} data_files key {data_key}")
+            # Gathered MAN dataset: (43373, 128, 3) samples, cond shape: (43373, 16, 2, 60, 104), doppler shape: (43373, 128, 1), rcs shape: (43373, 128, 1) frame_ids: 43373 tokens, 43373 scene_ids, 43373 frame_indices, 43373 sensor_sides, 43373 data_files key both_wan_128_pdnorm_only_5_center_1_skip
+
     
     print(f"MAN dataset loaded from cache. frame_ids (first 8 items): ")
     for k in all_frame_ids.keys():
         print(f"{k}: {all_frame_ids[k][:8]}")
 
-
     if args.shape_name == "man_heldout_split":
         split_seed = args.split_seed 
 
-        assert x0sbn3_norm.shape[0] == len(all_frame_ids["token"])== len(all_frame_ids["scene_id"]) == len(all_frame_ids["frame_index"]) == len(all_frame_ids["data_file"]) == len(all_frame_ids["sensor_side"]), f"Mismatch in number of samples and frame IDs: {x0sbn3_norm.shape[0]} vs {len(all_frame_ids['token'])}"
+        assert x0sbn5_all.shape[0] == len(all_frame_ids["token"])== len(all_frame_ids["scene_id"]) == len(all_frame_ids["frame_index"]) == len(all_frame_ids["data_file"]) == len(all_frame_ids["sensor_side"]), f"Mismatch in number of samples and frame IDs: {x0sbn5_all.shape[0]} vs {len(all_frame_ids['token'])}"
         
-        allids = list(range(x0sbn3_norm.shape[0]))
+        allids = list(range(x0sbn5_all.shape[0]))
 
         valid_scene_keys, bad_scene_keys = filter_valid_scene_keys(
             all_frame_ids,
@@ -1795,60 +2012,26 @@ if __name__ == "__main__":
             f"Some eval_scene_set keys were dropped by min_frames_per_side={args.min_frames_per_side}: "
             f"{sorted(list(dropped_eval))}"
         )
-
         assert len(dropped_test) == 0, (
             f"Some test_scene_set keys were dropped by min_frames_per_side={args.min_frames_per_side}: "
             f"{sorted(list(dropped_test))}"
         )
-
         assert len(eval_indices) > 0, f"No eval frames found for eval_scene_set={eval_scene_set}"
 
         if len(test_scene_set) > 0:
-
             assert len(test_indices) > 0, f"No test frames found for test_scene_set={test_scene_set}"
 
         random.seed(split_seed)
-
         random.shuffle(train_indices)
-
-
 
         if n_scene > 0:
             assert n_scene <= len(train_indices), f"Requested  {n_scene}, change n_scene to {len(train_indices)} or change the eval/test scene sets to free up more training scenes." 
             train_indices = train_indices[:n_scene]
 
-
-
         train_idx_pool = torch.as_tensor(train_indices, dtype=torch.long)
 
         eval_idx_pool = torch.as_tensor(eval_indices, dtype=torch.long)
-
         test_idx_pool = torch.as_tensor(test_indices, dtype=torch.long) if len(test_indices) > 0 else None
-
-
-        # Keep references to full base tensors. No train/eval/test tensor copies.
-
-        x0sbn3_train_norm = x0sbn3_norm
-
-        cond_train_norm = cond_norm
-
-        doppler_train_norm = doppler_norm
-
-        rcs_train_norm = rcs_norm
-
-        x0sbn3_eval_norm = x0sbn3_norm
-
-        cond_eval_norm = cond_norm
-
-        doppler_eval_norm = doppler_norm
-
-        rcs_eval_norm = rcs_norm
-
-
-
-
-        # frame_ids = {"train": {"token":[all_frame_ids["token"][ int(i)] for i in train_idx_pool],"scene_id":[all_frame_ids["scene_id"][ int(i)] for i in train_idx_pool],"frame_index":[all_frame_ids["frame_index"][ int(i)] for i in train_idx_pool], "sensor_side":[all_frame_ids["sensor_side"][ int(i)] for i in train_idx_pool], "data_file":[all_frame_ids["data_file"][ int(i)] for i in train_idx_pool]}, "eval": {"token":[all_frame_ids["token"][ int(i)] for i in eval_idx_pool],"scene_id":[all_frame_ids["scene_id"][ int(i)] for i in eval_idx_pool],"frame_index":[all_frame_ids["frame_index"][ int(i)] for i in eval_idx_pool], "sensor_side":[all_frame_ids["sensor_side"][ int(i)] for i in eval_idx_pool], "data_file":[all_frame_ids["data_file"][ int(i)] for i in eval_idx_pool]} , "test": {"token":[all_frame_ids["token"][ int(i)] for i in test_idx_pool],"scene_id":[all_frame_ids["scene_id"][ int(i)] for i in test_idx_pool],"frame_index":[all_frame_ids["frame_index"][ int(i)] for i in test_idx_pool], "sensor_side":[all_frame_ids["sensor_side"][ int(i)] for i in test_idx_pool], "data_file":[all_frame_ids["data_file"][ int(i)] for i in test_idx_pool]} if test_idx_pool is not None else None}
-
         frame_ids = {
             "split_method": "man_heldout_split",
             "split_key": "data_file,scene_id",
@@ -1861,7 +2044,7 @@ if __name__ == "__main__":
         }
         print("-#-----")
         print(
-            f"After split: full={x0sbn3_norm.shape[0]}, "
+            f"After split: x0sbn5_all={x0sbn5_all.shape[0]}, "
             f"train_frames={train_idx_pool.numel()}, "
             f"eval_frames={eval_idx_pool.numel()}, "
             f"test_frames={0 if test_idx_pool is None else test_idx_pool.numel()}"
@@ -1869,82 +2052,50 @@ if __name__ == "__main__":
         print(f"eval_scene_set={sorted(list(eval_scene_set))}")
         print(f"test_scene_set={sorted(list(test_scene_set))}")
 
-    elif args.shape_name == "man_proper_split_real" and args.man_one_distribution:
-        split_seed = args.split_seed
-        data_file = 'both'
-        # cache_fname = f"man_one_dist_frame_ids_man-mini_288_{cond_method}_{cond_mode}_{args.wan_frames}_{args.wan_frame_mode}_{args.wan_frame_stride}_{args.wan_edge_policy}_seed{42}.pkl"
-        # cache_path = os.path.join(checkpoint_dir, cache_fname)
-        if True or os.path.exists(cache_path):
-            
-            allids = list(range(x0sbn3_norm.shape[0]))
-            random.seed(split_seed)
-            random.shuffle(allids)
+        norm_stats = compute_norm_stats_from_train(
+            x0sbn5_src=x0sbn5_all,
+            cond_src=cond_all,
+            train_idx_pool=train_idx_pool,
+            chunk_size=512,
+        )
+        
 
-            print(f"shape of x0sbn3_norm: {x0sbn3_norm.shape}, shape of cond_norm: {cond_norm.shape if cond_norm is not None else None}, shape of doppler_norm: {doppler_norm.shape if doppler_norm is not None else None}, shape of rcs_norm: {rcs_norm.shape if rcs_norm is not None else None}")
-            
-            real_train_size = n_scene
-            assert real_train_size <= x0sbn3_norm.shape[0], f"Requested number of training scenes {n_scene} exceeds total available scenes {x0sbn3_norm.shape[0]} in the dataset."
-            if False:
-                real_eval_size = max(2, int(0.1 * n_scene / 0.8))  # keep the same eval ratio as in the original split
-            else:
-                real_eval_size = 36
-            assert real_eval_size + real_train_size <= x0sbn3_norm.shape[0], f"Requested number of training scenes {n_scene} and evaluation scenes {real_eval_size} exceeds total available scenes {x0sbn3_norm.shape[0]} in the dataset."
+        print(f"Data normalization statistics from train set: {norm_stats}")
 
-            # Define the slice index ranges from your shuffled allids list
-            train_indices = allids[:real_train_size]
-            eval_indices = allids[-real_eval_size:]
+        norm_stats_path = os.path.join(data_dir, "normalization_stats.json")
 
-            train_idx_pool = torch.as_tensor(train_indices, dtype=torch.long)
-            eval_idx_pool = torch.as_tensor(eval_indices, dtype=torch.long)
+        with open(norm_stats_path, "w") as f:
 
-            # Keep references to the full base tensors. No large copy.
-            x0sbn3_train_norm = x0sbn3_norm
-            cond_train_norm = cond_norm
-            doppler_train_norm = doppler_norm
-            rcs_train_norm = rcs_norm
+            json.dump(norm_stats, f, indent=2)
 
-            x0sbn3_eval_norm = x0sbn3_norm
-            cond_eval_norm = cond_norm
-            doppler_eval_norm = doppler_norm
-            rcs_eval_norm = rcs_norm
+        x0sbn5_norm = NormalizedX0Array(x0sbn5_all, norm_stats)
 
-            frame_ids = {"train": {"token":[all_frame_ids["token"][ i] for i in train_indices],"scene_id":[all_frame_ids["scene_id"][ i] for i in train_indices],"frame_index":[all_frame_ids["frame_index"][ i] for i in train_indices], "sensor_side":[all_frame_ids["sensor_side"][ i] for i in train_indices], "data_file":[all_frame_ids["data_file"][ i] for i in train_indices]},
-                        "eval": {"token":[all_frame_ids["token"][ i] for i in eval_indices],"scene_id":[all_frame_ids["scene_id"][ i] for i in eval_indices],"frame_index":[all_frame_ids["frame_index"][ i] for i in eval_indices], "sensor_side":[all_frame_ids["sensor_side"][ i] for i in eval_indices], "data_file":[all_frame_ids["data_file"][ i] for i in eval_indices]} }
-            print(f"After splitting cached dataset: Training scenes: {x0sbn3_train_norm.shape[0]}, Evaluation scenes: {x0sbn3_eval_norm.shape[0]}, frame_ids (first 8): ")
-            print(f"train: token:{frame_ids['train']['token'][:8]}, scene_id: {frame_ids['train']['scene_id'][:8]}, frame_index: {frame_ids['train']['frame_index'][:8]};")
-            print(f"eval: token:{frame_ids['eval']['token'][:8]}, scene_id: {frame_ids['eval']['scene_id'][:8]}, frame_index: {frame_ids['eval']['frame_index'][:8]}")
+        if cond_all is not None:
+
+            cond_norm = NormalizedCondArray(cond_all, norm_stats["cond_absmax"])
+
+        else:
+
+            cond_norm = None
+    else:
+        raise NotImplementedError(f"Shape name {args.shape_name} is not implemented yet. Please use 'man_heldout_split' for MAN dataset.")
+
 
     print(
-        f"Dataset created. Full samples: {x0sbn3_train_norm.shape[0]}, "
+        f"Dataset created. Full samples: {x0sbn5_all.shape[0]}, "
         f"Train indexed frames: {train_idx_pool.numel()}, "
-        f"Eval indexed frames: {eval_idx_pool.numel()}"
+        f"Eval indexed frames: {eval_idx_pool.numel()}, "
+        f"Test indexed frames: {0 if test_idx_pool is None else test_idx_pool.numel()}"
     )
 
-
-    # assert x0sbn3_train_norm.shape[0] >= n_scene, f"Not enough training scenes in the dataset. Requested: {n_scene}, available: {x0sbn3_train_norm.shape[0]}"
+    # assert x0sbn5_train_norm.shape[0] >= n_scene, f"Not enough training scenes in the dataset. Requested: {n_scene}, available: {x0sbn5_train_norm.shape[0]}"
     n_scene = train_idx_pool.numel()
     print(
-        f"shapes after dataset creation: x0sbn3_norm {x0sbn3_train_norm.shape}, cond {cond_train_norm.shape if cond_train_norm is not None else None}, doppler_norm {doppler_train_norm.shape if doppler_train_norm is not None else None}, rcs_norm {rcs_train_norm.shape if rcs_train_norm is not None else None}"
+        f"shapes after dataset creation: x0sbn5_all {x0sbn5_all.shape}, cond {cond_all.shape if cond_all is not None else None}"
     )
+        
+    inout_dim = 5  if args.train_rcs_doppler else 3
     
-
-
-    if args.train_rcs_doppler:
-        x0sbn3_all_5d = torch.cat(
-            [x0sbn3_train_norm, doppler_train_norm, rcs_train_norm],
-            dim=-1,
-        )
-        x0sbn3_train_norm = x0sbn3_all_5d
-        x0sbn3_eval_norm = x0sbn3_all_5d
-        inout_dim = 5
-
-
-        del doppler_train_norm, doppler_eval_norm, rcs_train_norm, rcs_eval_norm
-
-        del doppler_norm, rcs_norm
-    else:
-        inout_dim = 3
-
     model = make_model(device, args)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
@@ -1968,20 +2119,8 @@ if __name__ == "__main__":
             clip_sample=False,
             prediction_type=args.prediction_type,  # "epsilon" or "sample"
         )
-    elif args.sampler == "ddim":
-        from diffusers import DDIMScheduler
-
-        ddpm_scheduler = DDIMScheduler(
-            num_train_timesteps=T,
-            beta_start=1e-4,
-            beta_end=0.02,
-            beta_schedule="linear",
-            clip_sample=False,
-            steps_offset=1,  # to match the noise schedule of DDPMScheduler
-            prediction_type=args.prediction_type,  # "epsilon" or "sample"
-        )
     else:
-        raise ValueError(f"Unsupported sampler: {args.sampler}")
+        raise NotImplementedError(f"Sampler {args.sampler} is not implemented yet. Please use 'ddpm' sampler.")
 
     # Load checkpoint if exists
     if  args.fresh_run:
@@ -2012,488 +2151,464 @@ if __name__ == "__main__":
 
     print(f"mode: {args.mode}")
 
-    if args.mode == "eval":
+    if args.mode != "train":
         raise NotImplementedError("Evaluation mode is not implemented yet. Please use 'train' or 'interpolate' modes.")
-    elif args.mode == "train":
-        seed = args.seed
+    
+    seed = args.seed
 
-        check_tensor( "x0sbn3_train_norm",x0sbn3_train_norm)
-        # x0sbn3_train_norm shape= (40, 128, 5) type= <class 'torch.Tensor'> dtype= torch.float32 device= cpu requires_grad= False min= -0.8094146251678467 max= 1.0 nan= False
+    # check_data_source( "x0sbn3_train_norm",x0sbn5_all[:, :, :3])
+    # x0sbn3_train_norm shape= (40, 128, 5) type= <class 'torch.Tensor'> dtype= torch.float32 device= cpu requires_grad= False min= -0.8094146251678467 max= 1.0 nan= False
 
-        print(f"Whole data shape x0sbn3_train_norm: {x0sbn3_train_norm.shape}, x0sbn3_eval_norm: {x0sbn3_eval_norm.shape}, cond_train_norm: {cond_train_norm.shape if cond_train_norm is not None else None}, cond_eval_norm: {cond_eval_norm.shape if cond_eval_norm is not None else None}")
+    print(f"Whole data shape x0sbn5_all: {x0sbn5_all.shape} cond_all: {cond_all.shape if cond_all is not None else None}")
 
-        print(f"indices length: train_idx_pool {train_idx_pool.numel()}, eval_idx_pool {eval_idx_pool.numel()} test_idx_pool {0 if test_idx_pool is None else test_idx_pool.numel()}")
+    print(f"indices length: train_idx_pool {train_idx_pool.numel()}, eval_idx_pool {eval_idx_pool.numel()} test_idx_pool {0 if test_idx_pool is None else test_idx_pool.numel()}")
 
-        x0sbn3_train_norm = x0sbn3_train_norm.contiguous()
-        x0sbn3_eval_norm = x0sbn3_eval_norm.contiguous()
-        print(f"made x0sbn3_train_norm and x0sbn3_eval_norm contiguous, make date sits in one piece in memory for faster random access during training and evaluation.")
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
 
-        torch.manual_seed(seed)
-        np.random.seed(seed)
-        random.seed(seed)
+    tt = tqdm(
+        range(start_step, ddpm_iteration),
+        total=ddpm_iteration,
+        initial=start_step,
+        desc="Training",
+        unit="step",
+    )
+    total_work_step = ddpm_iteration - start_step
+    log_train_every = max(1, total_work_step // args.num_train_log)
+    save_checkpoint_every = max(1, total_work_step // args.num_checkpoints_save)
+    eval_every = max(1, total_work_step // args.num_eval)
+    print(
+        f"From {start_step} to {ddpm_iteration}: Logging, evaluation, and checkpoint saving frequencies (in steps): {log_train_every}/{eval_every}/{save_checkpoint_every} steps respectively."
+    )
 
-        tt = tqdm(
-            range(start_step, ddpm_iteration),
-            total=ddpm_iteration,
-            initial=start_step,
-            desc="Training",
-            unit="step",
+    logger = ExperimentLogger(tb_dir, data_dir, vars(args))
+
+    summary_csv = os.path.join(data_dir+"/..", "condition_eval_summary.csv")
+    per_scene_csv = os.path.join(data_dir + "/..", "condition_eval_per_scene.csv")
+    per_frame_csv = os.path.join(data_dir + "/..", "condition_eval_per_frame.csv")
+    logger.log_text("total_parameters", f"{sum(p.numel() for p in model.parameters())}",0)
+    logger.log_text("checkpoint_path", checkpoint_path, 0)
+    
+    param_groups = {}
+    for name, param in model.named_parameters():
+        group_name = name.split(".")[0]
+        if group_name not in param_groups:
+            param_groups[group_name] = 0
+        param_groups[group_name] += param.numel()
+    for group_name, num_params in param_groups.items():
+        logger.log_text(f"num_parameters_{group_name}", f"{num_params}", 0)
+    logger.log_text("run_id", run_id, 0)
+    logger.log_text("full_run_id", full_run_id, 0)
+    logger.log_text("system_key", system_key, 0)
+    logger.log_text("node_name", os.uname().nodename, 0)
+    if frame_ids is not None:
+        print(f"Saving frame_ids to logger config: (first 8 frames)")
+        print(f"train: token:{frame_ids['train']['token'][:8]}, scene_id: {frame_ids['train']['scene_id'][:8]}, frame_index: {frame_ids['train']['frame_index'][:8]};")
+        print(f"eval:  token:{frame_ids['eval']['token'][:8]}, scene_id: {frame_ids['eval']['scene_id'][:8]}, frame_index: {frame_ids['eval']['frame_index'][:8]}")
+        # logger.log_text("frame_ids",json.dumps(frame_ids, indent=4),0)
+        print("Saving frame_ids to JSON file, not TensorBoard text.")
+
+        frame_ids_path = os.path.join(data_dir, "frame_ids.json")
+        with open(frame_ids_path, "w") as f:
+            json.dump(frame_ids, f, indent=2, default=str)
+        frame_ids_hash = hashlib.md5(
+            json.dumps(frame_ids, sort_keys=True, default=str).encode()
+        ).hexdigest()[:12]
+        frame_ids_summary = {
+            "frame_ids_path": frame_ids_path,
+            "frame_ids_hash": frame_ids_hash,
+            "split_method": frame_ids.get("split_method"),
+            "split_key": frame_ids.get("split_key"),
+            "split_seed": frame_ids.get("split_seed"),
+            "n_train": len(frame_ids["train"]["token"]) if frame_ids.get("train") else 0,
+            "n_eval": len(frame_ids["eval"]["token"]) if frame_ids.get("eval") else 0,
+            "n_test": len(frame_ids["test"]["token"]) if frame_ids.get("test") else 0,
+            "eval_scene_set": frame_ids.get("eval_scene_set"),
+            "test_scene_set": frame_ids.get("test_scene_set"),
+            "train_first8": {
+                "scene_id": frame_ids["train"]["scene_id"][:8],
+                "frame_index": frame_ids["train"]["frame_index"][:8],
+                "sensor_side": frame_ids["train"]["sensor_side"][:8],
+                "data_file": frame_ids["train"]["data_file"][:8],
+            },
+            "eval_first8": {
+                "scene_id": frame_ids["eval"]["scene_id"][:8],
+                "frame_index": frame_ids["eval"]["frame_index"][:8],
+                "sensor_side": frame_ids["eval"]["sensor_side"][:8],
+                "data_file": frame_ids["eval"]["data_file"][:8],
+            },
+        }
+        logger.log_text(
+            "frame_ids_summary",
+            json.dumps(frame_ids_summary, indent=2, default=str),
+            0,
         )
-        total_work_step = ddpm_iteration - start_step
-        log_train_every = max(1, total_work_step // args.num_train_log)
-        save_checkpoint_every = max(1, total_work_step // args.num_checkpoints_save)
-        eval_every = max(1, total_work_step // args.num_eval)
-        print(
-            f"From {start_step} to {ddpm_iteration}: Logging, evaluation, and checkpoint saving frequencies (in steps): {log_train_every}/{eval_every}/{save_checkpoint_every} steps respectively."
-        )
-
-        logger = ExperimentLogger(tb_dir, data_dir, vars(args))
-
-        summary_csv = os.path.join(data_dir+"/..", "condition_eval_summary.csv")
-        per_scene_csv = os.path.join(data_dir + "/..", "condition_eval_per_scene.csv")
-        per_frame_csv = os.path.join(data_dir + "/..", "condition_eval_per_frame.csv")
-        logger.log_text("total_parameters", f"{sum(p.numel() for p in model.parameters())}",0)
-        logger.log_text("checkpoint_path", checkpoint_path, 0)
         
-        param_groups = {}
-        for name, param in model.named_parameters():
-            group_name = name.split(".")[0]
-            if group_name not in param_groups:
-                param_groups[group_name] = 0
-            param_groups[group_name] += param.numel()
-        for group_name, num_params in param_groups.items():
-            logger.log_text(f"num_parameters_{group_name}", f"{num_params}", 0)
-        logger.log_text("run_id", run_id, 0)
-        logger.log_text("full_run_id", full_run_id, 0)
-        logger.log_text("system_key", system_key, 0)
-        logger.log_text("node_name", os.uname().nodename, 0)
-        if frame_ids is not None:
-            print(f"Saving frame_ids to logger config: (first 8 frames)")
-            print(f"train: token:{frame_ids['train']['token'][:8]}, scene_id: {frame_ids['train']['scene_id'][:8]}, frame_index: {frame_ids['train']['frame_index'][:8]};")
-            print(f"eval:  token:{frame_ids['eval']['token'][:8]}, scene_id: {frame_ids['eval']['scene_id'][:8]}, frame_index: {frame_ids['eval']['frame_index'][:8]}")
-            # logger.log_text("frame_ids",json.dumps(frame_ids, indent=4),0)
-            print("Saving frame_ids to JSON file, not TensorBoard text.")
+    time_record = TimeRecorder()
+    for step in tt:
+        time_record.record("step_start")
+        # is_final_sample_eval = step + save_checkpoint_every >= ddpm_iteration
+        is_final_sample_eval = (step == ddpm_iteration - 1)
+        # print(f"Step {step}/{ddpm_iteration}, is_final_sample_eval: {is_final_sample_eval}")
 
-            frame_ids_path = os.path.join(data_dir, "frame_ids.json")
-            with open(frame_ids_path, "w") as f:
-                json.dump(frame_ids, f, indent=2, default=str)
-            frame_ids_hash = hashlib.md5(
-                json.dumps(frame_ids, sort_keys=True, default=str).encode()
-            ).hexdigest()[:12]
-            frame_ids_summary = {
-                "frame_ids_path": frame_ids_path,
-                "frame_ids_hash": frame_ids_hash,
-                "split_method": frame_ids.get("split_method"),
-                "split_key": frame_ids.get("split_key"),
-                "split_seed": frame_ids.get("split_seed"),
-                "n_train": len(frame_ids["train"]["token"]) if frame_ids.get("train") else 0,
-                "n_eval": len(frame_ids["eval"]["token"]) if frame_ids.get("eval") else 0,
-                "n_test": len(frame_ids["test"]["token"]) if frame_ids.get("test") else 0,
-                "eval_scene_set": frame_ids.get("eval_scene_set"),
-                "test_scene_set": frame_ids.get("test_scene_set"),
-                "train_first8": {
-                    "scene_id": frame_ids["train"]["scene_id"][:8],
-                    "frame_index": frame_ids["train"]["frame_index"][:8],
-                    "sensor_side": frame_ids["train"]["sensor_side"][:8],
-                    "data_file": frame_ids["train"]["data_file"][:8],
-                },
-                "eval_first8": {
-                    "scene_id": frame_ids["eval"]["scene_id"][:8],
-                    "frame_index": frame_ids["eval"]["frame_index"][:8],
-                    "sensor_side": frame_ids["eval"]["sensor_side"][:8],
-                    "data_file": frame_ids["eval"]["data_file"][:8],
-                },
-            }
-            logger.log_text(
-                "frame_ids_summary",
-                json.dumps(frame_ids_summary, indent=2, default=str),
-                0,
+        assert len(train_idx_pool) >= B,f"len(train_idx_pool) >= B"
+        train_local = torch.randperm(train_idx_pool.numel(), device="cpu")[:B]
+        train_idx_batch = train_idx_pool[train_local]
+        train_idx_batch = torch.sort(train_idx_batch).values
+        time_record.record("sample_train_idx_batch")
+        
+
+        loss, loss_dict,time_record_i = train_eval_step(
+            model=model,
+            optimizer=optimizer,
+            ddpm_scheduler=ddpm_scheduler,
+            x0sbn3_norm_all=x0sbn5_norm,  # only take the first inout_dim channels
+            scene_condition_all=cond_norm,
+            T=T,
+            device=device,
+            loss_weights=loss_weights,
+            inout_dim=inout_dim,
+            is_train=True,
+            lambda_cd=args.lambda_cd,
+            cd_mode=args.cd_mode,
+            lambda_mse=args.lambda_mse,
+            prediction_type=args.prediction_type,
+            scale_eps2x0_conversion=args.scale_eps2x0_conversion,
+            idx_pool=train_idx_batch,
+            collect_loss_stats=(step % log_train_every == 0),
+            lr_scheduler=lr_scheduler,
+            clip_grad_norm=args.clip_until_step ==0 or step < args.clip_until_step
+        )
+
+        time_record.record("train_eval_step")
+
+        if step % log_train_every == 0:
+            # add lr,grad norm, eps,pred/gt mean/norm
+            loss_dict.update(
+                {
+                    "lr": optimizer.param_groups[0]["lr"],
+                    # "grad_norm": torch.nn.utils.clip_grad_norm_(
+                    #     model.parameters(), max_norm=1e5
+                    # ),
+                }
             )
-            
-            
-        # print(f"Starting training loop from step {start_step} to {ddpm_iteration} skape x0sbn3_train_norm_rep: {x0sbn3_train_norm_rep.shape}, cond_train_norm_rep: {cond_train_norm_rep.shape if cond_train_norm_rep is not None else None}")
-        # g_eval = torch.Generator().manual_seed(seed + 999)
-        # eval_local = torch.randperm(eval_idx_pool.numel(), generator=g_eval)[:min(B, eval_idx_pool.numel())]
-        # eval_idx_fixed = eval_idx_pool[eval_local]
-        # #log eval index 
-        # logger.log_text("eval_idx_fixed", str(eval_idx_fixed.tolist()), 0)
+            logger.log_train(step, loss_dict, log_group=False)
+            time_record.record("log_train")
+        if step > start_step and  (step % save_checkpoint_every == 0 or is_final_sample_eval) :
+            save_checkpoint(
+                model, optimizer,  step, checkpoint_path, vars(args),lr_scheduler=lr_scheduler
+            )
 
-        # eval_fixed_size = min(1024, eval_idx_pool.numel())
-        # g_eval = torch.Generator(device="cpu").manual_seed(seed + 999)
-        # eval_local = torch.randperm(eval_idx_pool.numel(), generator=g_eval)[:eval_fixed_size]
-        # eval_idx_fixed = eval_idx_pool[eval_local]
-        # logger.log_text("eval_idx_fixed", str(eval_idx_fixed.tolist()), 0)
-        # print(f"eval_idx_fixed: {eval_idx_fixed[:min(16, eval_idx_pool.numel())]}")
+            model.eval()
+            if True:
+                dir_name = f"{samples_dir}/step_{step:06d}"
+                os.makedirs(dir_name, exist_ok=True)
 
-        time_record = TimeRecorder()
-        for step in tt:
-            time_record.record("step_start")
-            # is_final_sample_eval = step + save_checkpoint_every >= ddpm_iteration
-            is_final_sample_eval = (step == ddpm_iteration - 1)
-            # print(f"Step {step}/{ddpm_iteration}, is_final_sample_eval: {is_final_sample_eval}")
+                for set_name,set_idx_pool in tqdm(zip(
+                    ["eval", "train"],
+                    [eval_idx_pool, train_idx_pool]
+                ), desc=f"Sampling and plotting at step {step}",leave=False):
+                    set_cond,gt = cond_norm, x0sbn5_norm
 
-            assert len(train_idx_pool) >= B,f"len(train_idx_pool) >= B"
-            train_local = torch.randperm(train_idx_pool.numel(), device="cpu")[:B]
-            train_idx_batch = train_idx_pool[train_local]
-            time_record.record("sample_train_idx_batch")
-            
+                    for sample_seed in tqdm([42, 43] if is_final_sample_eval else [42], desc=f"Seeds for {set_name}", leave=False):
+                        if is_final_sample_eval and False:
+                            c_list = ["correct_cond", "zero_cond", "shuffled_cond", "nn_retrieval"] if set_cond is not None else ["none"]
+                        else:
+                            c_list = ["correct_cond"] if set_cond is not None else ["none"]
+                        for c_name in tqdm(c_list, desc=f"Conditions for {set_name}", leave=False):
+                            # print(f"-=-===--==--- {set_name}/{sample_seed}/{c_name}/{step}...")
+                            if set_name == "train" and c_name == "nn_retrieval":
+                                # print(f"skip")
+                                continue
+                            if c_name == "nn_retrieval" and sample_seed != 42:
+                                # print(f"skip")
+                                continue
+                            # full_B = gt.shape[0] if is_final_sample_eval else min(8, gt.shape[0])
+                            # if is_final_sample_eval and set_name == "eval":
+                            #     selected_idx = set_idx_pool
+                            # else:
+                            #     selected_idx = set_idx_pool[:min(8, set_idx_pool.numel())]
+                            if  set_name == "eval": #always full set on eval
+                                selected_idx = set_idx_pool
+                            else: #the same training frame for CD
+                                selected_idx = train_idx_batch
 
-            loss, loss_dict,time_record_i = train_eval_step(
+                            full_B = selected_idx.numel()
+                            full_gt = gt[selected_idx][:, :,:inout_dim]  # only take the first inout_dim channels
+                            full_cond = set_cond[selected_idx] if set_cond is not None else None
+                            # print(f"{set_name}/shape of cond: {set_cond.shape if set_cond is not None else None}, shape of gt: {gt.shape}, full_B: {full_B}")
+
+                            shuffle_perm = None
+                            if c_name == "shuffled_cond":
+                                g_shuffle = torch.Generator(device="cpu").manual_seed(sample_seed + 12345)
+                                shuffle_perm = torch.randperm(full_B, generator=g_shuffle)
+                                while torch.equal(shuffle_perm, torch.arange(full_B)) and full_B > 1:
+                                    shuffle_perm = torch.randperm(full_B, generator=g_shuffle)
+
+                            pred_all, cond_used_all = sample_or_retrieve_in_batches(
+
+                                model=model,
+                                scheduler=ddpm_scheduler,
+                                gt_all=full_gt,
+                                cond_all=full_cond,
+                                cond_train_norm=set_cond,
+                                x0sbn3_train_norm=gt,
+                                c_name=c_name,
+                                seed=sample_seed,
+                                N=N,
+                                inout_dim=inout_dim,
+                                T_infer=T_infer,
+                                device=device,
+                                batch_size=256,   # tune this
+                                shuffle_perm=shuffle_perm,
+                                train_idx_pool=train_idx_pool,   # REQUIRED
+                            )
+                            try:
+                                point_stat_output = calculate_pointset_stat(
+                                    pred_all.cpu(), full_gt.cpu(), prefix=f"{c_name}_{sample_seed}_"
+                                )
+                            except Exception as e:
+                                print(f"Error calculating point set statistics at step {step} for {set_name} with condition {c_name} and seed {sample_seed}: {e}")
+                                point_stat_output = {"cd": float("nan"), "fidelity": float("nan"), "diversity": float("nan")}
+                            
+                            npz_fname = (
+                                f"{dir_name}/{set_name}_{c_name}_sd{sample_seed}.npz"
+                            )
+                            frame_meta_np = make_frame_meta_np(all_frame_ids, selected_idx)
+
+                            np.savez_compressed(
+                                npz_fname,
+                                pred=pred_all.detach().cpu().numpy(),
+                                gt=full_gt.detach().cpu().numpy(),
+                                selected_idx=frame_meta_np["selected_idx"],
+                                token=frame_meta_np["token"],
+                                scene_id=frame_meta_np["scene_id"],
+                                frame_index=frame_meta_np["frame_index"],
+                                sensor_side=frame_meta_np["sensor_side"],
+                                data_file=frame_meta_np["data_file"],
+                                condition_type=np.asarray(c_name, dtype="<U32"),
+                                set_name=np.asarray(set_name, dtype="<U16"),
+                                sample_seed=np.asarray(sample_seed, dtype=np.int64),
+                                step=np.asarray(step, dtype=np.int64),
+                                full_run_id=np.asarray(full_run_id, dtype="<U256"),
+                                exp_name=np.asarray(args.exp_name, dtype="<U128"),
+                            )
+                            # save_point_sample(
+                            #     npz_fname,
+                            #     pred_all.cpu(),
+                            #     gt=full_gt.cpu(),
+                            #     condition=cond_used_all.cpu() if cond_used_all is not None else None,
+                            #     meta={
+                            #         **point_stat_output,
+                            #         **{
+                            #             "seed": sample_seed,
+                            #             "condition_type": c_name,
+                            #             "set_name": set_name,
+                            #         },
+                            #     },
+                            # )
+
+                            summary_row = {
+                                "date_time": datetime.now().isoformat(),
+                                "full_run_id": full_run_id,
+                                "exp_name": args.exp_name,
+                                "step": step,
+                                "n_scene": args.n_scene,
+                                "set_name": set_name,              # train/eval
+                                "condition_type": c_name,          # correct/zero/shuffled/nn
+                                "sample_seed": sample_seed,
+                                "model_name": args.model_name,
+                                "cond_type": getattr(args, "set_cond_type", None),
+                                "prediction_type": args.prediction_type,
+                                "cd_mode": args.cd_mode,
+                                "lambda_cd": args.lambda_cd,
+                                "lambda_mse": args.lambda_mse,
+                                "use_condition_pooling": getattr(args, "use_condition_pooling", False),
+                                "condition_pool_kernel": getattr(args, "condition_pool_kernel", None),
+                                "set_tx_dim": getattr(args, "set_tx_dim", None),
+                            }
+                            summary_row.update({
+                                "n_selected_frames": int(selected_idx.numel()),
+                                "selected_idx_min": int(selected_idx.min().item()),
+                                "selected_idx_max": int(selected_idx.max().item()),
+                            })
+                            for k, v in point_stat_output.items():
+                                if isinstance(v, torch.Tensor):
+                                    v = v.detach().cpu().item() if v.numel() == 1 else str(v.detach().cpu().tolist())
+                                summary_row[k] = v
+                            if is_final_sample_eval:
+                                print(f"final step {step}/{set_name}/{c_name}/seed{sample_seed}: {summary_row}")
+                                append_eval_row(summary_csv, summary_row)
+                                if set_name in ["eval", "test"]:
+                                    append_per_scene_eval_rows(
+                                        csv_path=per_scene_csv,
+                                        pred_all=pred_all,
+                                        gt_all=full_gt,
+                                        selected_idx=selected_idx,
+                                        all_frame_ids=all_frame_ids,
+                                        full_run_id=full_run_id,
+                                        exp_name=args.exp_name,
+                                        step=step,
+                                        set_name=set_name,
+                                        condition_type=c_name,
+                                        sample_seed=sample_seed,
+                                        args=args,
+                                    )
+                                    append_per_frame_eval_rows(
+                                        csv_path=per_frame_csv,
+                                        pred_all=pred_all,
+                                        gt_all=full_gt,
+                                        selected_idx=selected_idx,
+                                        all_frame_ids=all_frame_ids,
+                                        full_run_id=full_run_id,
+                                        exp_name=args.exp_name,
+                                        step=step,
+                                        set_name=set_name,
+                                        condition_type=c_name,
+                                        sample_seed=sample_seed,
+                                        args=args,
+                                    )
+                            if (
+                                set_name == "eval"
+                            ):  # log for seed, condition type, and eval/train set
+                                logger.log_val(step, point_stat_output, log_group=False)
+                            elif set_name == "train":
+                                logger.log_train(step, point_stat_output, log_group=False)
+                            else:
+                                raise ValueError(f"Unknown set_name: {set_name}")
+                            try:
+                                plot_B = min(8, pred_all.shape[0]) 
+                                pred_x = pred_all[:plot_B]
+                                extended_gt = full_gt[:plot_B]
+                                c_value_use = cond_used_all[:plot_B] if cond_used_all is not None else None
+
+                                batch_titles = [
+                                    f"cond:{c:.2f}"
+                                    for c in c_value_use[:plot_B]
+                                    .view(plot_B, -1)
+                                    .mean(dim=1)
+                                ] if c_value_use is not None else [f"N/A" for _ in range(plot_B)]
+                                batch_id_titles = [
+                                    f"sc:{all_frame_ids['scene_id'][int(i)]}, frame:{all_frame_ids['frame_index'][int(i)]}"
+                                    for i in selected_idx[:plot_B]
+                                ]
+                                batch_titles =   [f"{t}- {bt}" for t, bt in zip(batch_titles, batch_id_titles)]
+                                plot_pc_batch(
+                                    pred_x,
+                                    gt=extended_gt,
+                                    title=f"step{step} {set_name} {c_name} sd{sample_seed} N:{N} T:{T} Inf:{T_infer} B:{B}",
+                                    fname=f"{temp_dir}/denoised_{set_name}_{c_name}_{sample_seed}_{step:06d}.png",
+                                    azm=azm_easing(
+                                        step, ddpm_iteration, style="cosine"
+                                    ),
+                                    progress=step / ddpm_iteration,
+                                    elev=azm_easing(
+                                        step, ddpm_iteration, style="cosine"
+                                    )
+                                    / 360
+                                    * 90,
+                                    batch_titles=batch_titles,
+                                )
+                            except Exception as e:
+                                print(f"Error saving point sample at step {step} for {set_name} with condition {c_name} and seed {sample_seed}: {e}")
+                                continue
+                            
+                            # kill full_B, pred_all, cond_used_all, full_gt, full_cond, shuffle_perm
+                            
+            # except Exception as e:
+            #     print(f"Error during inference/plotting at step {step}: {e}")
+            model.train()
+            time_record.record("checkpoint-inference_and_plotting")
+        if step % eval_every == 0:
+
+            val_dict = eval_multi_batch(
                 model=model,
                 optimizer=optimizer,
                 ddpm_scheduler=ddpm_scheduler,
-                x0sbn3_norm_all=x0sbn3_train_norm,
-                scene_condition_all=cond_train_norm,
+                x0sbn3_norm_all=x0sbn5_norm,  # only take the first inout_dim channels
+                scene_condition_all=cond_norm,
                 T=T,
                 device=device,
                 loss_weights=loss_weights,
                 inout_dim=inout_dim,
-                is_train=True,
+                # eval_idx_pool=eval_idx_fixed,
+                eval_idx_pool=eval_idx_pool,   # full eval set
+                eval_batch_size=B,
+                num_eval_batches=math.ceil(eval_idx_pool.numel() / B),
+                lambda_mse=args.lambda_mse,
                 lambda_cd=args.lambda_cd,
                 cd_mode=args.cd_mode,
-                lambda_mse=args.lambda_mse,
                 prediction_type=args.prediction_type,
+                collect_loss_stats=True,
                 scale_eps2x0_conversion=args.scale_eps2x0_conversion,
-                idx_pool=train_idx_batch,
-                collect_loss_stats=(step % log_train_every == 0),
-                lr_scheduler=lr_scheduler,
-                clip_grad_norm=args.clip_until_step ==0 or step < args.clip_until_step
+                clip_grad_norm= args.clip_until_step ==0 or step < args.clip_until_step
             )
 
-            time_record.record("train_eval_step")
+            logger.log_val(step, val_dict, log_group=False)
 
+            # _, val_dict = train_eval_step(
+            #     model=model,
+            #     optimizer=optimizer,
+            #     ddpm_scheduler=ddpm_scheduler,
+            #     x0sbn3_norm_all=x0sbn3_eval_norm,
+            #     scene_condition_all=cond_eval_norm,
+            #     T=T,
+            #     device=device,
+            #     loss_weights=loss_weights,
+            #     inout_dim=inout_dim,
+            #     is_train=False,
+            #     lambda_cd=args.lambda_cd,
+            #     cd_mode=args.cd_mode,
+            #     lambda_mse=args.lambda_mse,
+            #     prediction_type=args.prediction_type,
+            #     scale_eps2x0_conversion=args.scale_eps2x0_conversion,
+            #     idx_pool=eval_idx_fixed,
+            #     lr_scheduler=None
+            # )
+            # logger.log_val(step, val_dict, log_group=False)
+            time_record.record("log_val")
+        tt.set_description(f"Loss: {loss.item():.1e}")
+        time_record.record("step_end")
+        time_record_cache = time_record.get_records()
+        time_record.reset()
+        if False:
+            if  step % eval_every == 0 or step % log_train_every == 0 or step % save_checkpoint_every == 0:
+                # logger.log_train(step, time_record.get_records(prefix_to_add="time"), log_group=False)
+                # logger.log_train(step, time_record_i.get_records(prefix_to_add="time_batch"), log_group=False)
 
-            if step % log_train_every == 0:
-                # add lr,grad norm, eps,pred/gt mean/norm
-                loss_dict.update(
-                    {
-                        "lr": optimizer.param_groups[0]["lr"],
-                        # "grad_norm": torch.nn.utils.clip_grad_norm_(
-                        #     model.parameters(), max_norm=1e5
-                        # ),
-                    }
-                )
-                logger.log_train(step, loss_dict, log_group=False)
-                time_record.record("log_train")
-            if step > start_step and  (step % save_checkpoint_every == 0 or is_final_sample_eval) :
-                save_checkpoint(
-                    model, optimizer,  step, checkpoint_path, vars(args),lr_scheduler=lr_scheduler
-                )
+                logger.log_grouped_scalars("time", step, time_record_cache)
+                logger.log_grouped_scalars("time_batch", step, time_record_i.get_records())
 
-                model.eval()
-                if True:
-                    dir_name = f"{samples_dir}/step_{step:06d}"
-                    os.makedirs(dir_name, exist_ok=True)
+    # save_checkpoint(
+    #     model,
+    #     optimizer,
+    #     ddpm_iteration,
+    #     checkpoint_path,
+    #     vars(args),lr_scheduler=lr_scheduler
+    # )
+    logger.close()
+    for set_name in ["eval", "train"]:
+        for seed in [42, 43]:# only seed 42 get animation!
+            for c_name in ["correct_cond", "zero_cond", "shuffled_cond", "nn_retrieval"]:
 
-                    for set_name, set_cond, gt in tqdm(zip(
-                        ["eval", "train"],
-                        [cond_eval_norm, cond_train_norm],
-                        [x0sbn3_eval_norm, x0sbn3_train_norm],
-                    ), desc=f"Sampling and plotting at step {step}",leave=False):
-                        set_idx_pool = eval_idx_pool if set_name == "eval" else train_idx_pool
-                        if set_cond is not None and gt is not None:
-                            assert gt.shape[0] == set_cond.shape[0], f"Number of samples in gt {gt.shape[0]} and condition {set_cond.shape[0]} must match for set {set_name}"
-                        
-
-                        for sample_seed in tqdm([42, 43] if is_final_sample_eval else [42], desc=f"Seeds for {set_name}", leave=False):
-                            if is_final_sample_eval:
-                                c_list = ["correct_cond", "zero_cond", "shuffled_cond", "nn_retrieval"] if set_cond is not None else ["none"]
-                            else:
-                                c_list = ["correct_cond"] if set_cond is not None else ["none"]
-                            for c_name in tqdm(c_list, desc=f"Conditions for {set_name}", leave=False):
-                                # print(f"-=-===--==--- {set_name}/{sample_seed}/{c_name}/{step}...")
-                                if set_name == "train" and c_name == "nn_retrieval":
-                                    # print(f"skip")
-                                    continue
-                                if c_name == "nn_retrieval" and sample_seed != 42:
-                                    # print(f"skip")
-                                    continue
-                                # full_B = gt.shape[0] if is_final_sample_eval else min(8, gt.shape[0])
-                                # if is_final_sample_eval and set_name == "eval":
-                                #     selected_idx = set_idx_pool
-                                # else:
-                                #     selected_idx = set_idx_pool[:min(8, set_idx_pool.numel())]
-                                if  set_name == "eval": #always full set on eval
-                                    selected_idx = set_idx_pool
-                                else: #the same training frame for CD
-                                    selected_idx = train_idx_batch
-
-                                full_B = selected_idx.numel()
-                                full_gt = gt[selected_idx]
-                                full_cond = set_cond[selected_idx] if set_cond is not None else None
-                                # print(f"{set_name}/shape of cond: {set_cond.shape if set_cond is not None else None}, shape of gt: {gt.shape}, full_B: {full_B}")
-
-
-                                shuffle_perm = None
-                                if c_name == "shuffled_cond":
-                                    g_shuffle = torch.Generator(device="cpu").manual_seed(sample_seed + 12345)
-                                    shuffle_perm = torch.randperm(full_B, generator=g_shuffle)
-                                    while torch.equal(shuffle_perm, torch.arange(full_B)) and full_B > 1:
-                                        shuffle_perm = torch.randperm(full_B, generator=g_shuffle)
-
-                                pred_all, cond_used_all = sample_or_retrieve_in_batches(
-
-                                    model=model,
-                                    scheduler=ddpm_scheduler,
-                                    gt_all=full_gt,
-                                    cond_all=full_cond,
-                                    cond_train_norm=cond_train_norm,
-                                    x0sbn3_train_norm=x0sbn3_train_norm,
-                                    c_name=c_name,
-                                    seed=sample_seed,
-                                    N=N,
-                                    inout_dim=inout_dim,
-                                    T_infer=T_infer,
-                                    device=device,
-                                    batch_size=256,   # tune this
-                                    shuffle_perm=shuffle_perm,
-                                    train_idx_pool=train_idx_pool,   # REQUIRED
-                                )
-                                try:
-                                    point_stat_output = calculate_pointset_stat(
-                                        pred_all.cpu(), full_gt.cpu(), prefix=f"{c_name}_{sample_seed}_"
-                                    )
-                                except Exception as e:
-                                    print(f"Error calculating point set statistics at step {step} for {set_name} with condition {c_name} and seed {sample_seed}: {e}")
-                                    point_stat_output = {"cd": float("nan"), "fidelity": float("nan"), "diversity": float("nan")}
-                                
-                                npz_fname = (
-                                    f"{dir_name}/{set_name}_{c_name}_sd{sample_seed}.npz"
-                                )
-                                frame_meta_np = make_frame_meta_np(all_frame_ids, selected_idx)
-
-                                np.savez_compressed(
-                                    npz_fname,
-                                    pred=pred_all.detach().cpu().numpy(),
-                                    gt=full_gt.detach().cpu().numpy(),
-                                    selected_idx=frame_meta_np["selected_idx"],
-                                    token=frame_meta_np["token"],
-                                    scene_id=frame_meta_np["scene_id"],
-                                    frame_index=frame_meta_np["frame_index"],
-                                    sensor_side=frame_meta_np["sensor_side"],
-                                    data_file=frame_meta_np["data_file"],
-                                    condition_type=np.asarray(c_name, dtype="<U32"),
-                                    set_name=np.asarray(set_name, dtype="<U16"),
-                                    sample_seed=np.asarray(sample_seed, dtype=np.int64),
-                                    step=np.asarray(step, dtype=np.int64),
-                                    full_run_id=np.asarray(full_run_id, dtype="<U256"),
-                                    exp_name=np.asarray(args.exp_name, dtype="<U128"),
-                                )
-                                # save_point_sample(
-                                #     npz_fname,
-                                #     pred_all.cpu(),
-                                #     gt=full_gt.cpu(),
-                                #     condition=cond_used_all.cpu() if cond_used_all is not None else None,
-                                #     meta={
-                                #         **point_stat_output,
-                                #         **{
-                                #             "seed": sample_seed,
-                                #             "condition_type": c_name,
-                                #             "set_name": set_name,
-                                #         },
-                                #     },
-                                # )
-
-                                summary_row = {
-                                    "date_time": datetime.now().isoformat(),
-                                    "full_run_id": full_run_id,
-                                    "exp_name": args.exp_name,
-                                    "step": step,
-                                    "n_scene": args.n_scene,
-                                    "set_name": set_name,              # train/eval
-                                    "condition_type": c_name,          # correct/zero/shuffled/nn
-                                    "sample_seed": sample_seed,
-                                    "model_name": args.model_name,
-                                    "cond_type": getattr(args, "set_cond_type", None),
-                                    "prediction_type": args.prediction_type,
-                                    "cd_mode": args.cd_mode,
-                                    "lambda_cd": args.lambda_cd,
-                                    "lambda_mse": args.lambda_mse,
-                                    "use_condition_pooling": getattr(args, "use_condition_pooling", False),
-                                    "condition_pool_kernel": getattr(args, "condition_pool_kernel", None),
-                                    "set_tx_dim": getattr(args, "set_tx_dim", None),
-                                }
-                                summary_row.update({
-                                    "n_selected_frames": int(selected_idx.numel()),
-                                    "selected_idx_min": int(selected_idx.min().item()),
-                                    "selected_idx_max": int(selected_idx.max().item()),
-                                })
-                                for k, v in point_stat_output.items():
-                                    if isinstance(v, torch.Tensor):
-                                        v = v.detach().cpu().item() if v.numel() == 1 else str(v.detach().cpu().tolist())
-                                    summary_row[k] = v
-                                if is_final_sample_eval:
-                                    print(f"final step {step}/{set_name}/{c_name}/seed{sample_seed}: {summary_row}")
-                                    append_eval_row(summary_csv, summary_row)
-                                    if set_name in ["eval", "test"]:
-                                        append_per_scene_eval_rows(
-                                            csv_path=per_scene_csv,
-                                            pred_all=pred_all,
-                                            gt_all=full_gt,
-                                            selected_idx=selected_idx,
-                                            all_frame_ids=all_frame_ids,
-                                            full_run_id=full_run_id,
-                                            exp_name=args.exp_name,
-                                            step=step,
-                                            set_name=set_name,
-                                            condition_type=c_name,
-                                            sample_seed=sample_seed,
-                                            args=args,
-                                        )
-                                        append_per_frame_eval_rows(
-                                            csv_path=per_frame_csv,
-                                            pred_all=pred_all,
-                                            gt_all=full_gt,
-                                            selected_idx=selected_idx,
-                                            all_frame_ids=all_frame_ids,
-                                            full_run_id=full_run_id,
-                                            exp_name=args.exp_name,
-                                            step=step,
-                                            set_name=set_name,
-                                            condition_type=c_name,
-                                            sample_seed=sample_seed,
-                                            args=args,
-                                        )
-                                if (
-                                    set_name == "eval"
-                                ):  # log for seed, condition type, and eval/train set
-                                    logger.log_val(step, point_stat_output, log_group=False)
-                                elif set_name == "train":
-                                    logger.log_train(step, point_stat_output, log_group=False)
-                                else:
-                                    raise ValueError(f"Unknown set_name: {set_name}")
-                                try:
-                                    plot_B = min(8, pred_all.shape[0]) 
-                                    pred_x = pred_all[:plot_B]
-                                    extended_gt = full_gt[:plot_B]
-                                    c_value_use = cond_used_all[:plot_B] if cond_used_all is not None else None
-
-                                    batch_titles = [
-                                        f"cond:{c:.2f}"
-                                        for c in c_value_use[:plot_B]
-                                        .view(plot_B, -1)
-                                        .mean(dim=1)
-                                    ] if c_value_use is not None else [f"N/A" for _ in range(plot_B)]
-                                    batch_id_titles = [
-                                        f"sc:{all_frame_ids['scene_id'][int(i)]}, frame:{all_frame_ids['frame_index'][int(i)]}"
-                                        for i in selected_idx[:plot_B]
-                                    ]
-                                    batch_titles =   [f"{t}- {bt}" for t, bt in zip(batch_titles, batch_id_titles)]
-                                    plot_pc_batch(
-                                        pred_x,
-                                        gt=extended_gt,
-                                        title=f"step{step} {set_name} {c_name} sd{sample_seed} N:{N} T:{T} Inf:{T_infer} B:{B}",
-                                        fname=f"{temp_dir}/denoised_{set_name}_{c_name}_{sample_seed}_{step:06d}.png",
-                                        azm=azm_easing(
-                                            step, ddpm_iteration, style="cosine"
-                                        ),
-                                        progress=step / ddpm_iteration,
-                                        elev=azm_easing(
-                                            step, ddpm_iteration, style="cosine"
-                                        )
-                                        / 360
-                                        * 90,
-                                        batch_titles=batch_titles,
-                                    )
-                                except Exception as e:
-                                    print(f"Error saving point sample at step {step} for {set_name} with condition {c_name} and seed {sample_seed}: {e}")
-                                    continue
-                                
-                                # kill full_B, pred_all, cond_used_all, full_gt, full_cond, shuffle_perm
-                                
-                # except Exception as e:
-                #     print(f"Error during inference/plotting at step {step}: {e}")
-                model.train()
-                time_record.record("checkpoint-inference_and_plotting")
-            if step % eval_every == 0:
-
-                val_dict = eval_multi_batch(
-                    model=model,
-                    optimizer=optimizer,
-                    ddpm_scheduler=ddpm_scheduler,
-                    x0sbn3_norm_all=x0sbn3_eval_norm,
-                    scene_condition_all=cond_eval_norm,
-                    T=T,
-                    device=device,
-                    loss_weights=loss_weights,
-                    inout_dim=inout_dim,
-                    # eval_idx_pool=eval_idx_fixed,
-                    eval_idx_pool=eval_idx_pool,   # full eval set
-                    eval_batch_size=B,
-                    num_eval_batches=math.ceil(eval_idx_pool.numel() / B),
-                    lambda_mse=args.lambda_mse,
-                    lambda_cd=args.lambda_cd,
-                    cd_mode=args.cd_mode,
-                    prediction_type=args.prediction_type,
-                    collect_loss_stats=True,
-                    scale_eps2x0_conversion=args.scale_eps2x0_conversion,
-                    clip_grad_norm= args.clip_until_step ==0 or step < args.clip_until_step
-                )
-
-                logger.log_val(step, val_dict, log_group=False)
-
-                # _, val_dict = train_eval_step(
-                #     model=model,
-                #     optimizer=optimizer,
-                #     ddpm_scheduler=ddpm_scheduler,
-                #     x0sbn3_norm_all=x0sbn3_eval_norm,
-                #     scene_condition_all=cond_eval_norm,
-                #     T=T,
-                #     device=device,
-                #     loss_weights=loss_weights,
-                #     inout_dim=inout_dim,
-                #     is_train=False,
-                #     lambda_cd=args.lambda_cd,
-                #     cd_mode=args.cd_mode,
-                #     lambda_mse=args.lambda_mse,
-                #     prediction_type=args.prediction_type,
-                #     scale_eps2x0_conversion=args.scale_eps2x0_conversion,
-                #     idx_pool=eval_idx_fixed,
-                #     lr_scheduler=None
-                # )
-                # logger.log_val(step, val_dict, log_group=False)
-                time_record.record("log_val")
-            tt.set_description(f"Loss: {loss.item():.1e}")
-            time_record.record("step_end")
-            time_record_cache = time_record.get_records()
-            time_record.reset()
-            if False:
-                if  step % eval_every == 0 or step % log_train_every == 0 or step % save_checkpoint_every == 0:
-                    # logger.log_train(step, time_record.get_records(prefix_to_add="time"), log_group=False)
-                    # logger.log_train(step, time_record_i.get_records(prefix_to_add="time_batch"), log_group=False)
-
-                    logger.log_grouped_scalars("time", step, time_record_cache)
-                    logger.log_grouped_scalars("time_batch", step, time_record_i.get_records())
-
-        # save_checkpoint(
-        #     model,
-        #     optimizer,
-        #     ddpm_iteration,
-        #     checkpoint_path,
-        #     vars(args),lr_scheduler=lr_scheduler
-        # )
-        logger.close()
-        for set_name in ["eval", "train"]:
-            for seed in [42, 43]:# only seed 42 get animation!
-                for c_name in ["correct_cond", "zero_cond", "shuffled_cond", "nn_retrieval"]:
-
-                    if set_name == "train" and c_name == "nn_retrieval":
-                        continue
-                    if c_name == "nn_retrieval" and seed != 42:
-                        continue
-                    if seed ==42:
-                        os.system(
-                            f"ls -v {temp_dir}/denoised_{set_name}_{c_name}_{seed}_*.png | xargs cat | ffmpeg -y -framerate {fps} -f image2pipe -i - {temp_dir}/../{set_name}_{c_name}_{seed}.gif"
-                        )
-                        #scale=640:-1
-                        os.system(
-                            f"ls -v {temp_dir}/denoised_{set_name}_{c_name}_{seed}_*.png | xargs cat | ffmpeg -y -f image2pipe -vcodec png -i - -vf \"fps=10,scale=640:-1:flags=lanczos,split[s0][s1];[s0]palettegen=max_colors=128[p];[s1][p]paletteuse=dither=bayer:bayer_scale=3\" {temp_dir}/../{set_name}_{c_name}_{seed}_scaled.gif"
-                        )
-                    else:#just copy over
-                        os.system(
-                            f"cp {temp_dir}/denoised_{set_name}_{c_name}_{seed}_*.png {temp_dir}/../"
-                        )
+                if set_name == "train" and c_name == "nn_retrieval":
+                    continue
+                if c_name == "nn_retrieval" and seed != 42:
+                    continue
+                if seed ==42:
                     os.system(
-                        f"rm {temp_dir}/denoised_{set_name}_{c_name}_{seed}_*.png"
+                        f"ls -v {temp_dir}/denoised_{set_name}_{c_name}_{seed}_*.png | xargs cat | ffmpeg -y -framerate {fps} -f image2pipe -i - {temp_dir}/../{set_name}_{c_name}_{seed}.gif"
                     )
-        os.system(f"rm -r {temp_dir}")
+                    #scale=640:-1
+                    os.system(
+                        f"ls -v {temp_dir}/denoised_{set_name}_{c_name}_{seed}_*.png | xargs cat | ffmpeg -y -f image2pipe -vcodec png -i - -vf \"fps=10,scale=640:-1:flags=lanczos,split[s0][s1];[s0]palettegen=max_colors=128[p];[s1][p]paletteuse=dither=bayer:bayer_scale=3\" {temp_dir}/../{set_name}_{c_name}_{seed}_scaled.gif"
+                    )
+                else:#just copy over
+                    os.system(
+                        f"cp {temp_dir}/denoised_{set_name}_{c_name}_{seed}_*.png {temp_dir}/../"
+                    )
+                os.system(
+                    f"rm {temp_dir}/denoised_{set_name}_{c_name}_{seed}_*.png"
+                )
+    os.system(f"rm -r {temp_dir}")
