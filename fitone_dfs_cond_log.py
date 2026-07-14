@@ -2189,6 +2189,7 @@ if __name__ == "__main__":
     per_frame_csv = os.path.join(data_dir + "/..", "condition_eval_per_frame.csv")
     logger.log_text("total_parameters", f"{sum(p.numel() for p in model.parameters())}",0)
     logger.log_text("checkpoint_path", checkpoint_path, 0)
+    logger.log_text("norm_stats", json.dumps(norm_stats, indent=2, default=str), 0)
     
     param_groups = {}
     for name, param in model.named_parameters():
@@ -2376,24 +2377,27 @@ if __name__ == "__main__":
                                 f"{dir_name}/{set_name}_{c_name}_sd{sample_seed}.npz"
                             )
                             frame_meta_np = make_frame_meta_np(all_frame_ids, selected_idx)
-
-                            np.savez_compressed(
-                                npz_fname,
-                                pred=pred_all.detach().cpu().numpy(),
-                                gt=full_gt.detach().cpu().numpy(),
-                                selected_idx=frame_meta_np["selected_idx"],
-                                token=frame_meta_np["token"],
-                                scene_id=frame_meta_np["scene_id"],
-                                frame_index=frame_meta_np["frame_index"],
-                                sensor_side=frame_meta_np["sensor_side"],
-                                data_file=frame_meta_np["data_file"],
-                                condition_type=np.asarray(c_name, dtype="<U32"),
-                                set_name=np.asarray(set_name, dtype="<U16"),
-                                sample_seed=np.asarray(sample_seed, dtype=np.int64),
-                                step=np.asarray(step, dtype=np.int64),
-                                full_run_id=np.asarray(full_run_id, dtype="<U256"),
-                                exp_name=np.asarray(args.exp_name, dtype="<U128"),
-                            )
+                            try:
+                                np.savez_compressed(
+                                    npz_fname,
+                                    pred=pred_all.detach().cpu().numpy(),
+                                    gt=full_gt.detach().cpu().numpy(),
+                                    selected_idx=frame_meta_np["selected_idx"],
+                                    token=frame_meta_np["token"],
+                                    scene_id=frame_meta_np["scene_id"],
+                                    frame_index=frame_meta_np["frame_index"],
+                                    sensor_side=frame_meta_np["sensor_side"],
+                                    data_file=frame_meta_np["data_file"],
+                                    condition_type=np.asarray(c_name, dtype="<U32"),
+                                    set_name=np.asarray(set_name, dtype="<U16"),
+                                    sample_seed=np.asarray(sample_seed, dtype=np.int64),
+                                    step=np.asarray(step, dtype=np.int64),
+                                    full_run_id=np.asarray(full_run_id, dtype="<U256"),
+                                    exp_name=np.asarray(args.exp_name, dtype="<U128"),
+                                )
+                            except Exception as e:  
+                                print(f"Error saving npz file at step {step} for {set_name} with condition {c_name} and seed {sample_seed}: {e}")
+                                
                             # save_point_sample(
                             #     npz_fname,
                             #     pred_all.cpu(),

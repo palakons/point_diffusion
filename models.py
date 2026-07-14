@@ -801,6 +801,9 @@ def make_model( device, args):
     elif model_name == "SetTxDnsr":
         dim=args.set_tx_dim
         set_cond_type =args.set_cond_type
+        wan_shape =     (1,)
+        if  cond_mode != "none" and cond_method != 'scene_id':
+            wan_shape = (16,( args.wan_frames-1)//4 +1, 60, 104)
         model = FullSetTransformerDenoiser(
             in_channels=inout_dim,
             dim =dim,
@@ -809,7 +812,7 @@ def make_model( device, args):
             num_heads=8,
             dropout=0.,
             out_channels=inout_dim,
-            wan_shape=(16, 2, 60, 104) if cond_mode != "none" and cond_method != 'scene_id' else (1,),
+            wan_shape=wan_shape,
             cond_type=set_cond_type ,
             mlp_ratio=4,
             use_condition_pooling=args.use_condition_pooling,

@@ -357,23 +357,26 @@ def normalize_data(x, mean=None, max_half_range=None,save_filename_title=None):
     x_normalized = x_centered / max_half_range
 
     if save_filename_title is not None:
-        fname,title = save_filename_title
-        #plot log historgam of the original data and the normalized data for each dimension
-        import matplotlib.pyplot as plt
-        #2 col for before and after normalization, and D rows for each dimension
-        fig, axs = plt.subplots( x.shape[2], 2, figsize=(8, 4 * x.shape[2]))
-        if x.shape[2] == 1:
-            axs = axs[None, :]
-        for d in range(x.shape[2]):
-            n,bins,patch = axs[d, 0].hist(x[:,:,d].cpu().numpy().flatten(), bins=50, log=True, color="tab:blue", alpha=0.75)
-            axs[d, 0].set_title(f"Original data - dim {d}")
-            n,bins,patch = axs[d, 1].hist(x_normalized[:,:,d].cpu().numpy().flatten(), bins=50, log=True, color="tab:orange", alpha=0.75)
-            # print(f"Dimension {d}: n {n}, bins {bins}")
-            axs[d, 1].set_title(f"{title} - dim {d} {'train' if is_train else 'eval'}")
-        plt.suptitle(title)
-        plt.tight_layout()
-        plt.savefig(fname)
-        plt.close()
+        try:
+            fname,title = save_filename_title
+            #plot log historgam of the original data and the normalized data for each dimension
+            import matplotlib.pyplot as plt
+            #2 col for before and after normalization, and D rows for each dimension
+            fig, axs = plt.subplots( x.shape[2], 2, figsize=(8, 4 * x.shape[2]))
+            if x.shape[2] == 1:
+                axs = axs[None, :]
+            for d in range(x.shape[2]):
+                n,bins,patch = axs[d, 0].hist(x[:,:,d].cpu().numpy().flatten(), bins=50, log=True, color="tab:blue", alpha=0.75)
+                axs[d, 0].set_title(f"Original data - dim {d}")
+                n,bins,patch = axs[d, 1].hist(x_normalized[:,:,d].cpu().numpy().flatten(), bins=50, log=True, color="tab:orange", alpha=0.75)
+                # print(f"Dimension {d}: n {n}, bins {bins}")
+                axs[d, 1].set_title(f"{title} - dim {d} {'train' if is_train else 'eval'}")
+            plt.suptitle(title)
+            plt.tight_layout()
+            plt.savefig(fname)
+            plt.close()
+        except Exception as e:
+            print(f"Error while plotting histograms for normalization: {e}")
     return x_normalized, mean, max_half_range
 # def sample_batch(x, B):
 #     n = x.shape[0]

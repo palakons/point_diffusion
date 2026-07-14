@@ -277,22 +277,36 @@ if __name__ == "__main__":
 
     args = parse_args()
 
-
+    print(f"args done: {[k for k in vars(args)]}")
 
     system_key = "ddpm_cond_slow"
     wan_vae_checkpoint="/checkpoints/huggingface_hub/models--Wan-AI--Wan2.2-T2V-A14B/Wan2.1_VAE.pth"
     checkpoint_dir = f"/data/palakons/{system_key}/cache_unnorm/"
     os.makedirs(checkpoint_dir, exist_ok=True)  
 
+    print(f"Checkpoint directory: {checkpoint_dir}")
+
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     wan_spec = {"wan_frames": args.wan_frames, "wan_frame_mode": args.wan_frame_mode, "wan_frame_stride": args.wan_frame_stride, "wan_edge_policy": args.wan_edge_policy}
+    print(f"dev {device}")
+    print(f"wan spec {wan_spec}")
 
-    tc_mini = TruckScenes("v1.0-mini", "/data/palakons/new_dataset/MAN/mini/man-truckscenes", False) 
-    tc_full = TruckScenes("v1.0-trainval", "/data/palakons/new_dataset/MAN/man-truckscenes", False) 
+    if args.data_file == "man-mini":
+        print(f"loading tc mini")
+        tc_full = None
+        tc_mini = TruckScenes("v1.0-mini", "/data/palakons/new_dataset/MAN/mini/man-truckscenes", False) 
+    else:
+        print(f"loading tc full")
+        tc_mini =None
+        tc_full = TruckScenes("v1.0-trainval", "/data/palakons/new_dataset/MAN/man-truckscenes", False) 
     total_scenes = 10 if args.data_file == "man-mini" else 597
     
     csv_meta_fname = f"man_meta_data_{args.cond_method}_{args.N}_{args.cond_mode}_{args.wan_frames}_{args.wan_frame_mode}_{args.wan_frame_stride}_{args.wan_edge_policy}.csv"
     csv_meta_path = os.path.join(checkpoint_dir, csv_meta_fname)
+
+    print(f"totla sc {total_scenes}")
+    print(f"csv_meta_fname, {csv_meta_fname}")
     if not os.path.exists(csv_meta_path):
         with open(csv_meta_path, "w") as f:
             f.write("scene_id,data_file,sensor_side,is_normalized,total_points_original_mean,total_points_after_distance_filter_mean,total_points_visible_mean,total_points_original_std,total_points_after_distance_filter_std,total_points_visible_std,x0sbn3_mean_x,x0sbn3_mean_y,x0sbn3_mean_z,x0sbn3_max_half_range,doppler_mean,doppler_max_half_range,rcs_mean,rcs_max_half_range,wan_cond_max_abs\n")
@@ -312,8 +326,9 @@ if __name__ == "__main__":
         cache_path = os.path.join(checkpoint_dir, cache_fname)
         print(f"Processing scene {sc_id} with cache path: {cache_path}")
 
+
         if os.path.exists(cache_path):
-            # print(f"Cache file {cache_path} already exists. Loading from cache.")
+            print(f"Cache file {cache_path} already exists. Loading from cache.")
             loaded_data = pickle.load(open(cache_path, "rb"))
             mands, frame_ids_loaded = loaded_data
             print(f"shapes of loaded mands: {[m.shape if m is not None else None for m in mands]} len(frame_ids_loaded['token']): {len(frame_ids_loaded['token'])}") # should be [n_scene, num_points, 3]
@@ -328,7 +343,8 @@ if __name__ == "__main__":
             norm_record ={'scene_id': sc_id, 'data_file': args.data_file, 'sensor_side': args.sensor_side,"is_normalized": not args.output_unnormalized}
             print (f"Cache file {cache_path} does not exist. Creating new cache.")
 
-            try:    
+            # try:   
+            if True: 
                 mands_org = make_man_pc(
                     num_points=args.N,scene_ids= [sc_id],
                     n_scene=40,
@@ -343,10 +359,9 @@ if __name__ == "__main__":
                     trucksc= tc_mini if args.data_file == "man-mini" else tc_full   ,
                     wan_vae21_object = wan_vae21_object 
                 )
-            except Exception as e:
-                print(f"Error processing scene {sc_id} {args.data_file} {args.sensor_side}: {e}. Skipping this scene.")
-                exit()
-                continue
+            # except Exception as e:
+            #     print(f"Error processing scene {sc_id} {args.data_file} {args.sensor_side}: {e}. Skipping this scene.")
+            #     continue
 
 
             frame_ids = {'token':[mands_org[2][i]['frame_token'] for i in range(len(mands_org[0]))],"scene_id":[mands_org[2][i]['scene_id'] for i in range(len(mands_org[0]))],"frame_index":[mands_org[2][i]['frame_index'] for i in range(len(mands_org[0]))]} 

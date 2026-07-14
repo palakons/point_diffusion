@@ -319,13 +319,21 @@ class MANDataset(Dataset):
                 # assert loaded_data is not None, f"Failed to load data for scene {scene_id} frame {pbar.n} token {frame_token}"
                 if self.wan_vae and loaded_data is not None: #if wan, and cached, and the cahed wan tensor is [0], set loaded_data to None
                     preprocessed_file_path = os.path.join( self.wan_preprocess_dir, loaded_data["camera_file_name"].split("/")[-1].replace(".jpg", f"_{latent_id}.pt") ) 
+                    # print(f"path {preprocessed_file_path}")
                     if os.path.exists(preprocessed_file_path):
-                        loaded_wan = torch.load(preprocessed_file_path)
+                        try:
+                            loaded_wan = torch.load(preprocessed_file_path)
+
+                            if   torch.load(preprocessed_file_path).shape == torch.Size([1]) and torch.load(preprocessed_file_path)[0] == 0:
+                                print(f"Preprocessed VAE latent for scene {scene_id} frame {pbar.n} is a placeholder, skipping loading data for this frame.len data_bank {len(self.data_bank)}")
+                                print(f"type dtype shape device of cached preprocessed VAE latent for scene {scene_id} frame {pbar.n}: {type(loaded_wan)}, {loaded_wan.dtype}, {loaded_wan.shape}, {loaded_wan.device}")
+                                loaded_data = None
+                        except Exception as e:
+                            print(f"Error loading preprocessed VAE latent for scene {scene_id} frame {pbar.n}: {e}. Skipping this frame.")
+                            os.remove(preprocessed_file_path)  # Remove the corrupted file
+                            loaded_wan = None
+                        # loaded_wan = torch.load(preprocessed_file_path)
                         # print(f"type dtype shape device of cached preprocessed VAE latent for scene {scene_id} frame {pbar.n}: {type(loaded_wan)}, {loaded_wan.dtype}, {loaded_wan.shape}, {loaded_wan.device}")
-                        if   torch.load(preprocessed_file_path).shape == torch.Size([1]) and torch.load(preprocessed_file_path)[0] == 0:
-                            print(f"Preprocessed VAE latent for scene {scene_id} frame {pbar.n} is a placeholder, skipping loading data for this frame.len data_bank {len(self.data_bank)}")
-                            print(f"type dtype shape device of cached preprocessed VAE latent for scene {scene_id} frame {pbar.n}: {type(loaded_wan)}, {loaded_wan.dtype}, {loaded_wan.shape}, {loaded_wan.device}")
-                            loaded_data = None
 
                 if loaded_data is not None:
                     image_cache.append({
@@ -400,7 +408,7 @@ class MANDataset(Dataset):
             for item, latent in tqdm(zip(missing_image_cache, wan_latent), desc="Saving preprocessed VAE latents", total=len(missing_image_cache)):
                 preprocessed_file_path = os.path.join( self.wan_preprocess_dir, item["camera_file_name"].split("/")[-1].replace(".jpg", f"_{latent_id}.pt") ) 
                 torch.save(latent.cpu(), preprocessed_file_path)
-                print(f"saved preprocessed VAE latent for scene {item['scene_id']} frame {item['frame_index']} token {item['frame_token']} to {preprocessed_file_path}")
+                # print(f"saved preprocessed VAE latent for scene {item['scene_id']} frame {item['frame_index']} token {item['frame_token']} to {preprocessed_file_path}")
 
             for idx_db,item in tqdm(enumerate(image_cache), desc="Loading preprocessed VAE latents", total=len(image_cache)):
                 preprocessed_file_path = os.path.join( self.wan_preprocess_dir, item["camera_file_name"].split("/")[-1].replace(".jpg", f"_{latent_id}.pt") )  
@@ -712,7 +720,7 @@ class MANDataset(Dataset):
         print("wan_tiled_images shape:", wan_tiled_images.shape )
         with torch.no_grad():
             BATCH = 16
-            for i in tqdm(range(0, wan_tiled_images.shape[0], BATCH), desc="Encoding images with VAE"):
+            for i in tqdm(range(0, wan_tiled_images.shape[0], BATCH), desc=f"Encoding images batchsize {BATCH} with VAE"):
                 batch_imgs = wan_tiled_images[i : i + BATCH].to(self.device)
                 # print("batch_imgs shape:", batch_imgs.shape) #batch_imgs shape: torch.Size([2, 3, 5, 480, 832])
                 outputs = self.vae21.encode(batch_imgs)  
@@ -829,7 +837,8 @@ class MANDataset(Dataset):
         T_radar2cam_left_multiply = (
             T_ego2cam_inv @ T_global2ego_c_inv @ T_ego2global_r @ T_radar2ego
         )
-
+        # print(f"T_radar2cam_left_multiply shape ")
+        # print(T_radar2cam_left_multiply)
         R = T_radar2cam_left_multiply[:3, :3].unsqueeze(0)  # (1, 3, 3)
         T = (T_radar2cam_left_multiply[3, :3].T).unsqueeze(0)  # (1, 3)
 
@@ -1595,7 +1604,7 @@ class MANDataset(Dataset):
             & (points_uvz[:, 0] < 1980)
             & (points_uvz[:, 2] > 0)  # Ensure points are in front of the camera
         )
-        print(f"# points {radar_data_all.shape[0]} -(user-defined ROI)-> {radar_data_all_filter.shape[0]} -(visible in camera view)-> {points_uvz[mask].shape[0]}")
+        # print(f"# points {radar_data_all.shape[0]} -(user-defined ROI)-> {radar_data_all_filter.shape[0]} -(visible in camera view)-> {points_uvz[mask].shape[0]}")
         time_12 = time.time()
         filtered_radar_data = radar_data_all_filter[mask]
 
