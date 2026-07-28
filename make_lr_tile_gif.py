@@ -70,9 +70,20 @@ VIEWS = [
 
 BASE_DIR = Path(
     "/data/palakons/ddpm_cond_slow/"
-    "xattn-B256_dim768_samplemse-lr1e-4-constant-500k-smooth-infer/"
+    # "xattn-B256_dim768_samplemse-lr1e-4-constant-500k-smooth-infer/"
+    "default_exp_name/"
     "inference"
 )
+
+# accept "expname" via command line argument, e.g.:
+#   python make_lr_tile_gif.py xattn-B256_dim768_samplemse  
+args = os.sys.argv[1:]
+if args:
+    BASE_DIR = Path(
+        "/data/palakons/ddpm_cond_slow/"
+        f"{args[0]}/"
+        "inference"
+    )
 
 x_value = 4
 
@@ -120,18 +131,19 @@ def image_path(data_file: str, side: str, scene_id: int, frame_id: int) -> Path:
     return BASE_DIR / f"combo_{token}_{side}_sc-{scene_id}_fr-{frame_id}.png"
 
 
-def all_candidate_paths():
-    for frame_id in FRAME_IDS:
-        for data_file, scene_id in VIEWS:
+def all_candidate_paths(views=VIEWS,frame_ids = FRAME_IDS):
+    for frame_id in frame_ids:
+        for data_file, scene_id in views:
             for side in SIDES:
                 yield image_path(data_file, side, scene_id, frame_id)
 
 
-def infer_tile_size():
-    for p in all_candidate_paths():
+def infer_tile_size(views=VIEWS):
+    for p in all_candidate_paths(views=views):
         if p.exists():
             with Image.open(p) as im:
                 return im.size
+        print(f"not found: {p}")
 
     raise RuntimeError(
         "No existing image files found. Cannot infer tile size. "
@@ -295,24 +307,44 @@ def crop_top_left(input_gif_path, output_gif_path, out_dir, crop_factor=4):
     subprocess.run(cmd_gif, check=True)
     print(f"Successfully cropped top-left 1/{crop_factor} to: {output_gif_path}")
 
+def get_views(csv_path):
+    #get uniqie file-scene pairs from BASE_DIR/sampled_cds.csv
+    '''data_file,sensor_side,scene_id,frame_index,token,xyz_cd
+    man-mini,left,5,4,6e169e7d226d47ba88c32424fc414937,0.014977823942899704
+    man-mini,left,5,5,e4081856fd5349b5a7b89b944a5b543f,0.01413094624876976'''
+    df = pd.read_csv(csv_path)
+    df = df.drop_duplicates(subset=['data_file', 'scene_id'])
+    df = df[['data_file', 'scene_id']]
+    return list(df.itertuples(index=False, name=None))
+
+
 
 def main():
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
+    csv_file_path = os.path.join(BASE_DIR, "sampled_stat_correct_cond_sd42.csv")
+    assert os.path.exists(csv_file_path), f"CSV file not found: {csv_file_path}"
+
+    views_from_file = get_views(csv_file_path)
+    print(f"Using {len(views_from_file)} unique views from sampled_cds.csv")
+    print(f"Views: {views_from_file}")
+    frame_ids_from_file = sorted(set(pd.read_csv(csv_file_path)['frame_index']))
+
     if TILE_SIZE is None:
-        tile_w, tile_h = infer_tile_size()
+        tile_w, tile_h = infer_tile_size( views=views_from_file)
     else:
         tile_w, tile_h = TILE_SIZE
 
     print(f"tile size: {tile_w}x{tile_h}")
     print(f"grid: {GRID_W}x{GRID_H}")
-    print(f"frames: {min(FRAME_IDS)}..{max(FRAME_IDS)}")
+    print(f"frames: {min(frame_ids_from_file)}..{max(frame_ids_from_file)}")
 
     font = load_font()
 
     if True:
-        for frame_id in FRAME_IDS:
-            draw_one_frame(frame_id, tile_w, tile_h, font)
+        for frame_id in frame_ids_from_file:
+            draw_one_frame(frame_id, tile_w, tile_h, font,views = views_from_file)
+
 
         make_gif_with_ffmpeg()
 
@@ -320,10 +352,13 @@ def main():
 
     if True:
         # plot best/worst
-        sampled_batch_cd_fname = f"sampled_cds.csv"
-        sampled_batch_cd_path = os.path.join(BASE_DIR, sampled_batch_cd_fname)
+        sampled_batch_cd_path = csv_file_path
 
         per_frame_cds_df = pd.read_csv(sampled_batch_cd_path)
+
+        # filter only "condition_use" of "correct_cond"
+        per_frame_cds_df = per_frame_cds_df[(per_frame_cds_df['condition_use'] == 'correct_cond')]
+
 
         #aggegrate by scene_id and data_file, take mean of xyz_cd
         per_scene_cds_df = per_frame_cds_df.groupby(['data_file', 'scene_id']).agg({'xyz_cd': 'mean'}).reset_index()
@@ -341,7 +376,7 @@ def main():
             interleaved_views.append(b)
             interleaved_views.append(w)
         
-        for frame_id in FRAME_IDS:
+        for frame_id in frame_ids_from_file:
             draw_one_frame(frame_id, tile_w, tile_h, font, views=interleaved_views, grid_h=4, grid_w=4, label_h=LABEL_H, scene_grid_w=2, scene_grid_h=4,fname_prefix="tile_lr_fr_best_worst")
         
         make_gif_with_ffmpeg(fname_prefix="tile_lr_fr_best_worst", gif_output_path=BASE_DIR / f"tile_lr_fr_best_worst_hd_{x_value}x.gif")

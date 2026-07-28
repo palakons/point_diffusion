@@ -266,6 +266,13 @@ def parse_args():
         action="store_true",
         help="If set, output unnormalized point clouds instead of normalized ones.",
     )
+    parser.add_argument(
+        "--coord_frame",
+        type=str,
+        default="camera",
+        choices=["radar", "camera"],
+        help="Coordinate frame used as the diffusion target.",
+    )
 
     args = parser.parse_args()
 
@@ -281,7 +288,10 @@ if __name__ == "__main__":
 
     system_key = "ddpm_cond_slow"
     wan_vae_checkpoint="/checkpoints/huggingface_hub/models--Wan-AI--Wan2.2-T2V-A14B/Wan2.1_VAE.pth"
-    checkpoint_dir = f"/data/palakons/{system_key}/cache_unnorm/"
+    checkpoint_dir = (
+        f"/data/palakons/{system_key}/"
+        f"cache_{args.coord_frame}xyz_{'unnorm' if args.output_unnormalized else 'normed'}/"
+    )
     os.makedirs(checkpoint_dir, exist_ok=True)  
 
     print(f"Checkpoint directory: {checkpoint_dir}")
@@ -309,7 +319,7 @@ if __name__ == "__main__":
     print(f"csv_meta_fname, {csv_meta_fname}")
     if not os.path.exists(csv_meta_path):
         with open(csv_meta_path, "w") as f:
-            f.write("scene_id,data_file,sensor_side,is_normalized,total_points_original_mean,total_points_after_distance_filter_mean,total_points_visible_mean,total_points_original_std,total_points_after_distance_filter_std,total_points_visible_std,x0sbn3_mean_x,x0sbn3_mean_y,x0sbn3_mean_z,x0sbn3_max_half_range,doppler_mean,doppler_max_half_range,rcs_mean,rcs_max_half_range,wan_cond_max_abs\n")
+            f.write("scene_id,data_file,sensor_side,coord_frame,is_normalized,total_points_original_mean,total_points_after_distance_filter_mean,total_points_visible_mean,total_points_original_std,total_points_after_distance_filter_std,total_points_visible_std,xyz_mean_x,xyz_mean_y,xyz_mean_z,xyz_max_half_range,doppler_mean,doppler_max_half_range,rcs_mean,rcs_max_half_range,wan_cond_max_abs\n")
 
     print(f"Loading VAE from checkpoint: {wan_vae_checkpoint}")
 
@@ -322,7 +332,7 @@ if __name__ == "__main__":
     for sc_id in trange(args.from_scene_id,min(args.from_scene_id + args.num_scenes, total_scenes), desc="Processing scenes", total=min(args.num_scenes, total_scenes - args.from_scene_id)):
 
          
-        cache_fname = f"man_{args.data_file}_{sc_id}{f'_right' if args.sensor_side =='right' else ''}_{args.cond_method}_{args.N}_{args.cond_mode}_{args.wan_frames}_{args.wan_frame_mode}_{args.wan_frame_stride}_{args.wan_edge_policy}{'_unnorm' if args.output_unnormalized else ''}.pkl"
+        cache_fname = f"man_{args.data_file}_{sc_id}{f'_right' if args.sensor_side =='right' else ''}{'_cameraxyz' if args.coord_frame == 'camera' else ''}_{args.cond_method}_{args.N}_{args.cond_mode}_{args.wan_frames}_{args.wan_frame_mode}_{args.wan_frame_stride}_{args.wan_edge_policy}{'_unnorm' if args.output_unnormalized else ''}.pkl"
         cache_path = os.path.join(checkpoint_dir, cache_fname)
         print(f"Processing scene {sc_id} with cache path: {cache_path}")
 
@@ -340,7 +350,7 @@ if __name__ == "__main__":
             if all_32:
                 print(f"All frame tokens have length 32.: Good!")
         else:
-            norm_record ={'scene_id': sc_id, 'data_file': args.data_file, 'sensor_side': args.sensor_side,"is_normalized": not args.output_unnormalized}
+            norm_record ={'scene_id': sc_id, 'data_file': args.data_file, 'sensor_side': args.sensor_side, 'coord_frame': args.coord_frame, "is_normalized": not args.output_unnormalized}
             print (f"Cache file {cache_path} does not exist. Creating new cache.")
 
             # try:   
@@ -357,7 +367,8 @@ if __name__ == "__main__":
                     radar_channel = "RADAR_LEFT_FRONT" if args.sensor_side == "left" else "RADAR_RIGHT_FRONT",
                     camera_channel = "CAMERA_LEFT_FRONT" if args.sensor_side == "left" else "CAMERA_RIGHT_FRONT",
                     trucksc= tc_mini if args.data_file == "man-mini" else tc_full   ,
-                    wan_vae21_object = wan_vae21_object 
+                    wan_vae21_object = wan_vae21_object ,
+                    coord_frame=args.coord_frame,
                 )
             # except Exception as e:
             #     print(f"Error processing scene {sc_id} {args.data_file} {args.sensor_side}: {e}. Skipping this scene.")
@@ -365,7 +376,20 @@ if __name__ == "__main__":
 
 
             frame_ids = {'token':[mands_org[2][i]['frame_token'] for i in range(len(mands_org[0]))],"scene_id":[mands_org[2][i]['scene_id'] for i in range(len(mands_org[0]))],"frame_index":[mands_org[2][i]['frame_index'] for i in range(len(mands_org[0]))]} 
-            mands = [mands_org[0], mands_org[1], torch.norm(mands_org[3], p=2, dim=-1, keepdim=True), mands_org[4]] #x0sbn3, wan_cond, doppler, rcs
+            mands = [mands_org[0], mands_org[1], torch.norm(mands_org[3], p=2, dim=-1, keepdim=True), mands_org[4]] #xyz, wan_cond, doppler, rcs
+            
+            for i in range(len(mands)):
+                data_i = mands[i]
+                print(
+                    f" --- {args.coord_frame} {i} "
+                    f"shape={tuple(data_i.shape)} "
+                        # f"mean={data_i.mean(dim=(0, 1))} "
+                        # f"min={data_i.amin(dim=(0, 1))} "
+                        # f"max={data_i.amax(dim=(0, 1))}"
+                )
+            if args.coord_frame == "camera":
+                assert (mands[0][..., 2] > 0).all(), f"All Z values in camera frame should be positive, but found some non-positive values."
+
             total_scenes_num = mands[0].shape[0]
             print(f"sizes of train_ds: {mands[0].shape}") # should be [n_scene, num_points, 3]
 
@@ -406,21 +430,23 @@ if __name__ == "__main__":
                 elif args.cond_method == 'scene_id': #actually frame_id
                     mands[1] = ((torch.arange(0, total_scenes_num, device='cpu').float() / total_scenes_num)*2-1).unsqueeze(1)  # [n_scene], normalized to [-1,1]
                         
-            for i, name in enumerate(["x0sbn3", "wan_cond", "doppler","rcs"]): #assume no None
+            for i, name in enumerate(["xyz", "wan_cond", "doppler","rcs"]): #assume no None
                 # print(f"{name} {i}  shape: {mands[i].shape}, dtype: {mands[i].dtype}, device: {mands[i].device}") 
                 mands[i] = mands[i].cpu()
                 # print(f"{name} {i}  shape: {mands[i].shape}, dtype: {mands[i].dtype}, device: {mands[i].device}")  #must be on cpu for the following preprocessing steps to save GPU memory??
                 assert mands[i].device == torch.device('cpu'), f"{name}  {i} is not on CPU, but on {mands[i].device}. Please move it to CPU before proceeding."
 
-            for data_name,idx in zip(["x0sbn3","doppler","rcs"], [0,2,3]):
+            for data_name,idx in zip(["xyz","doppler","rcs"], [0,2,3]):
                 mean, max_half_range = None, None
+
+                print(f"shape of {data_name} before normalization: {mands[idx].shape}, dtype: {mands[idx].dtype}, device: {mands[idx].device}")
                     
                 updated_data, mean_, max_half_range_ = normalize_data(mands[idx], save_filename_title=(f"/home/palakons/point_diffusion/output/sample/{args.data_file}_{sc_id}_{data_name}_data_normalization.png", f"{args.data_file} sc{sc_id} {data_name} data normalization,"))
                 
                 if mands[idx].shape[0]>0:
                     mean_ = mean_.view(-1) 
                     max_half_range_ = max_half_range_.view(-1)
-                    if data_name == "x0sbn3": 
+                    if data_name == "xyz": 
                         norm_record[f"{data_name}_mean_x"] = mean_[0].item()
                         norm_record[f"{data_name}_mean_y"] = mean_[1].item()
                         norm_record[f"{data_name}_mean_z"] = mean_[2].item()
@@ -428,7 +454,7 @@ if __name__ == "__main__":
                         norm_record[f"{data_name}_mean"] = mean_.item()
                     norm_record[f"{data_name}_max_half_range"] = max_half_range_.item()
                 else:
-                    if data_name == "x0sbn3": 
+                    if data_name == "xyz": 
                         norm_record[f"{data_name}_mean_x"] = 0
                         norm_record[f"{data_name}_mean_y"] =0
                         norm_record[f"{data_name}_mean_z"] = 0
@@ -441,12 +467,12 @@ if __name__ == "__main__":
 
             with open(cache_path, "wb") as f:            
                 pickle.dump([ mands,frame_ids], f)
-            for i, name in enumerate(["x0sbn3", "wan_cond", "doppler","rcs"]): #assume no None
+            for i, name in enumerate(["xyz", "wan_cond", "doppler","rcs"]): #assume no None
                 print(f"{name} {i}  shape: {mands[i].shape}, dtype: {mands[i].dtype}, device: {mands[i].device}")
             for key in frame_ids:
                 print(f"frame_ids[{key}] length: {len(frame_ids[key])}")
 
             with open(csv_meta_path, "a") as f:
-                f.write(f"{norm_record['scene_id']},{norm_record['data_file']},{norm_record['sensor_side']},{norm_record['is_normalized']},{norm_record['total_points_original_mean']},{norm_record['total_points_after_distance_filter']},{norm_record['total_points_visible']},{norm_record['total_points_original_std']},{norm_record['total_points_after_distance_filter_std']},{norm_record['total_points_visible_std']},{norm_record['x0sbn3_mean_x']},{norm_record['x0sbn3_mean_y']},{norm_record['x0sbn3_mean_z']},{norm_record['x0sbn3_max_half_range']},{norm_record['doppler_mean']},{norm_record['doppler_max_half_range']},{norm_record['rcs_mean']},{norm_record['rcs_max_half_range']},{norm_record.get('wan_cond_max_abs', 'N/A')}\n")
+                f.write(f"{norm_record['scene_id']},{norm_record['data_file']},{norm_record['sensor_side']},{norm_record['coord_frame']},{norm_record['is_normalized']},{norm_record['total_points_original_mean']},{norm_record['total_points_after_distance_filter']},{norm_record['total_points_visible']},{norm_record['total_points_original_std']},{norm_record['total_points_after_distance_filter_std']},{norm_record['total_points_visible_std']},{norm_record['xyz_mean_x']},{norm_record['xyz_mean_y']},{norm_record['xyz_mean_z']},{norm_record['xyz_max_half_range']},{norm_record['doppler_mean']},{norm_record['doppler_max_half_range']},{norm_record['rcs_mean']},{norm_record['rcs_max_half_range']},{norm_record.get('wan_cond_max_abs', 'N/A')}\n")
 
         print(f"Saved frame IDs to {cache_path}")

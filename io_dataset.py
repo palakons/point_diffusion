@@ -28,7 +28,7 @@ def save_point_sample(path, pred, gt=None, condition=None, meta=None):
     np.savez_compressed(path, **data)
 
 def make_man_pc(
-    num_points=64, n_scene=1, device="cpu", is_dense=False, data_file="man-mini",wan_spec={"wan_frames":5, "wan_frame_mode":"repeat", "wan_frame_stride":1,"wan_edge_policy":"skip"},get_wan_cond=True,scene_ids=[],radar_channel = "RADAR_LEFT_FRONT",camera_channel = "CAMERA_LEFT_FRONT",trucksc = None,wan_vae21_object = None
+    num_points=64, n_scene=1, device="cpu", is_dense=False, data_file="man-mini",wan_spec={"wan_frames":5, "wan_frame_mode":"repeat", "wan_frame_stride":1,"wan_edge_policy":"skip"},get_wan_cond=True,scene_ids=[],radar_channel = "RADAR_LEFT_FRONT",camera_channel = "CAMERA_LEFT_FRONT",trucksc = None,wan_vae21_object = None,coord_frame="radar",
 ):
     # B 128 128 pt 9.482Gi/15.992Gi
     import sys
@@ -90,10 +90,12 @@ def make_man_pc(
         # npoints_filtereds: min 58, max 221, mean 136.66
         # exit()
         x0sbn3 = torch.stack(
-            [ds[i]["filtered_radar_data"] for i in range(n_scene)], dim=0
+            [ds[i]["filtered_radar_data" if coord_frame == "radar" else "camera_xyz"] for i in range(n_scene)], dim=0
         ).to(
             device
         )  # [B, N, 3]
+        # print(f"shapes x0sbn3: {x0sbn3.shape}") #shapes x0sbn3: torch.Size([40, 128, 7])
+        
         wan_cond = None
         if get_wan_cond and wan_spec is not None:
             wan_cond = torch.stack(
@@ -128,7 +130,11 @@ def make_man_pc(
             for i in range(n_scene)
         ]
         combined_ds = torch.utils.data.ConcatDataset(ds)
-        x0sbn3 = torch.stack([data[0]["filtered_radar_data"] for data in ds], dim=0).to(
+        
+
+        x0sbn3 = torch.stack(
+            [ds[i]["filtered_radar_data" if coord_frame == "radar" else "camera_xyz"] for i in range(n_scene)], dim=0
+        ).to(
             device
         )  # [B, N, 3]
         wan_cond = None
@@ -353,7 +359,13 @@ def normalize_data(x, mean=None, max_half_range=None,save_filename_title=None):
         mean = x.mean(dim=[0, 1], keepdim=True)  # [1, 1, D]
     x_centered = x - mean
     if max_half_range is None:
-        max_half_range = x_centered.abs().max()  # [B, 1, 1]
+        try:
+            max_half_range = x_centered.abs().max()  # [B, 1, 1]
+        except Exception as e:
+            print(f"Error computing max_half_range: {e}. Returning the input tensor and None for mean and max_half_range.")
+            print(f"shape of x_centered: {x_centered.shape}, dtype: {x_centered.dtype}, device: {x_centered.device}")
+            print(f"shape of x: {x.shape}, dtype: {x.dtype}, device: {x.device} ")
+            
     x_normalized = x_centered / max_half_range
 
     if save_filename_title is not None:

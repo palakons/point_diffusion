@@ -3,6 +3,7 @@ import pypcd4
 import os
 import torch
 import numpy as np
+from pathlib import Path
 from torch.utils.data import Dataset
 from matplotlib import pyplot as plt
 from scipy.spatial.transform import Rotation as R
@@ -18,7 +19,7 @@ from tqdm import tqdm, trange
 import random
 import textwrap
 
-import time
+import time,pickle
 import sys
 import torchvision.transforms.functional as TF
 from torch.nn import functional as F
@@ -33,7 +34,7 @@ sys.path.insert(0, "/home/palakons/Wan2.2")
 class SimplePerspectiveCamera:
     """Simple perspective camera replacement for PyTorch3D PerspectiveCameras"""
 
-    def __init__(self, focal_length, principal_point, R, T, image_size):
+    def __init__(self, focal_length, principal_point, R, T, image_size,dtype):
         """
         focal_length: (1, 2) tensor [fx, fy]
         principal_point: (1, 2) tensor [cx, cy]
@@ -52,7 +53,7 @@ class SimplePerspectiveCamera:
         # Build intrinsic matrix K
         self.K = torch.tensor(
             [[self.fx, 0, self.cx], [0, self.fy, self.cy], [0, 0, 1]],
-            dtype=torch.float32,
+            dtype=dtype,
         )
 
     def transform_points(self, points_in_radar_view):
@@ -65,6 +66,10 @@ class SimplePerspectiveCamera:
         # Convert to homogeneous coordinates
         N = points_in_radar_view.shape[0]
 
+        assert self.R.dtype == points_in_radar_view.dtype, f"R dtype {self.R.dtype} does not match points dtype {points_in_radar_view.dtype}"
+        assert self.T.dtype == points_in_radar_view.dtype, f"T dtype {self.T.dtype} does not match points dtype {points_in_radar_view.dtype}"
+        assert self.K.dtype == points_in_radar_view.dtype, f"K dtype {self.K.dtype} does not match points dtype {points_in_radar_view.dtype}"
+
         # Transform to camera coordinates: p_cam = R * p_world + T
         camera_points = (self.R @ points_in_radar_view.T).T + self.T  # (N, 3)
 
@@ -74,6 +79,12 @@ class SimplePerspectiveCamera:
 
         # Normalize by depth (z-coordinate)
         depth = image_coords_homo[:, 2:3]  # (N, 1)
+
+        # depth2 = camera_points[:, 2:3]
+        # print(f"all close {torch.allclose(depth, depth2)}") #true
+
+
+
         uvz = torch.cat(
             [
                 image_coords_homo[:, 0:1] / depth,  # u
@@ -210,7 +221,10 @@ class MANDataset(Dataset):
         normalize_type="std",  # "std" or "minmax", if "std", return mean, std, if "minmax", return mean(min,max), range
         x_range=None, y_range=None, z_range=None,
         wan_preprocess_dir=None,
-        trucksc = None, wan_vae21_object = None
+        trucksc = None, wan_vae21_object = None,
+        debug_projection: bool = False,
+        debug_projection_pkl: str = "/home/palakons/point_diffusion/output/deep_mands_projection.pkl",
+        debug_projection_verbose: bool = False,
     ):  # load all frames from scene_id, of data_file, particular radar and camera channel
         self.device = device
         self.data_file = data_file
@@ -249,6 +263,9 @@ class MANDataset(Dataset):
         self.z_range = z_range
         self.wan_preprocess_dir = os.path.join(wan_preprocess_dir,self.data_file) if wan_preprocess_dir is not None else None
         self.wan_spec = wan_spec
+        self.debug_projection = debug_projection
+        self.debug_projection_pkl = debug_projection_pkl
+        self.debug_projection_verbose = debug_projection_verbose
         print("wan process dir:", self.wan_preprocess_dir)
         
 
@@ -622,6 +639,7 @@ class MANDataset(Dataset):
                         ),
                         save_di=self.viz_dir,
                     )
+    
     def process_camera_front_to_wan(self, image_cache):
         if len(image_cache) == 0:
             print("No images to process for WAN VAE.")
@@ -751,6 +769,22 @@ class MANDataset(Dataset):
         T_inv = torch.eye(4)
         T_inv[:3, :3] = R_inv
         T_inv[:3, 3] = t_inv
+
+        assert torch.allclose(self.inverse_SE3_new(T), T_inv), "inverse_SE3_new and inverse_SE3 do not match"
+        return T_inv
+
+    def inverse_SE3_new(self, T: torch.Tensor) -> torch.Tensor:
+
+        Rm = T[:3, :3]
+
+        t = T[:3, 3]
+
+        T_inv = torch.eye(4, dtype=T.dtype, device=T.device)
+
+        T_inv[:3, :3] = Rm.T
+
+        T_inv[:3, 3] = -Rm.T @ t
+
         return T_inv
 
     def quat2mat(self, q):  # q in (w, x, y, z)
@@ -775,6 +809,14 @@ class MANDataset(Dataset):
         T = torch.eye(4)
         T[:3, :3] = R
         T[:3, 3] = t
+        assert torch.allclose(T, self.to_homogeneous_new(R, t)), "to_homogeneous_new and to_homogeneous do not match"
+        return T
+    def to_homogeneous_new(self, R: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """Convert rotation and translation to a 4x4 homogeneous transform."""
+        t = t.to(dtype=R.dtype, device=R.device)
+        T = torch.eye(4, dtype=R.dtype, device=R.device)
+        T[:3, :3] = R
+        T[:3, 3] = t
         return T
 
     def calib_to_camera_base_MAN_no_crop(
@@ -785,77 +827,241 @@ class MANDataset(Dataset):
         radar_pose,
         image_size_hw,
         step=4,
+        input_points=None,
+        dtype = torch.float64
     ):
         """
-        image_size_hw: tuple, (height, width), origninal image size
+        Build radar-sensor -> camera-sensor transform following the SDK order exactly.
+
+        SDK order:
+        1. radar sensor -> radar ego:      p = R_radar_calib p + t_radar_calib
+        2. radar ego -> global:            p = R_radar_pose  p + t_radar_pose
+        3. global -> camera ego:           p = R_cam_pose.T  (p - t_cam_pose)
+        4. camera ego -> camera sensor:    p = R_cam_calib.T (p - t_cam_calib)
+
+        Args:
+            input_points:
+                Optional radar-frame points to record intermediate transforms.
+                Accepts either:
+                    [N, 3] xyz
+                    [N, >=3] xyz + attributes
+                Only xyz is transformed; attributes are not modified.
+
+        Returns:
+            cam_obj:
+                SimplePerspectiveCamera, same as before.
+            debug_points:
+                None if input_points is None.
+                Otherwise dict with SDK-like intermediate stages.
         """
 
-        # === Build individual transforms as 4x4 homogeneous matrices ===
-        T_radar2ego = (
-            self.to_homogeneous(
-                self.quat2mat(radar_calib["rotation"]),
-                torch.tensor(radar_calib["translation"]),
+
+        R_radar_calib = self.quat2mat(radar_calib["rotation"]).to(dtype)
+        t_radar_calib = torch.tensor(radar_calib["translation"], dtype=dtype)
+
+        R_radar_pose = self.quat2mat(radar_pose["rotation"]).to(dtype)
+        t_radar_pose = torch.tensor(radar_pose["translation"], dtype=dtype)
+
+        R_cam_pose = self.quat2mat(cam_pose["rotation"]).to(dtype)
+        t_cam_pose = torch.tensor(cam_pose["translation"], dtype=dtype)
+
+        R_cam_calib = self.quat2mat(cam_calib["rotation"]).to(dtype)
+        t_cam_calib = torch.tensor(cam_calib["translation"], dtype=dtype)
+
+        # Compose affine transform p_cam = R_total @ p_radar + t_total.
+        # This is the algebraic equivalent of the SDK's sequential operations.
+        R_total = R_cam_calib.T @ R_cam_pose.T @ R_radar_pose @ R_radar_calib
+
+        t_total = (
+            R_cam_calib.T
+            @ (
+                R_cam_pose.T
+                @ (
+                    R_radar_pose @ t_radar_calib
+                    + t_radar_pose
+                    - t_cam_pose
+                )
+                - t_cam_calib
             )
-            if step >= 1
-            else torch.eye(4)
-        )
-        T_ego2global_r = (
-            self.to_homogeneous(
-                self.quat2mat(radar_pose["rotation"]),
-                torch.tensor(radar_pose["translation"]),
-            )
-            if step >= 2
-            else torch.eye(4)
-        )
-        T_global2ego_c = (
-            self.to_homogeneous(
-                self.quat2mat(cam_pose["rotation"]),
-                torch.tensor(cam_pose["translation"]),
-            )
-            if step >= 3
-            else torch.eye(4)
-        )
-        T_ego2cam = (
-            self.to_homogeneous(
-                self.quat2mat(cam_calib["rotation"]),
-                torch.tensor(cam_calib["translation"]),
-            )
-            if step >= 4
-            else torch.eye(4)
         )
 
-        # === Compose full radar → camera transform === but some conventions like Pytorch3D uses right matrix multiplication in computation procedure
+        K = torch.tensor(cam_calib["camera_intrinsic"], dtype=dtype)
 
-        # T_radar2cam = T_radar2ego.sT @ T_ego2global_r.T @ torch.linalg.inv(T_global2ego_c).T @ torch.linalg.inv(T_ego2cam).T
+        focal_length = torch.tensor([[K[0, 0], K[1, 1]]], dtype=dtype)
+        principal_point = torch.tensor([[K[0, 2], K[1, 2]]], dtype=dtype)
 
-        T_global2ego_c_inv = self.inverse_SE3(T_global2ego_c)
-        T_ego2cam_inv = self.inverse_SE3(T_ego2cam)
-
-        T_radar2cam = (
-            T_radar2ego.T @ T_ego2global_r.T @ T_global2ego_c_inv.T @ T_ego2cam_inv.T
-        )
-        T_radar2cam_left_multiply = (
-            T_ego2cam_inv @ T_global2ego_c_inv @ T_ego2global_r @ T_radar2ego
-        )
-        # print(f"T_radar2cam_left_multiply shape ")
-        # print(T_radar2cam_left_multiply)
-        R = T_radar2cam_left_multiply[:3, :3].unsqueeze(0)  # (1, 3, 3)
-        T = (T_radar2cam_left_multiply[3, :3].T).unsqueeze(0)  # (1, 3)
-
-        K = torch.tensor(cam_calib["camera_intrinsic"])
-
-        # Extract focal length and principal point from K
-        focal_length = torch.tensor([[K[0, 0], K[1, 1]]])
-        principal_point = torch.tensor([[K[0, 2], K[1, 2]]])
-
-        # Create a PerspectiveCameras object
-        return SimplePerspectiveCamera(
+        cam_obj = SimplePerspectiveCamera(
             focal_length=focal_length,
             principal_point=principal_point,
-            R=R,
-            T=T,
-            image_size=[image_size_hw],
+            R=R_total.unsqueeze(0),
+            T=t_total.unsqueeze(0),
+            image_size=[image_size_hw],dtype=dtype
         )
+
+        debug_points = None
+
+        if input_points is not None:
+            pts = input_points
+            if not torch.is_tensor(pts):
+                pts = torch.tensor(pts)
+
+            pts = pts.detach().clone().to(dtype=dtype)
+
+            if pts.ndim != 2 or pts.shape[1] < 3:
+                raise ValueError(
+                    f"input_points must have shape [N, 3] or [N, >=3], got {pts.shape}"
+                )
+
+            xyz_raw = pts[:, :3]
+
+            # SDK pc.points convention is [C, N], so record as [3, N].
+            debug_points = {}
+
+            debug_points["raw"] = xyz_raw.T.detach().cpu().numpy()
+
+            # 1. radar sensor -> radar ego
+            xyz_ego = (R_radar_calib @ xyz_raw.T).T + t_radar_calib
+            debug_points["ego"] = xyz_ego.T.detach().cpu().numpy()
+
+
+            # 2. radar ego -> global
+            xyz_global = (R_radar_pose @ xyz_ego.T).T + t_radar_pose
+            debug_points["global"] = xyz_global.T.detach().cpu().numpy()
+
+            # 3. global -> camera ego
+            xyz_ego_cam = (R_cam_pose.T @ (xyz_global - t_cam_pose).T).T
+            debug_points["ego_cam"] = xyz_ego_cam.T.detach().cpu().numpy()
+
+            # 4. camera ego -> camera sensor
+            xyz_cam = (R_cam_calib.T @ (xyz_ego_cam - t_cam_calib).T).T
+            debug_points["cam"] = xyz_cam.T.detach().cpu().numpy()
+
+            # Projection: your true uvz = [u, v, camera_z].
+            uvw = (K @ xyz_cam.T).T
+            uv = uvw[:, :2] / uvw[:, 2:3]
+            depth = xyz_cam[:, 2:3]
+            uvz = torch.cat([uv, depth], dim=1)
+
+            debug_points["uvd"] = uvz.T.detach().cpu().numpy()
+
+            # SDK view_points(..., normalize=True) gives [u, v, 1], not [u, v, depth].
+            uv1 = uvz.clone()
+            uv1[:, 2] = 1.0
+            debug_points["uvz"] = uv1.T.detach().cpu().numpy()
+
+            debug_points["depths"] = depth.squeeze(1).detach().cpu().numpy()
+
+            # SDK-style mask.
+            H, W = image_size_hw
+            min_dist = 1.0
+            mask = (
+                (depth.squeeze(1) > min_dist)
+                & (uv[:, 0] > 1)
+                & (uv[:, 0] < W - 1)
+                & (uv[:, 1] > 1)
+                & (uv[:, 1] < H - 1)
+            )
+            
+
+            debug_points["mask"] = mask.detach().cpu().numpy()
+            debug_points["uvd_masked"] = uvz[mask].T.detach().cpu().numpy()
+
+            uv1_masked = uv1[mask]
+            debug_points["uvz_masked"] = uv1_masked.T.detach().cpu().numpy()
+            debug_points["cam_xyz_masked"] = xyz_cam[mask].T.detach().cpu().numpy()
+            debug_points["depths_masked"] = depth.squeeze(1)[mask].detach().cpu().numpy()
+
+            # Preserve original attributes for alignment checks, but do not transform them.
+            if pts.shape[1] > 3:
+                debug_points["raw_attr"] = pts[:, 3:].T.detach().cpu().numpy()
+                debug_points["raw_all"] = pts.T.detach().cpu().numpy()
+
+        return cam_obj, debug_points
+    
+    # def calib_to_camera_base_MAN_no_crop_old(
+    #     self,
+    #     cam_calib,
+    #     cam_pose,
+    #     radar_calib,
+    #     radar_pose,
+    #     image_size_hw,
+    #     step=4,
+    # ):
+    #     """
+    #     image_size_hw: tuple, (height, width), origninal image size
+    #     """
+
+    #     # === Build individual transforms as 4x4 homogeneous matrices ===
+    #     T_radar2ego = (
+    #         self.to_homogeneous(
+    #             self.quat2mat(radar_calib["rotation"]),
+    #             torch.tensor(radar_calib["translation"]),
+    #         )
+    #         if step >= 1
+    #         else torch.eye(4)
+    #     )
+    #     T_ego2global_r = (
+    #         self.to_homogeneous(
+    #             self.quat2mat(radar_pose["rotation"]),
+    #             torch.tensor(radar_pose["translation"]),
+    #         )
+    #         if step >= 2
+    #         else torch.eye(4)
+    #     )
+    #     T_global2ego_c = (
+    #         self.to_homogeneous(
+    #             self.quat2mat(cam_pose["rotation"]),
+    #             torch.tensor(cam_pose["translation"]),
+    #         )
+    #         if step >= 3
+    #         else torch.eye(4)
+    #     )
+    #     T_ego2cam = (
+    #         self.to_homogeneous(
+    #             self.quat2mat(cam_calib["rotation"]),
+    #             torch.tensor(cam_calib["translation"]),
+    #         )
+    #         if step >= 4
+    #         else torch.eye(4)
+    #     )
+
+    #     # === Compose full radar → camera transform === but some conventions like Pytorch3D uses right matrix multiplication in computation procedure
+
+    #     # T_radar2cam = T_radar2ego.sT @ T_ego2global_r.T @ torch.linalg.inv(T_global2ego_c).T @ torch.linalg.inv(T_ego2cam).T
+
+    #     T_global2ego_c_inv = self.inverse_SE3(T_global2ego_c)
+    #     T_ego2cam_inv = self.inverse_SE3(T_ego2cam)
+
+    #     T_radar2cam = (
+    #         T_radar2ego.T @ T_ego2global_r.T @ T_global2ego_c_inv.T @ T_ego2cam_inv.T
+    #     )
+    #     T_radar2cam_left_multiply = (
+    #         T_ego2cam_inv @ T_global2ego_c_inv @ T_ego2global_r @ T_radar2ego
+    #     )
+        
+    #     R = T_radar2cam_left_multiply[:3, :3].unsqueeze(0)  # (1, 3, 3)
+    #     # [[[ 0.4472, -0.8942,  0.0185],
+    #     #  [ 0.0297, -0.0058, -0.9995],
+    #     #  [ 0.8939,  0.4475,  0.0240]]]
+    #     T = (T_radar2cam_left_multiply[3, :3].T).unsqueeze(0)  # (1, 3) #[[0., 0., 0.]], WRONG
+    #     # T = T_radar2cam_left_multiply[:3, 3].unsqueeze(0) #[[-0.0597,  0.0975,  0.8445]]
+
+    #     # print(f"T_radar2cam_left_multiply shape {T_radar2cam_left_multiply.shape},T {T}, R {R}")
+
+    #     K = torch.tensor(cam_calib["camera_intrinsic"])
+
+    #     # Extract focal length and principal point from K
+    #     focal_length = torch.tensor([[K[0, 0], K[1, 1]]])
+    #     principal_point = torch.tensor([[K[0, 2], K[1, 2]]])
+
+    #     # Create a PerspectiveCameras object
+    #     return SimplePerspectiveCamera(
+    #         focal_length=focal_length,
+    #         principal_point=principal_point,
+    #         R=R,
+    #         T=T,
+    #         image_size=[image_size_hw],
+    #     )
 
     def inferDA3_depth_image(
         self, image_paths, output_paths, batch_size=4
@@ -1247,6 +1453,8 @@ class MANDataset(Dataset):
         cam = trucksc.get("sample_data", frame["data"][self.camera_channel])
         radar = trucksc.get("sample_data", frame["data"][self.radar_channel])
 
+        points_dict = {} if self.debug_projection_pkl is not None else None
+
         # -1) get annotated Bouding Box of this nuScene-like frame
         if get_bb:
             cam_token = cam["token"]
@@ -1380,6 +1588,17 @@ class MANDataset(Dataset):
         radar_data_all = torch.tensor(points, dtype=torch.float32)
         npoints_original = radar_data.shape[0]
 
+        if points_dict is not None:
+            points_dict["frame_token"] = frame_token
+            points_dict["camera_token"] = cam["token"]
+            points_dict["pointsensor_token"] = radar["token"]
+            points_dict["camera_file_name"] = cam["filename"]
+            points_dict["radar_file_name"] = radar["filename"]
+
+            # SDK stores pc.points as [C, N]. Your tensor is [N, 7].
+            points_dict["raw"] = radar_data_all.T.detach().cpu().numpy()
+            points_dict["raw_xyz_N3"] = radar_data_all[:, :3].detach().cpu().numpy()
+
         # 3) load calibration
 
         # print calibration
@@ -1390,13 +1609,20 @@ class MANDataset(Dataset):
         cam_pose = trucksc.get("ego_pose", cam["ego_pose_token"])
         radar_pose = trucksc.get("ego_pose", radar["ego_pose_token"])
         time_6 = time.time()
-        cam_calib_obj = self.calib_to_camera_base_MAN_no_crop(
+        cam_calib_obj,_ = self.calib_to_camera_base_MAN_no_crop(
             cam_calib,
             cam_pose,
             radar_calib,
             radar_pose,
-            self.original_image_size,
+            self.original_image_size, dtype=torch.float64
         )
+
+        if points_dict is not None:
+            points_dict["K"] = cam_calib_obj.K.detach().cpu().numpy()
+            points_dict["R_radar_to_cam"] = cam_calib_obj.R.detach().cpu().numpy()
+            points_dict["T_radar_to_cam"] = cam_calib_obj.T.detach().cpu().numpy()
+            points_dict["camera_intrinsic"] = np.array(cam_calib["camera_intrinsic"])
+            points_dict["image_size_hw"] = np.array(self.original_image_size)
 
         # 4) load camera
         time_7 = time.time()
@@ -1510,11 +1736,43 @@ class MANDataset(Dataset):
                 ]
         # print(f"shapes {radar_data_all_filter_distance.shape} {rcs.shape} {doppler.shape}")
         n_points_after_distance_filter = radar_data_all_filter.shape[0]
+        if points_dict is not None:
+            points_dict["after_xyz_range_filter"] = radar_data_all_filter.T.detach().cpu().numpy()
+            points_dict["after_xyz_range_filter_xyz_N3"] = radar_data_all_filter[:, :3].detach().cpu().numpy()
 
         image_coord, camera_view_points = cam_calib_obj.transform_points(
-            radar_data_all_filter[:,:3]# x y z
+            radar_data_all_filter[:,:3].to(torch.float64)
+            
         )
         points_uvz = image_coord[:, :3]  # N x3
+
+        if points_dict is not None:
+
+            _,debug_points = self.calib_to_camera_base_MAN_no_crop(
+                        cam_calib,
+                        cam_pose,
+                        radar_calib,
+                        radar_pose,
+                        self.original_image_size,input_points=radar_data_all_filter[:,:3]
+                    )
+
+            points_dict.update(debug_points)
+
+            # Your camera-frame xyz, equivalent to SDK pc.points[:3, :] after camera transform.
+            points_dict["cam_xyz"] = camera_view_points.T.detach().cpu().numpy()
+
+            # Your true [u, v, depth]. Shape [3, N] for easier SDK comparison.
+            # points_dict["uvz"] = points_uvz.T.detach().cpu().numpy()
+
+            # SDK-style projected homogeneous image coordinates after normalize=True.
+            # In SDK this third row is not depth; it is usually 1.
+            uv1 = points_uvz.clone()
+            uv1[:, 2] = 1.0
+            # points_dict["uv1_sdk_style"] = uv1.T.detach().cpu().numpy()
+
+            # Real depth used for filtering/coloring.
+            points_dict["depths"] = camera_view_points[:, 2].detach().cpu().numpy()
+        
         time_11 = time.time()
 
         if self.wan_vae and False: #original
@@ -1595,18 +1853,52 @@ class MANDataset(Dataset):
         time_115 = time.time()
         # 5) filter points
         # print("camera_front.shape", camera_front.shape) #[3, 943, 1980])
+        if False:
+            mask = (
+                (points_uvz[:, 1] >= 0)
+                # & (points_uvz[:, 1] < camera_front.shape[1])
+                & (points_uvz[:, 1] < 943)
+                & (points_uvz[:, 0] >= 0)
+                # & (points_uvz[:, 0] < camera_front.shape[2])
+                & (points_uvz[:, 0] < 1980)
+                & (points_uvz[:, 2] > 1)  # Ensure points are in front of the camera
+            )
+
+        H, W = self.original_image_size
+        assert H == 943 and W == 1980, "Expected original image size to be (943, 1980)"
+        min_dist = 1.0
+
         mask = (
-            (points_uvz[:, 1] >= 0)
-            # & (points_uvz[:, 1] < camera_front.shape[1])
-            & (points_uvz[:, 1] < 943)
-            & (points_uvz[:, 0] >= 0)
-            # & (points_uvz[:, 0] < camera_front.shape[2])
-            & (points_uvz[:, 0] < 1980)
-            & (points_uvz[:, 2] > 0)  # Ensure points are in front of the camera
+            (points_uvz[:, 2] >= min_dist)
+            & (points_uvz[:, 0] > 1)
+            & (points_uvz[:, 0] < W - 1)
+            & (points_uvz[:, 1] > 1)
+            & (points_uvz[:, 1] < H - 1)
         )
+        # print(f"MANDataSet Filtering points: {mask.sum().item()} out of {points_uvz.shape[0]} points are within the camera view and in front of the camera.")
+        if points_dict is not None:
+            points_dict["mask"] = mask.detach().cpu().numpy()
+            # points_dict["uvz_masked"] = points_uvz[mask].T.detach().cpu().numpy()
+
+            points_dict["uvz_mands"] = points_uvz.T.detach().cpu().numpy()
+            uv1_masked = points_uvz[mask].clone()
+            points_dict["uvz_masked_mands"] = uv1_masked.T.detach().cpu().numpy().copy()
+            uv1_masked[:, 2] = 1.0
+
+            points_dict["uv1_masked_mands"] = uv1_masked.T.detach().cpu().numpy()
+
+            points_dict["cam_xyz_masked"] = camera_view_points[mask].T.detach().cpu().numpy()
+            points_dict["depths_masked"] = camera_view_points[mask, 2].detach().cpu().numpy()
         # print(f"# points {radar_data_all.shape[0]} -(user-defined ROI)-> {radar_data_all_filter.shape[0]} -(visible in camera view)-> {points_uvz[mask].shape[0]}")
         time_12 = time.time()
-        filtered_radar_data = radar_data_all_filter[mask]
+        filtered_radar_data = radar_data_all_filter[mask]        
+        camera_xyz = camera_view_points[mask]
+        # attach rcs and doppler from filtred_radar_data to camera_xyz
+        filtered_rcs = filtered_radar_data[:, 6:7]
+        filtered_doppler = filtered_radar_data[:, 3:6]
+        camera_xyz = torch.cat([camera_xyz, filtered_rcs, filtered_doppler], dim=1)
+
+        # print(f"Filtered radar data shape: {filtered_radar_data.shape}, Camera XYZ shape: {camera_xyz.shape}, Camera view points shape: {camera_view_points.shape}")#Filtered radar data shape: torch.Size([108, 7]), Camera XYZ shape: torch.Size([108, 7]), Camera view points shape: torch.Size([114, 3])     
 
         npoints_filtered = filtered_radar_data.shape[0]
 
@@ -1617,6 +1909,8 @@ class MANDataset(Dataset):
         # print(f"frame_token: {frame_token}, npoints_original: {npoints_original}, npoints_filtered: {npoints_filtered}")
         # print("filtered_radar_data", filtered_radar_data.shape)  # (N, 3) or (N, 7)
 
+        if points_dict is not None:
+            points_dict["filtered_radar_data_before_np"] = filtered_radar_data.T.detach().cpu().numpy()
         # if random.random() < 0.01:
         time_13 = time.time()
         if False:
@@ -1654,6 +1948,7 @@ class MANDataset(Dataset):
         # 6) keep or padding radar points to fixed number, self.n_p
         output_filtered_radar_data = filtered_radar_data
         output_uvz = points_uvz[mask]
+        output_camera_xyz = camera_xyz
         if output_uvz.shape[0] >0:
             if self.n_p == 0:
                 pass
@@ -1663,13 +1958,25 @@ class MANDataset(Dataset):
                 indices = torch.randint(0, output_uvz.shape[0], (self.n_p,))
                 output_uvz = output_uvz[indices]
                 output_filtered_radar_data = output_filtered_radar_data[indices]
+                output_camera_xyz = output_camera_xyz[indices]
             elif output_uvz.shape[0] > self.n_p:  # randomly pick self.n_p points
                 indices = torch.randperm(output_uvz.shape[0])[: self.n_p]
                 output_uvz = output_uvz[indices]
                 output_filtered_radar_data = output_filtered_radar_data[indices]
+                output_camera_xyz = output_camera_xyz[indices]
         else:
             # if no points,  output empty tensor with shape (self.n_p, 3) or (self.n_p, 7) depending
             output_filtered_radar_data = output_filtered_radar_data[[]]
+            output_camera_xyz = output_camera_xyz[[]]
+
+        if points_dict is not None:
+            points_dict["output_uvz"] = output_uvz.T.detach().cpu().numpy()
+            points_dict["output_filtered_radar_data"] = output_filtered_radar_data.T.detach().cpu().numpy()
+            points_dict["npoints_original"] = int(npoints_original)
+            points_dict["npoints_after_distance_filter"] = int(n_points_after_distance_filter)
+            points_dict["npoints_filtered"] = int(npoints_filtered)
+            points_dict["npoints_output"] = int(output_uvz.shape[0])
+
         time_15 = time.time()
         # calculate percentage of time spent in each step
         time_diff = {
@@ -1691,14 +1998,23 @@ class MANDataset(Dataset):
         #     print(f"{k}: {v/total_time*100:.2f}%")
         
         output = {
-            "filtered_radar_data": output_filtered_radar_data,
-            "uvz": output_uvz,
+            "filtered_radar_data": output_filtered_radar_data.float(),  # radar-frame XYZ/attrs
+            "camera_xyz": output_camera_xyz.float(),                    # camera-frame XYZ [m]
+            "uvz": output_uvz.float(),                                  # projected [u,v,z]
             "frame_token": frame_token,
             "npoints_original": npoints_original,
             "npoints_after_distance_filter": n_points_after_distance_filter,
             "npoints_filtered": npoints_filtered,
             "camera_file_name": cam["filename"],
         }
+
+        assert (
+            len(output_filtered_radar_data)
+            == len(output_camera_xyz)
+            == len(output_uvz)
+        ), f"Length mismatch: {len(output_filtered_radar_data)}, {len(output_camera_xyz)}, {len(output_uvz)}"
+        assert torch.allclose(  output_camera_xyz[:, 2],    output_uvz[:, 2],), f"Depth mismatch: {output['camera_xyz'][:, 2]} vs {output['uvz'][:, 2]}"
+
         # if self.wan_vae:
         #     output["wan_vae_latent"] = wan_vae_latent  # add wan vae latent
         if self.get_clip:
@@ -1707,6 +2023,28 @@ class MANDataset(Dataset):
             output["camera_front"] = camera_front  # add camera image
         if self.get_depth:
             output["depth_image"] = depth_image  # add depth image
+
+        if points_dict is not None:
+            import pickle
+
+            debug_payload = {
+                "image": camera_front.detach().cpu().numpy() if self.get_camera else None,
+                "points": points_dict,
+            }
+
+            os.makedirs(os.path.dirname(self.debug_projection_pkl), exist_ok=True)
+            with open(self.debug_projection_pkl, "wb") as f:
+                pickle.dump(debug_payload, f)
+
+            if self.debug_projection_verbose:
+                print(f"[DEBUG] Saved MAN projection data to {self.debug_projection_pkl}")
+                print("[DEBUG] keys:", sorted(points_dict.keys()))
+                print("[DEBUG] raw:", points_dict["raw"].shape)
+                print("[DEBUG] cam_xyz:", points_dict["cam_xyz"].shape)
+                print("[DEBUG] uvz:", points_dict["uvz"].shape)
+                print("[DEBUG] uvz_masked:", points_dict["uvz_masked"].shape)
+                print("[DEBUG] output_uvz:", points_dict["output_uvz"].shape)
+                
         return output
 
     def __len__(self):

@@ -484,7 +484,7 @@ def make_run_id(args):
 
     norm_str = f"" if args.norm_per_scene else "_trainnorm"
         
-    out_id =  f"{args.model_name}{model_spec}_it{args.ddpm_iteration}_{args.shape_name}{shape_spec}_train_sc{args.n_scene}_N{args.N}_B{args.B}_T{args.T}-{args.T_infer}_{args.prediction_type}-{args.sampler}{scale_eps2x0_str}_{args.cond_mode}{cond_spec}{wan_id}_weight{dop_rcs_loss_weight}_lmse{args.lambda_mse:1.3f}_lcd{args.lambda_cd:1.3f}{cd_spec}_sd{args.seed}_lr{args.lr:.1e}{lr_sche_str}{clip_str}{norm_str}"
+    out_id =  f"{args.model_name}{model_spec}_it{args.ddpm_iteration:09d}_{args.shape_name}{shape_spec}_train_sc{args.n_scene}_N{args.N}_B{args.B}_T{args.T}-{args.T_infer}_{args.prediction_type}-{args.sampler}{scale_eps2x0_str}_{args.cond_mode}{cond_spec}{wan_id}_weight{dop_rcs_loss_weight}_lmse{args.lambda_mse:1.3f}_lcd{args.lambda_cd:1.3f}{cd_spec}_sd{args.seed}_lr{args.lr:.1e}{lr_sche_str}{clip_str}{norm_str}"
 
     
 
@@ -1076,16 +1076,19 @@ def gather_man_ds(args, checkpoint_dir):
                     frame_ids_all["frame_index"].extend(frame_ids["frame_index"])
                     frame_ids_all["sensor_side"].extend([sensor_side] * len(frame_ids["token"]))
                     frame_ids_all["data_file"].extend([data_file] * len(frame_ids["token"]))
-                    if  x0sbn3_file.shape[0] < 36: #just to check, <36 = less perfect for the common case
+                    if  x0sbn3_file.shape[0] < 40-args.wan_frames+1: #just to check, <36 = less perfect for the common case
                         print(f"{x0sbn3_file.shape[0]} samples loaded for {sc_id}-{sensor_side}-{data_file}")
-
+    print(f"Loaded {len(x0sbn3_all)} data files, total samples: {sum(x.shape[0] for x in x0sbn3_all)}, now concatenating")
     x0sbn3_all = torch.cat(x0sbn3_all, dim=0)
+    print(f"Concatenated x0sbn3_all shape: {x0sbn3_all.shape}, now concatenating cond_all")
     if args.cond_method == "none":
         cond_all = None
     else:
         cond_all = torch.cat(cond_all, dim=0) if cond_all[0] is not None else None
+    print(f"Concatenated cond_all shape: {cond_all.shape if cond_all is not None else None}, now concatenating doppler_all, rcs_all")
 
     doppler_all = torch.cat(doppler_all, dim=0) if doppler_all[0] is not None else None
+    print(f"Concatenated doppler_all shape: {doppler_all.shape if doppler_all is not None else None}, now concatenating rcs_all")   
     rcs_all = torch.cat(rcs_all, dim=0) if rcs_all[0] is not None else None
 
     assert x0sbn3_all.shape[0] == len(frame_ids_all["token"]) == len(frame_ids_all["scene_id"]) == len(frame_ids_all["frame_index"]), f"Mismatch in number of samples and frame IDs: {x0sbn3_all.shape[0]} vs {len(frame_ids_all['token'])}"
