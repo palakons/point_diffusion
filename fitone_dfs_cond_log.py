@@ -460,6 +460,9 @@ def make_run_id(args):
             shape_spec += f"_held_e{args.n_eval_scene_keys}-{eval_tag}_t{args.n_test_scene_keys}-{test_tag}"
         
         shape_spec += f"_minpts{args.min_frames_per_side}"
+    
+    if args.coord_frame =="camera":
+        shape_spec += "_camframe"
        
 
     cd_spec = f"_cdmd{args.cd_mode}" if args.lambda_cd > 0 else ""
@@ -852,6 +855,13 @@ def parse_args():
         help="If set, normalize WAN condition per scene instead of globally.",
     )
 
+    parser.add_argument(
+        "--coord_frame",
+        type=str,
+        default="radar",
+        choices=["radar", "camera"],
+        help="Coordinate frame used as the diffusion target.",
+    )
     args = parser.parse_args()
 
     return args
@@ -1028,7 +1038,7 @@ def gather_man_ds(args, checkpoint_dir):
             for sensor_side in sensor_sides:
                 side_str = "" if sensor_side == "left" else f"_{sensor_side}"
                 # cache_fname = f"man_{data_file}_{sc_id}{side_str}_{cond_method}_{args.N}_{cond_string}.pkl"
-                cache_fname = f"man_{data_file}_{sc_id}{side_str}_{cond_method}_{args.N}_{cond_string}_unnorm.pkl"
+                cache_fname = f"man_{data_file}_{sc_id}{side_str}{'_cameraxyz' if args.coord_frame == 'camera' else ''}_{cond_method}_{args.N}_{cond_string}_unnorm.pkl"
                 cache_path = os.path.join(checkpoint_dir, cache_fname)
                 if not os.path.exists(cache_path):
                     if data_file not in missing_files:
@@ -1050,7 +1060,7 @@ def gather_man_ds(args, checkpoint_dir):
             for sensor_side in sensor_sides:
                 side_str = "" if sensor_side == "left" else f"_{sensor_side}"
                 # cache_fname = f"man_{data_file}_{sc_id}{side_str}_{cond_method}_{args.N}_{cond_string}.pkl"
-                cache_fname = f"man_{data_file}_{sc_id}{side_str}_{cond_method}_{args.N}_{cond_string}_unnorm.pkl"
+                cache_fname = f"man_{data_file}_{sc_id}{side_str}{'_cameraxyz' if args.coord_frame == 'camera' else ''}_{cond_method}_{args.N}_{cond_string}_unnorm.pkl"
                 cache_path = os.path.join(checkpoint_dir, cache_fname)
                 assert  os.path.exists(cache_path), f"Cache file {cache_fname} not found, need to run python /palakons/point_diffusion/preprocess_man.py --cond_method wan --wan_frames 5 --wan_frame_mode center --wan_frame_stride 1 --wan_edge_policy skip --N 128  --data_file man-mini --num_scenes 100 --from_scene_id 0"
                 with open(cache_path, "rb") as f:   
@@ -1833,7 +1843,7 @@ if __name__ == "__main__":
     samples_dir = f"{data_dir}/samples"
     checkpoint_dir = f"/data/palakons/{system_key}/checkpoints/"
     # cache_dir = f"/data/palakons/{system_key}/cache/"
-    cache_dir = f"/data/palakons/{system_key}/cache_unnorm/"
+    cache_dir = f"/data/palakons/{system_key}/cache{'_cameraxyz' if args.coord_frame == 'camera' else ''}_unnorm/"
     checkpoint_path = os.path.join(checkpoint_dir, f"latest_{run_id}.pt")
     exists = {'tb_dir': os.path.exists(tb_dir), 'data_dir': os.path.exists(data_dir),"checkpoint_file": os.path.exists(checkpoint_path)}
     print(f"Directories and checkpoint existence: {exists}")
@@ -1877,19 +1887,20 @@ if __name__ == "__main__":
             cond_method = "wan"
             cond_string = f"pdnorm_only_5_center_1_skip"
             
-        data_key = f"{args.data_file}_side{args.sensor_side}_{cond_method}_{args.N}_{cond_string}"
+        data_key = f"{args.data_file}_side{args.sensor_side}{'_cameraframe' if args.coord_frame == 'camera' else ''}_{cond_method}_{args.N}_{cond_string}"
+
         print(f"data_key: {data_key}")
-        gather_cahce_dir = os.path.join(cache_dir, data_key )
-        os.makedirs(gather_cahce_dir, exist_ok=True)
+        gather_cache_dir = os.path.join(cache_dir, data_key )
+        os.makedirs(gather_cache_dir, exist_ok=True)
 
         whole_ds_cache_fname= {k: f"man_{k}.npy" for k in ["x0sbn5_all", "cond_all"]}
         whole_ds_cache_fname.update({"frame_ids_all": f"man_frame_ids_all.json"})
 
-        if not all(os.path.exists(os.path.join(gather_cahce_dir, fname)) for fname in whole_ds_cache_fname.values()): #prepare for lazy loading through NPY's MemMap
+        if not all(os.path.exists(os.path.join(gather_cache_dir, fname)) for fname in whole_ds_cache_fname.values()): #prepare for lazy loading through NPY's MemMap
             print(f"some cache files are missing, gathering MAN dataset from individual scene cache files. This may take a while...")
             #which fiel not exist, print them
             for k, v in whole_ds_cache_fname.items():
-                if not os.path.exists(os.path.join(gather_cahce_dir, v)):
+                if not os.path.exists(os.path.join(gather_cache_dir, v)):
                     print(f"Missing cache file: {v}")
             x0sbn3_all, cond_all, doppler_all, rcs_all,frame_ids_all = gather_man_ds(args, cache_dir)
             x0sbn5_all= torch.cat([x0sbn3_all, doppler_all, rcs_all], dim=-1) 
@@ -1902,12 +1913,12 @@ if __name__ == "__main__":
             #save eachof the tensors to a separate npy, to ahve memMap in the future
             for k, v in whole_ds_cache_fname.items():
                 if k  in["frame_ids_all"]:
-                    with open(os.path.join(gather_cahce_dir, v), "w") as f:
+                    with open(os.path.join(gather_cache_dir, v), "w") as f:
                         json.dump(eval(k), f)
-                        print(f"saved {k} to {os.path.join(gather_cahce_dir, v)}")
+                        print(f"saved {k} to {os.path.join(gather_cache_dir, v)}")
                 else:
-                    np.save(os.path.join(gather_cahce_dir, v), eval(k).detach().cpu().numpy(),allow_pickle=False)
-                    print(f"saved {k} to {os.path.join(gather_cahce_dir, v)}")
+                    np.save(os.path.join(gather_cache_dir, v), eval(k).detach().cpu().numpy(),allow_pickle=False)
+                    print(f"saved {k} to {os.path.join(gather_cache_dir, v)}")
             del x0sbn3_all,  doppler_all, rcs_all
 
             import gc
@@ -1928,10 +1939,10 @@ if __name__ == "__main__":
 
             time_recorder = TimeRecorder(insert_order=True, cuda_sync=True)
             if args.lazy_npy:
-                x0sbn5_all, cond_all= [ LazyNpyArray(os.path.join(gather_cahce_dir, whole_ds_cache_fname[k])) for k in ["x0sbn5_all", "cond_all"]]
+                x0sbn5_all, cond_all= [ LazyNpyArray(os.path.join(gather_cache_dir, whole_ds_cache_fname[k])) for k in ["x0sbn5_all", "cond_all"]]
             else:#load all to RAM
-                x0sbn5_all, cond_all = [torch.as_tensor(np.load(os.path.join(gather_cahce_dir, whole_ds_cache_fname[k]), allow_pickle=False)) for k in ["x0sbn5_all", "cond_all"]]
-            with open(os.path.join(gather_cahce_dir, whole_ds_cache_fname["frame_ids_all"]), "r") as f:
+                x0sbn5_all, cond_all = [torch.as_tensor(np.load(os.path.join(gather_cache_dir, whole_ds_cache_fname[k]), allow_pickle=False)) for k in ["x0sbn5_all", "cond_all"]]
+            with open(os.path.join(gather_cache_dir, whole_ds_cache_fname["frame_ids_all"]), "r") as f:
                 frame_ids_all = json.load(f)         
 
 

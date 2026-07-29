@@ -440,6 +440,13 @@ def parse_args():
         action="store_true",
         help="If set, normalize WAN condition per scene instead of globally.",
     )
+    parser.add_argument(
+        "--coord_frame",
+        type=str,
+        default="radar",
+        choices=["radar", "camera"],
+        help="Coordinate frame used as the diffusion target.",
+    )
 
 
     args = parser.parse_args()
@@ -497,15 +504,15 @@ def plot_combo(image_rgb_path,pred,gt,save_path,title):
     axs[0].imshow(img)
     axs[0].set_title(title)
     axs[0].axis('off')
-    #plot gt/pred top view  , y is horizontal, x is vertical
-    axs[1].scatter(gt[:,1], gt[:,0], c='blue', s=1, label='GT')
+    #plot gt/pred top view  , z is horizontal, x is vertical
+    axs[1].scatter(gt[:,0], gt[:,2], c='blue', s=1, label='GT')
     # x_range=[0, 50],
 
     # y_range=[-50, 50],
-    axs[1].scatter(pred[:,1], pred[:,0], c='red', s=1, label='Pred')
+    axs[1].scatter(pred[:,0], pred[:,2], c='red', s=1, label='Pred')
     axs[1].set_title(f"Top View: GT (blue) vs Pred (red)")
-    axs[1].set_xlabel("Y (m)")
-    axs[1].set_ylabel("X (m)")
+    axs[1].set_xlabel("X (m)")
+    axs[1].set_ylabel("Z (m)")
     #set equal aspect ratio
     # axs[1].set_aspect('equal', adjustable='box')
 
@@ -537,7 +544,8 @@ if __name__ == "__main__":
     samples_dir = f"{data_dir}/samples"
     inference_dir = f"{data_dir}/inference"
     checkpoint_dir = f"/data/palakons/{system_key}/checkpoints/"
-    cache_dir = f"/data/palakons/{system_key}/cache_unnorm/"
+    # cache_dir = f"/data/palakons/{system_key}/cache/"
+    cache_dir = f"/data/palakons/{system_key}/cache{'_cameraxyz' if args.coord_frame == 'camera' else ''}_unnorm/"
     checkpoint_path = os.path.join(checkpoint_dir, f"latest_{run_id}.pt")
     exists = {'tb_dir': os.path.exists(tb_dir), 'data_dir': os.path.exists(data_dir),"checkpoint_file": os.path.exists(checkpoint_path)}
     print(f"Directories and checkpoint existence: {exists}")
@@ -636,28 +644,28 @@ if __name__ == "__main__":
             cond_method = "wan"
             cond_string = f"pdnorm_only_5_center_1_skip"
             
-        data_key = f"{args.data_file}_side{args.sensor_side}_{cond_method}_{args.N}_{cond_string}"
+        data_key = f"{args.data_file}_side{args.sensor_side}{'_cameraframe' if args.coord_frame == 'camera' else ''}_{cond_method}_{args.N}_{cond_string}"
         print(f"data_key: {data_key}")
-        gather_cahce_dir = os.path.join(cache_dir, data_key )
-        os.makedirs(gather_cahce_dir, exist_ok=True)
+        gather_cache_dir = os.path.join(cache_dir, data_key )
+        os.makedirs(gather_cache_dir, exist_ok=True)
 
         whole_ds_cache_fname= {k: f"man_{k}.npy" for k in ["x0sbn5_all", "cond_all"]}
         whole_ds_cache_fname.update({"frame_ids_all": f"man_frame_ids_all.json"})
 
 
-        if not all(os.path.exists(os.path.join(gather_cahce_dir, fname)) for fname in whole_ds_cache_fname.values()): #prepare for lazy loading through NPY's MemMap
+        if not all(os.path.exists(os.path.join(gather_cache_dir, fname)) for fname in whole_ds_cache_fname.values()): #prepare for lazy loading through NPY's MemMap
             print(f"some cache files are missing, gathering MAN dataset from individual scene cache files. This may take a while...")
-            raise ValueError(f"Some cache files are missing in {gather_cahce_dir}. Please run the data gathering script to prepare the dataset before training.")
+            raise ValueError(f"Some cache files are missing in {gather_cache_dir}. Please run the data gathering script to prepare the dataset before training.")
         else:
             
             print(f"Loading MAN dataset from cache: {whole_ds_cache_fname}")
 
             time_recorder = TimeRecorder(insert_order=True, cuda_sync=True)
             if args.lazy_npy:
-                x0sbn5_all, cond_all= [ LazyNpyArray(os.path.join(gather_cahce_dir, whole_ds_cache_fname[k])) for k in ["x0sbn5_all", "cond_all"]]
+                x0sbn5_all, cond_all= [ LazyNpyArray(os.path.join(gather_cache_dir, whole_ds_cache_fname[k])) for k in ["x0sbn5_all", "cond_all"]]
             else:#load all to RAM
-                x0sbn5_all, cond_all = [torch.as_tensor(np.load(os.path.join(gather_cahce_dir, whole_ds_cache_fname[k]), allow_pickle=False)) for k in ["x0sbn5_all", "cond_all"]]
-            with open(os.path.join(gather_cahce_dir, whole_ds_cache_fname["frame_ids_all"]), "r") as f:
+                x0sbn5_all, cond_all = [torch.as_tensor(np.load(os.path.join(gather_cache_dir, whole_ds_cache_fname[k]), allow_pickle=False)) for k in ["x0sbn5_all", "cond_all"]]
+            with open(os.path.join(gather_cache_dir, whole_ds_cache_fname["frame_ids_all"]), "r") as f:
                 frame_ids_all = json.load(f)         
 
 
@@ -969,9 +977,8 @@ if __name__ == "__main__":
                         save_path = os.path.join(inference_dir, save_fname)
                         title=f"RGB Image: {data_file}, {sensor_side}, scene {scene_id}, frame {frame_index}"
 
-                        plot_combo(image_rgb_path,pred,gt,save_path,title)
-                        # plot_combo(image_rgb_path,pred_unnormed,gt_unnormed,save_path,title)
-                        exit()
+                        # plot_combo(image_rgb_path,pred,gt,save_path,title)
+                        plot_combo(image_rgb_path,pred_unnormed,gt_unnormed,save_path,title)
                         
 
                 pointset_error_stat = calculate_pointset_stat(pred_unnormed.unsqueeze(0), gt_unnormed.unsqueeze(0))
