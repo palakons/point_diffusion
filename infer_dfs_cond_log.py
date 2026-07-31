@@ -504,11 +504,11 @@ def plot_combo(image_rgb_path,pred,gt,save_path,title):
     axs[0].imshow(img)
     axs[0].set_title(title)
     axs[0].axis('off')
-    #plot gt/pred top view  , z is horizontal, x is vertical
+    #plot gt/pred top view  , x is horizontal, z is vertical
     axs[1].scatter(gt[:,0], gt[:,2], c='blue', s=1, label='GT')
-    # x_range=[0, 50],
+    # x_range=[-50, 50],
 
-    # y_range=[-50, 50],
+    # z_range=[0, 50],
     axs[1].scatter(pred[:,0], pred[:,2], c='red', s=1, label='Pred')
     axs[1].set_title(f"Top View: GT (blue) vs Pred (red)")
     axs[1].set_xlabel("X (m)")
@@ -517,8 +517,8 @@ def plot_combo(image_rgb_path,pred,gt,save_path,title):
     # axs[1].set_aspect('equal', adjustable='box')
 
     #reset range [-1,1] to *_lim_meters
-    # axs[1].set_xlim(-50, 50)
-    # axs[1].set_ylim(00, 50)
+    axs[1].set_xlim(-50, 50)
+    axs[1].set_ylim(00, 50)
 
     #make sure aspect is equal
     axs[1].set_aspect('equal')

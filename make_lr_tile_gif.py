@@ -85,7 +85,7 @@ if args:
         "inference"
     )
 
-x_value = 4
+x_value = 2
 
 OUT_DIR = BASE_DIR / "tiles_lr_frames"
 GIF_PATH = BASE_DIR / f"tile_lr_fr002-037_hd_{x_value}x.gif"
@@ -111,7 +111,7 @@ MISSING_COLOR = (230, 230, 230)
 TEXT_COLOR = (0, 0, 0)
 MISSING_TEXT_COLOR = (120, 120, 120)
 
-GIF_FPS = 6
+GIF_FPS = 10
 GIF_WIDTH = 1920*x_value
 
 
