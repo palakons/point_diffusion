@@ -230,22 +230,67 @@ def azm_easing(step, total_steps, style="cosine"):
     else:
         raise ValueError(f"Unknown easing style: {style}")
     return eased * 360
+from pytorch3d.ops import knn_points
 
-def calculate_pointset_stat(pc,gt,c_name,seed,bin = 20):
-    assert pc.device == gt.device, f"Device mismatch: pc on {pc.device}, gt on {gt.device}"
-    
-    '''
-    PC: [B,N , D], where D >= 3 (x,y,z, optional doppler and rcs)
-    GT: [B, N, D], same shape as PC
+def calculate_pointset_stat(
+    pc,
+    gt,
+    bin=20,
+    prefix="",
+    fscore_thresholds=(0.5, 1.0, 2.0, 3.0, 5.0),
+):
+    assert pc.device == gt.device, \
+        f"Device mismatch: pc on {pc.device}, gt on {gt.device}"
 
-    cd_xyz, centroid_error,doppler_mae, rcs_mae,range_hist_error,azm_hist_error, doppler_hist_error, rcs_hist_error, x-y_occupancy_error
-    '''
+    if len(prefix) > 0 and not prefix.endswith("_"):
+        prefix += "_"
+
+    pc_xyz = pc[:, :, :3]
+    gt_xyz = gt[:, :, :3]
 
     cd_xyz = pt3d_chamfer_distance(
-        pc[:, :, :3],
-        gt[:, :, :3],
-    )[0]  # Compute Chamfer Distance for the batch
-    centroid_dist = (pc[:, :, :3].mean(dim=1) - gt[:, :, :3].mean(dim=1).to(pc.device)).norm(dim=-1).mean()
+        pc_xyz,
+        gt_xyz,
+    )[0]
+
+    centroid_dist = (
+        pc_xyz.mean(dim=1) - gt_xyz.mean(dim=1)
+    ).norm(dim=-1).mean()
+
+    # -------- F-score --------
+    # PyTorch3D KNN distances are squared L2 distances.
+    d_pc_gt = knn_points(
+        pc_xyz, gt_xyz, K=1, norm=2
+    ).dists[..., 0]
+
+    d_gt_pc = knn_points(
+        gt_xyz, pc_xyz, K=1, norm=2
+    ).dists[..., 0]
+
+    fscore_data = {}
+
+    for r in fscore_thresholds:
+        r2 = r ** 2
+
+        precision_b = (d_pc_gt <= r2).float().mean(dim=1)
+        recall_b = (d_gt_pc <= r2).float().mean(dim=1)
+
+        fscore_b = (
+            2 * precision_b * recall_b
+            / (precision_b + recall_b + 1e-8)
+        )
+
+        tag = f"{r:g}m"
+
+        fscore_data.update({
+            f"{prefix}precision_{tag}":
+                precision_b.mean().item(),
+            f"{prefix}recall_{tag}":
+                recall_b.mean().item(),
+            f"{prefix}fscore_{tag}":
+                fscore_b.mean().item(),
+        })
+
 
     gt_range = np.linalg.norm(gt[:, :, :3].cpu().numpy(), axis=-1)
     gt_range_range = (gt_range.min(), gt_range.max())
@@ -264,8 +309,14 @@ def calculate_pointset_stat(pc,gt,c_name,seed,bin = 20):
 
     binary_x_y_occupancy_error = (pc_hist > 0).astype(int) - (gt_hist > 0).astype(int)
 
-    logged_data = {f'{c_name}sd{seed}_cd': cd_xyz.item(), f'{c_name}sd{seed}_centroid_error': centroid_dist.item(), f'{c_name}sd{seed}_range_hist_error': range_hist_error, f'{c_name}sd{seed}_azm_hist_error': azm_hist_error, f'{c_name}sd{seed}_x_y_occupancy_error': x_y_occupancy_error, f'{c_name}sd{seed}_binary_x_y_occupancy_error': binary_x_y_occupancy_error}
+    #range_hist_error, azm_hist_error, x_y_occupancy_error , range_hist_error  must be summarized to single number, lets do MAE for now
+    range_hist_error = np.mean(np.abs(range_hist_error))
+    azm_hist_error = np.mean(np.abs(azm_hist_error))
+    x_y_occupancy_error = np.mean(np.abs(x_y_occupancy_error))
+    binary_x_y_occupancy_error = np.mean(np.abs(binary_x_y_occupancy_error))
 
+    logged_data = {f'{prefix}xyz_cd': cd_xyz.item(), f'{prefix}centroid_error': centroid_dist.item(), f'{prefix}range_hist_error': range_hist_error, f'{prefix}azm_hist_error': azm_hist_error, f'{prefix}x_y_occupancy_error': x_y_occupancy_error, f'{prefix}binary_x_y_occupancy_error': binary_x_y_occupancy_error}
+    logged_data.update(fscore_data)
     if pc.shape[-1] >3 and gt.shape[-1] >3:
         gt_doppler_range = (gt[:, :, 3].min().item(), gt[:, :, 3].max().item())
         gt_rcs_range = (gt[:, :, 4].min().item(), gt[:, :, 4].max().item())
@@ -273,8 +324,16 @@ def calculate_pointset_stat(pc,gt,c_name,seed,bin = 20):
         rcs_mae = F.l1_loss(pc[:, :, 4:].cpu(), gt[:, :, 4:].to(pc.device).cpu())
         doppler_hist_error = np.histogram(pc[:, :, 3].cpu().numpy().flatten(), bins=bin, range=gt_doppler_range)[0] - np.histogram(gt[:, :, 3].cpu().numpy().flatten(), bins=bin, range=gt_doppler_range)[0]
         rcs_hist_error = np.histogram(pc[:, :, 4].cpu().numpy().flatten(), bins=bin, range=gt_rcs_range)[0] - np.histogram(gt[:, :, 4].cpu().numpy().flatten(), bins=bin, range=gt_rcs_range)[0]
+        # doppler_hist_error, rcs_hist_error need to be sumarized to single number, MSE? MAE? RMSE? lets do MAE for now
+        doppler_hist_error = np.mean(np.abs(doppler_hist_error))
+        rcs_hist_error = np.mean(np.abs(rcs_hist_error))
+        
+        doppler_sign_accuracy = ((pc[:, :, 3] > 0).int() == (gt[:, :, 3] > 0).int().to(pc.device)).float().mean().item()
+        # print(f"min max doppler {pc[:, :, 3].min().item(), pc[:, :, 3].max().item()}, {gt[:, :, 3].min().item(), gt[:, :, 3].max().item()}")
 
-        logged_data.update({f'{c_name}sd{seed}_doppler_mae': doppler_mae.item(), f'{c_name}sd{seed}_rcs_mae': rcs_mae.item(), f'{c_name}sd{seed}_doppler_hist_error': doppler_hist_error, f'{c_name}sd{seed}_rcs_hist_error': rcs_hist_error})
+        logged_data.update({f'{prefix}doppler_mae': doppler_mae.item(), f'{prefix}rcs_mae': rcs_mae.item(), f'{prefix}doppler_hist_mae': doppler_hist_error, f'{prefix}rcs_hist_mae': rcs_hist_error, f'{prefix}doppler_sign_accuracy': doppler_sign_accuracy})
+    else:
+        logged_data.update({f'{prefix}doppler_mae': None, f'{prefix}rcs_mae': None, f'{prefix}doppler_hist_mae': None, f'{prefix}rcs_hist_mae': None, f'{prefix}doppler_sign_accuracy': None})
 
     return logged_data
 

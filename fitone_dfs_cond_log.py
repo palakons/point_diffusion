@@ -403,12 +403,12 @@ def chamfer_xyz_with_matched_attrs(
     }
     return loss_dict
 
-def reconstruct_x0(pred, x_t, t, scheduler, prediction_type):
+def reconstruct_x0(pred_eps, x_t, t, scheduler, prediction_type):
     # return x0 and scale factor for epsilon to x0 conversion if applicable
     if prediction_type == "sample":
-        return pred, None
+        return pred_eps, None
     alpha_bar = scheduler.alphas_cumprod[t].view(-1, 1, 1)
-    return (x_t - torch.sqrt(1 - alpha_bar) * pred) / torch.sqrt(alpha_bar) , torch.sqrt((1 - alpha_bar)/alpha_bar)
+    return (x_t - torch.sqrt(1 - alpha_bar) * pred_eps) / torch.sqrt(alpha_bar) , torch.sqrt((1 - alpha_bar)/alpha_bar)
 
 def shorten_run_id(out_id,  keep_len=200):
 

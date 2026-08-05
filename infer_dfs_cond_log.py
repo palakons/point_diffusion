@@ -493,9 +493,141 @@ def unnormalize_data(x, norm_stats):
         x[:,4:5] = x[:,4:5] * norm_stats["rcs"]["max_half_range"] + np.array(norm_stats["rcs"]["mean"])[None,:]
     # print(f"shape of x: {x.shape} minmax, {x.min()}, {x.max()}")shape of x: torch.Size([128, 5]) minmax, -15.458029747009277, 47.90575408935547
     return x
-    
+def plot_combo(
+    image_rgb_path,
+    pred,
+    gt,
+    save_path,
+    title,
+    split_bottom=False,
+):
+    img = plt.imread(image_rgb_path)
 
-def plot_combo(image_rgb_path,pred,gt,save_path,title):
+    # Convert if needed
+    if torch.is_tensor(pred):
+        pred_np = pred.detach().cpu().numpy()
+    else:
+        pred_np = np.asarray(pred)
+
+    if torch.is_tensor(gt):
+        gt_np = gt.detach().cpu().numpy()
+    else:
+        gt_np = np.asarray(gt)
+
+    # CD_xyz [m^2]
+    pred_t = torch.as_tensor(pred_np[:, :3], dtype=torch.float32)[None]
+    gt_t   = torch.as_tensor(gt_np[:, :3], dtype=torch.float32)[None]
+
+    cd_xyz = pt3d_chamfer_distance(pred_t, gt_t)[0].item()
+
+    if not split_bottom:
+        # ---------------- original overlay ----------------
+        fig, axs = plt.subplots(
+            2, 1,
+            figsize=(6, 5),
+            gridspec_kw={"height_ratios": [1.0, 1.0]},
+        )
+
+        axs[0].imshow(img)
+        axs[0].set_title(title, pad=2)
+        axs[0].axis("off")
+
+        axs[1].scatter(gt_np[:, 0], gt_np[:, 2],
+                       c="blue", s=2, label="GT")
+        axs[1].scatter(pred_np[:, 0], pred_np[:, 2],
+                       c="red", s=2, label="Pred")
+
+        axs[1].set_title(
+            rf"GT vs Pred   CD$_{{xyz}}$={cd_xyz:.2f} m$^2$",
+            pad=2,
+        )
+        axs[1].set_xlabel("X (m)")
+        axs[1].set_ylabel("Z (m)")
+        axs[1].set_xlim(-50, 50)
+        axs[1].set_ylim(0, 50)
+        axs[1].set_aspect("equal")
+        axs[1].legend(
+            loc="upper right",
+            fontsize=7,
+            markerscale=2,
+            frameon=False,
+        )
+
+        plt.subplots_adjust(
+            left=0.07,
+            right=0.995,
+            bottom=0.07,
+            top=0.96,
+            hspace=0.08,
+        )
+
+    else:
+        fig = plt.figure(figsize=(7, 5.0))
+
+        gs = fig.add_gridspec(
+            2, 2,
+            height_ratios=[ 1.0,.75],
+            hspace=0.02,
+            wspace=0.0,
+        )
+
+        ax_img = fig.add_subplot(gs[0, :])
+        ax_gt = fig.add_subplot(gs[1, 0])
+        ax_pred = fig.add_subplot(gs[1, 1], sharey=ax_gt)
+
+        ax_img.imshow(img)
+        ax_img.set_title(title, pad=1)
+        ax_img.axis("off")
+        ax_img.set_anchor("S")
+
+        # GT / Pred
+        for ax in (ax_gt, ax_pred):
+            ax.set_xlim(-30,30)
+            ax.set_ylim(0, 50)
+            ax.set_aspect("equal")
+            # ax.set_xlabel("X (m)", labelpad=1)
+            for spine in ax.spines.values():
+                spine.set_visible(True)
+                spine.set_linewidth(0.8)        
+
+        for spine in ax_img.spines.values():
+            spine.set_visible(True)
+            spine.set_linewidth(0.8)
+        ax_gt.scatter(gt_np[:, 0], gt_np[:, 2], c="blue", s=1, label="GT")
+        ax_gt.set_xlabel("GT - X (m)", labelpad=1)
+        ax_pred.scatter(pred_np[:, 0], pred_np[:, 2], c="red", s=1, label="Pred")
+        ax_pred.set_xlabel("Pred - X (m)", labelpad=1)
+
+        # ax_gt.set_title(f"GT", pad=1)
+        # ax_pred.set_title(f"Pred   CD$_{{xyz}}$={cd_xyz:.2f} m$^2$", pad=1)
+
+        ax_gt.set_anchor("E")
+        ax_pred.set_anchor("W")
+
+        ax_gt.set_ylabel(f"Z (m); CD$_{{xyz}}$={cd_xyz:.2f} m$^2$", labelpad=1)
+        ax_pred.tick_params(axis="y", left=False, labelleft=False)
+
+        #make axis font size, smaller
+        for ax in (ax_img, ax_gt, ax_pred):
+            ax.tick_params(axis="both", which="major", labelsize=7, length=2, width=0.5)
+            ax.tick_params(axis="both", which="minor", labelsize=7, length=1, width=0.5)
+            #also axis label font size
+            ax.xaxis.label.set_size(7)
+            ax.yaxis.label.set_size(7)
+
+
+
+
+    plt.savefig(
+        save_path,
+        dpi=200,
+        bbox_inches="tight",
+        pad_inches=0.01,
+    )
+    plt.close(fig)
+
+
+def plot_combo_old(image_rgb_path,pred,gt,save_path,title):
 
     #plot img, ont he left, gt/pred top view ont he right, with gt in blue, pred in red
     fig,axs =  plt.subplots(2,1,figsize=(6,6))
@@ -529,7 +661,7 @@ def plot_combo(image_rgb_path,pred,gt,save_path,title):
     plt.tight_layout()
     plt.savefig(save_path)
     plt.close(fig)
-    print(f"Saved inference figure to {save_path}")
+    # print(f"Saved inference figure to {save_path}")
 
 if __name__ == "__main__":
     args = parse_args()
@@ -883,10 +1015,11 @@ if __name__ == "__main__":
     print(f"mode: {args.mode}")
 
     if args.mode == "eval":
-        print(f"Starting evaluation mode.")
-
+        print(f"Starting evaluation mode. loading TruckScenes dataset for evaluation...")
+        time0= time.time()
         trucksc_all={'man-mini': {"data_root": "/data/palakons/new_dataset/MAN/mini/man-truckscenes", "version": "v1.0-mini","sc_class": TruckScenes("v1.0-mini", "/data/palakons/new_dataset/MAN/mini/man-truckscenes", False)},
                 'man-full': {"data_root": "/data/palakons/new_dataset/MAN/man-truckscenes", "version": "v1.0-trainval","sc_class": TruckScenes("v1.0-trainval", "/data/palakons/new_dataset/MAN/man-truckscenes", False)}}
+        print(f"Loaded TruckScenes dataset for evaluation in {time.time()-time0:.2f} seconds.")
 
         # c_name = "correct_cond" 
         sampling_seed = 42
@@ -971,14 +1104,15 @@ if __name__ == "__main__":
                         raise FileNotFoundError(f"Image file does not exist: {image_rgb_path}")
                     else:
                         
-                        print(f"Image file path: {image_rgb_path}, token: {frame_token}, scene_id: {scene_id}, frame_index: {frame_index}, sensor_side: {sensor_side}, data_file: {data_file}")
+                        # print(f"Image file path: {image_rgb_path}, token: {frame_token}, scene_id: {scene_id}, frame_index: {frame_index}, sensor_side: {sensor_side}, data_file: {data_file}")
                         #plot image, gt, pred
                         save_fname =  f"combo_{data_file}_{sensor_side}_sc-{scene_id}_fr-{frame_index}.png"
                         save_path = os.path.join(inference_dir, save_fname)
                         title=f"RGB Image: {data_file}, {sensor_side}, scene {scene_id}, frame {frame_index}"
 
                         # plot_combo(image_rgb_path,pred,gt,save_path,title)
-                        plot_combo(image_rgb_path,pred_unnormed,gt_unnormed,save_path,title)
+                        plot_combo(image_rgb_path,pred_unnormed,gt_unnormed,save_path,title, split_bottom=True)
+                        # plot_combo(image_rgb_path,pred_unnormed,gt_unnormed,save_path.replace('.png', '_notsplit.png'),title, split_bottom=False)
                         
 
                 pointset_error_stat = calculate_pointset_stat(pred_unnormed.unsqueeze(0), gt_unnormed.unsqueeze(0))

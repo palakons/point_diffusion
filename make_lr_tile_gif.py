@@ -279,6 +279,24 @@ def make_gif_with_ffmpeg(fname_prefix="tile_lr_fr",gif_output_path=GIF_PATH):
 
     print(f"saved GIF: {gif_output_path}")
 
+    #make mp4, directly from the pngs, no palette needed
+    mp4_output_path = str(gif_output_path).replace(".gif", ".mp4")
+    cmd_mp4 = [
+        "ffmpeg",
+        "-y",
+        "-framerate", str(GIF_FPS),
+        "-start_number", "2",
+        "-i", input_pattern,
+        "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
+        str(mp4_output_path),
+    ]
+
+    print("making MP4...")
+    subprocess.run(cmd_mp4, check=True)
+
+    print(f"saved MP4: {mp4_output_path}")
+
 def crop_top_left(input_gif_path, output_gif_path, out_dir, crop_factor=4):
     palette_path = str(out_dir / "crop_palette.png")
 
