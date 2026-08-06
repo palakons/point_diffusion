@@ -97,7 +97,7 @@ def sample_or_retrieve_in_batches(
 
     total = gt_all.shape[0]
 
-    for s in trange(0, total, batch_size, leave=False, desc=f"Sampling batch with {c_name}"):
+    for s in trange(0, total, batch_size, leave=False, desc=f"Sampling batch with {c_name} BS {batch_size}"):
         e = min(s + batch_size, total)
         cond_b = cond_all[s:e].float() if cond_all is not None else None
         b = e - s
@@ -524,7 +524,7 @@ def p_sample_loop(
         condition = condition.to(device)
     # print(f"loop")
     try:
-        for t_step in tqdm(scheduler.timesteps, desc="Sampling", leave=False):
+        for t_step in tqdm(scheduler.timesteps, desc="p_sample_loop", leave=False):
             # print(f"make tensor")
             t_tensor = torch.full((B,), t_step.item(), device=device, dtype=torch.long)
             # print(f"model pred")

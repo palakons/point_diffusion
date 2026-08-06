@@ -32,7 +32,7 @@ from io_dataset import (
 )
 from fitone_dfs_cond_log import find_nn_cond_exact_chunked,sample_or_retrieve_in_batches,none_if_all_zero,append_per_scene_eval_rows,append_eval_row,debug_batch,check_model,check_tensor,chamfer_xyz_with_matched_attrs,p_sample_loop,shorten_run_id,make_run_id,auto_fill_scene_sets,filter_valid_scene_keys,parse_scene_set_spec,_compress_ids,scene_set_tag,reconstruct_x0,frame_key,take_frame_ids,gather_man_ds,train_eval_step,eval_multi_batch,TimeRecorder,make_frame_meta_np,append_per_frame_eval_rows,LazyNpyArray,compute_norm_stats_from_train,NormalizedX0Array,NormalizedCondArray
 from truckscenes import TruckScenes
-
+from scipy.ndimage import gaussian_filter
 from types import ModuleType
 
 # Mock open3d to bypass the headless GLIBC_2.38 driver clash
@@ -447,6 +447,12 @@ def parse_args():
         choices=["radar", "camera"],
         help="Coordinate frame used as the diffusion target.",
     )
+    parser.add_argument(
+        "--n_multi",
+        type=int,
+        default=1,
+        help="Number of stochastic generation passes for uncertainty visualization.",
+    )
 
 
     args = parser.parse_args()
@@ -500,6 +506,8 @@ def plot_combo(
     save_path,
     title,
     split_bottom=False,
+    pred_multi=None,
+    sigma=1.5
 ):
     img = plt.imread(image_rgb_path)
 
@@ -595,8 +603,65 @@ def plot_combo(
             spine.set_linewidth(0.8)
         ax_gt.scatter(gt_np[:, 0], gt_np[:, 2], c="blue", s=1, label="GT")
         ax_gt.set_xlabel("GT - X (m)", labelpad=1)
-        ax_pred.scatter(pred_np[:, 0], pred_np[:, 2], c="red", s=1, label="Pred")
-        ax_pred.set_xlabel("Pred - X (m)", labelpad=1)
+        # ax_pred.scatter(pred_np[:, 0], pred_np[:, 2], c="red", s=1, label="Pred")
+
+        if pred_multi is None or len(pred_multi) <= 1:
+            ax_pred.scatter(
+                pred_np[:, 0],
+                pred_np[:, 2],
+                c="red",
+                s=1,label="Pred"
+            )
+
+        else:
+            # [n_multi * N, 3]
+            multi_np = np.concatenate([
+                p.detach().cpu().numpy() if torch.is_tensor(p) else np.asarray(p)
+                for p in pred_multi
+            ], axis=0)
+
+            # 2D density in camera X-Z plane
+            H, xedges, zedges = np.histogram2d(
+                multi_np[:, 0],
+                multi_np[:, 2],
+                bins=(120, 100),
+                range=[[-30, 30], [0, 50]],
+            )
+
+            # Smooth discrete point hits into a density map
+            H = gaussian_filter(H, sigma=sigma)
+
+            ax_pred.imshow(
+                H.T,
+                origin="lower",
+                extent=[-30, 30, 0, 50],
+                aspect="equal",
+                cmap="Blues",
+                interpolation="bilinear",
+            )
+            # ax_pred.scatter(
+            #     pred_np[:, 0],
+            #     pred_np[:, 2],
+            #     c="red",
+            #     s=0.5,
+            #     alpha=0.3,
+            # )
+
+            #calculate error H.T at GT: pick the bin that GT falls into, and get the density value
+            gt_bin_x = np.digitize(gt_np[:, 0], xedges) - 1
+            gt_bin_z = np.digitize(gt_np[:, 2], zedges) - 1
+            gt_bin_x = np.clip(gt_bin_x, 0, H.shape[1] - 1)
+            gt_bin_z = np.clip(gt_bin_z, 0, H.shape[0] - 1)
+            gt_bin_idx = gt_bin_z * H.shape[1] + gt_bin_x
+            gt_density = H.T[gt_bin_idx]
+
+
+
+        # ax_pred.set_xlabel("Pred - X (m)", labelpad=1)
+        ax_pred.set_xlabel(
+            f"Pred ({len(pred_multi) if pred_multi is not None else 1} samples) - X (m)",
+            labelpad=1,
+        )
 
         # ax_gt.set_title(f"GT", pad=1)
         # ax_pred.set_title(f"Pred   CD$_{{xyz}}$={cd_xyz:.2f} m$^2$", pad=1)
@@ -604,7 +669,7 @@ def plot_combo(
         ax_gt.set_anchor("E")
         ax_pred.set_anchor("W")
 
-        ax_gt.set_ylabel(f"Z (m); CD$_{{xyz}}$={cd_xyz:.2f} m$^2$", labelpad=1)
+        ax_gt.set_ylabel(rf"Z (m); CD$_{{xyz}}^{{(1)}}$={cd_xyz:.2f} m$^2$", labelpad=1)
         ax_pred.tick_params(axis="y", left=False, labelleft=False)
 
         #make axis font size, smaller
@@ -1082,10 +1147,68 @@ if __name__ == "__main__":
                         },
                         f,
                     )
+
+            # ---------------------------------------------------------
+            # Multiple stochastic samples for uncertainty visualization
+            # Keep pred_all as pass 0 for all existing quantitative metrics.
+            # ---------------------------------------------------------
+            pred_multi_all = [pred_all]
+
+            if c_name == "correct_cond" and args.n_multi > 1:
+
+                print(f"Generating {args.n_multi} stochastic passes...")
+
+                gt_eval_norm = x0sbn5_norm[eval_idx_pool][:, :, :inout_dim]
+                cond_eval_norm = cond_norm[eval_idx_pool] if cond_norm is not None else None
+
+                for multi_i in trange(1, args.n_multi, desc="Pred multiple stochastic passes"):
+
+                    pred_i, _ = sample_or_retrieve_in_batches(
+                        model=model,
+                        scheduler=ddpm_scheduler,
+                        gt_all=gt_eval_norm,
+                        cond_all=cond_eval_norm,
+
+                        cond_train_norm=cond_norm,
+                        x0sbn3_train_norm=x0sbn5_norm,
+
+                        c_name=c_name,
+                        seed=sampling_seed + multi_i,
+
+                        N=N,
+                        inout_dim=inout_dim,
+                        T_infer=T_infer,
+                        device=device,
+                        batch_size=1024,
+                        shuffle_perm=None,
+                        train_idx_pool=train_idx_pool,
+                    )
+
+                    pred_multi_all.append(pred_i)
             print(f"pred_all, cond_used_all shapes: {pred_all.shape}, {cond_used_all.shape if cond_used_all is not None else None}, eval_idx_pool numel: {eval_idx_pool.numel()}")
                 
             
-            for frame_token, scene_id, frame_index, sensor_side, data_file,pred,gt in tqdm(zip(frame_ids['eval']['token'], frame_ids['eval']['scene_id'], frame_ids['eval']['frame_index'], frame_ids['eval']['sensor_side'], frame_ids['eval']['data_file'], pred_all, x0sbn5_norm[eval_idx_pool]), desc="Processing frames", total=len(frame_ids['eval']['token'])):
+            for eval_i, (
+                frame_token,
+                scene_id,
+                frame_index,
+                sensor_side,
+                data_file,
+                pred,
+                gt,
+            ) in enumerate(tqdm(
+                zip(
+                    frame_ids['eval']['token'],
+                    frame_ids['eval']['scene_id'],
+                    frame_ids['eval']['frame_index'],
+                    frame_ids['eval']['sensor_side'],
+                    frame_ids['eval']['data_file'],
+                    pred_all,
+                    x0sbn5_norm[eval_idx_pool],
+                ),
+                desc="Processing frames",
+                total=len(frame_ids['eval']['token']),
+            )):
                 pred_unnormed = unnormalize_data(pred.clone(), norm_stats)
                 gt_unnormed = unnormalize_data(gt.clone(), norm_stats)
 
@@ -1103,6 +1226,11 @@ if __name__ == "__main__":
                         print(f"Image file does not exist: {image_rgb_path}")
                         raise FileNotFoundError(f"Image file does not exist: {image_rgb_path}")
                     else:
+
+                        pred_multi_unnormed = [
+                            unnormalize_data(pred_pass[eval_i].clone(), norm_stats)
+                            for pred_pass in pred_multi_all
+                        ]
                         
                         # print(f"Image file path: {image_rgb_path}, token: {frame_token}, scene_id: {scene_id}, frame_index: {frame_index}, sensor_side: {sensor_side}, data_file: {data_file}")
                         #plot image, gt, pred
@@ -1111,7 +1239,7 @@ if __name__ == "__main__":
                         title=f"RGB Image: {data_file}, {sensor_side}, scene {scene_id}, frame {frame_index}"
 
                         # plot_combo(image_rgb_path,pred,gt,save_path,title)
-                        plot_combo(image_rgb_path,pred_unnormed,gt_unnormed,save_path,title, split_bottom=True)
+                        plot_combo(image_rgb_path,pred_unnormed,gt_unnormed,save_path,title, split_bottom=True,    pred_multi=pred_multi_unnormed,sigma=1.5)
                         # plot_combo(image_rgb_path,pred_unnormed,gt_unnormed,save_path.replace('.png', '_notsplit.png'),title, split_bottom=False)
                         
 

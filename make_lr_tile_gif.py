@@ -240,7 +240,7 @@ def draw_one_frame(frame_id: int, tile_w: int, tile_h: int, font,views=VIEWS, gr
     return out_path
 
 
-def make_gif_with_ffmpeg(fname_prefix="tile_lr_fr",gif_output_path=GIF_PATH):
+def make_gif_with_ffmpeg(fname_prefix="tile_lr_fr",gif_output_path=GIF_PATH,gif_width=GIF_WIDTH,gif_fps=GIF_FPS):
     if shutil.which("ffmpeg") is None:
         print("ffmpeg not found. PNG frames were created, but GIF was skipped.")
         return
@@ -252,24 +252,26 @@ def make_gif_with_ffmpeg(fname_prefix="tile_lr_fr",gif_output_path=GIF_PATH):
     cmd_palette = [
         "ffmpeg",
         "-y",
-        "-framerate", str(GIF_FPS),
+        "-framerate", str(gif_fps),
         "-start_number", "2",
         "-i", input_pattern,
-        "-vf", f"scale={GIF_WIDTH}:-1:flags=lanczos,palettegen",
+        "-vf", f"scale={gif_width}:-1:flags=lanczos,palettegen",
         palette_path,
     ]
+    #ro commadn directly ffmpeg -y -framerate 10 -start_number 2 -i tile_lr_fr%03d.png -vf scale=1920:-1:flags=lanczos,palettegen palette.png
 
     # GIF pass.
     cmd_gif = [
         "ffmpeg",
         "-y",
-        "-framerate", str(GIF_FPS),
+        "-framerate", str(gif_fps),
         "-start_number", "2",
         "-i", input_pattern,
         "-i", palette_path,
-        "-lavfi", f"scale={GIF_WIDTH}:-1:flags=lanczos[x];[x][1:v]paletteuse",
+        "-lavfi", f"scale={gif_width}:-1:flags=lanczos[x];[x][1:v]paletteuse",
         str(gif_output_path),
     ]
+    #direct command ffmpeg -y -framerate 10 -start_number 2 -i /data/palakons/ddpm_cond_slow/xattn-B16_dim512_samplemse-lr1e-4-constantm1-smooth-lazy-1norm-center9-cameraframe-xyzonly/inference/tiles_lr_frames/tile_lr_fr_best_worst%03d.png -i /data/palakons/ddpm_cond_slow/xattn-B16_dim512_samplemse-lr1e-4-constantm1-smooth-lazy-1norm-center9-cameraframe-xyzonly/inference/tiles_lr_frames/palette.png -lavfi 'scale=960:-1:flags=lanczos[x];[x][1:v]paletteuse' /data/palakons/ddpm_cond_slow/xattn-B16_dim512_samplemse-lr1e-4-constantm1-smooth-lazy-1norm-center9-cameraframe-xyzonly/inference/tile_lr_fr_best_worst_1x.gif
 
     print("making GIF palette...")
     subprocess.run(cmd_palette, check=True)
@@ -284,7 +286,7 @@ def make_gif_with_ffmpeg(fname_prefix="tile_lr_fr",gif_output_path=GIF_PATH):
     cmd_mp4 = [
         "ffmpeg",
         "-y",
-        "-framerate", str(GIF_FPS),
+        "-framerate", str(gif_fps),
         "-start_number", "2",
         "-i", input_pattern,
         "-c:v", "libx264",
@@ -397,7 +399,9 @@ def main():
         for frame_id in frame_ids_from_file:
             draw_one_frame(frame_id, tile_w, tile_h, font, views=interleaved_views, grid_h=4, grid_w=4, label_h=LABEL_H, scene_grid_w=2, scene_grid_h=4,fname_prefix="tile_lr_fr_best_worst")
         
-        make_gif_with_ffmpeg(fname_prefix="tile_lr_fr_best_worst", gif_output_path=BASE_DIR / f"tile_lr_fr_best_worst_hd_{x_value}x.gif")
+        make_gif_with_ffmpeg(fname_prefix="tile_lr_fr_best_worst", gif_output_path=BASE_DIR / f"tile_lr_fr_best_worst_hd_{x_value//2}x.gif", gif_width=GIF_WIDTH//2, gif_fps=GIF_FPS)
+
+
 
 if __name__ == "__main__":
     main()
