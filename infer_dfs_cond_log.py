@@ -454,50 +454,61 @@ def parse_args():
         help="Number of stochastic generation passes for uncertainty visualization.",
     )
 
+    parser.add_argument(
+        "--eval_scene_id",
+        type=int,
+        default=-1,
+        help="If >=0, restrict evaluation to this scene_id.",
+    )
+    parser.add_argument(
+        "--plot_sigma_m",
+        type=float,
+        default=1,
+        help="Sigma for Gaussian smoothing of multi-sample density plots. in meters. Only used if --n_multi > 1.",
+    )
 
     args = parser.parse_args()
 
 
     return args
-
+    
 def unnormalize_data(x, norm_stats):
-
-
     x = x.clone()
-    '''
-        x: [n,3 or 5]
-        norm stat: {
-                        "x0sbn3": {
-                            "mean": [
-                            29.298988342285156,
-                            4.784998893737793,
-                            0.002921066712588072
-                            ],
-                            "max_half_range": 45.21278762817383
-                        },
-                        "doppler": {
-                            "mean": [
-                            15.066837310791016
-                            ],
-                            "max_half_range": 100.08779907226562
-                        },
-                        "rcs": {
-                            "mean": [
-                            -10.122147560119629
-                            ],
-                            "max_half_range": 56.12214660644531
-                        }
-                    }
-    '''
-    # print(f"shape of x: {x.shape} minmax, {x.min()}, {x.max()}")
 
-    # shape of x: torch.Size([128, 5]) minmax, -0.5435303449630737, 0.8864037394523621
-    x[:,:3] = x[:,:3] * norm_stats["x0sbn3"]["max_half_range"] + np.array(norm_stats["x0sbn3"]["mean"])[None,:]
+    xyz_mean = torch.as_tensor(
+        norm_stats["x0sbn3"]["mean"],
+        dtype=x.dtype,
+        device=x.device,
+    )
+
+    x[:, :3] = (
+        x[:, :3] * norm_stats["x0sbn3"]["max_half_range"]
+        + xyz_mean
+    )
 
     if x.shape[-1] == 5:
-        x[:,3:4] = x[:,3:4] * norm_stats["doppler"]["max_half_range"] + np.array(norm_stats["doppler"]["mean"])[None,:]
-        x[:,4:5] = x[:,4:5] * norm_stats["rcs"]["max_half_range"] + np.array(norm_stats["rcs"]["mean"])[None,:]
-    # print(f"shape of x: {x.shape} minmax, {x.min()}, {x.max()}")shape of x: torch.Size([128, 5]) minmax, -15.458029747009277, 47.90575408935547
+        doppler_mean = torch.as_tensor(
+            norm_stats["doppler"]["mean"],
+            dtype=x.dtype,
+            device=x.device,
+        )
+
+        rcs_mean = torch.as_tensor(
+            norm_stats["rcs"]["mean"],
+            dtype=x.dtype,
+            device=x.device,
+        )
+
+        x[:, 3:4] = (
+            x[:, 3:4] * norm_stats["doppler"]["max_half_range"]
+            + doppler_mean
+        )
+
+        x[:, 4:5] = (
+            x[:, 4:5] * norm_stats["rcs"]["max_half_range"]
+            + rcs_mean
+        )
+
     return x
 def plot_combo(
     image_rgb_path,
@@ -507,7 +518,7 @@ def plot_combo(
     title,
     split_bottom=False,
     pred_multi=None,
-    sigma=1.5
+    sigma_m=1.5
 ):
     img = plt.imread(image_rgb_path)
 
@@ -604,7 +615,7 @@ def plot_combo(
         ax_gt.scatter(gt_np[:, 0], gt_np[:, 2], c="blue", s=1, label="GT")
         ax_gt.set_xlabel("GT - X (m)", labelpad=1)
         # ax_pred.scatter(pred_np[:, 0], pred_np[:, 2], c="red", s=1, label="Pred")
-
+        # print(f"pred_multi: {len(pred_multi) if pred_multi is not None else 0} samples")
         if pred_multi is None or len(pred_multi) <= 1:
             ax_pred.scatter(
                 pred_np[:, 0],
@@ -619,22 +630,36 @@ def plot_combo(
                 p.detach().cpu().numpy() if torch.is_tensor(p) else np.asarray(p)
                 for p in pred_multi
             ], axis=0)
-
             # 2D density in camera X-Z plane
+            x_range = (-30, 30)
+            z_range = (0, 50)
+            x_bins = 120
+            z_bins = 100
+
             H, xedges, zedges = np.histogram2d(
                 multi_np[:, 0],
                 multi_np[:, 2],
-                bins=(120, 100),
-                range=[[-30, 30], [0, 50]],
+                bins=(x_bins, z_bins),
+                range=[x_range, z_range],
             )
 
-            # Smooth discrete point hits into a density map
-            H = gaussian_filter(H, sigma=sigma)
+            # Gaussian bandwidth defined in physical units [m]
+            # sigma_m = 1.0
+
+            dx = (x_range[1] - x_range[0]) / x_bins   # 0.5 m/bin
+            dz = (z_range[1] - z_range[0]) / z_bins   # 0.5 m/bin
+
+            sigma_bins = (
+                sigma_m / dx,
+                sigma_m / dz,
+            )
+
+            H = gaussian_filter(H, sigma=sigma_bins)
 
             ax_pred.imshow(
                 H.T,
                 origin="lower",
-                extent=[-30, 30, 0, 50],
+                extent=[*x_range, *z_range],
                 aspect="equal",
                 cmap="Blues",
                 interpolation="bilinear",
@@ -646,14 +671,7 @@ def plot_combo(
             #     s=0.5,
             #     alpha=0.3,
             # )
-
-            #calculate error H.T at GT: pick the bin that GT falls into, and get the density value
-            gt_bin_x = np.digitize(gt_np[:, 0], xedges) - 1
-            gt_bin_z = np.digitize(gt_np[:, 2], zedges) - 1
-            gt_bin_x = np.clip(gt_bin_x, 0, H.shape[1] - 1)
-            gt_bin_z = np.clip(gt_bin_z, 0, H.shape[0] - 1)
-            gt_bin_idx = gt_bin_z * H.shape[1] + gt_bin_x
-            gt_density = H.T[gt_bin_idx]
+            
 
 
 
@@ -728,6 +746,37 @@ def plot_combo_old(image_rgb_path,pred,gt,save_path,title):
     plt.close(fig)
     # print(f"Saved inference figure to {save_path}")
 
+def select_medoid_sample(pred_multi):
+    """
+    pred_multi: list of K tensors [N,3]
+    """
+    K = len(pred_multi)
+
+    if K == 1:
+        return pred_multi[0], 0
+
+    scores = []
+
+    for i in range(K):
+        cds = []
+
+        for j in range(K):
+            if i == j:
+                continue
+
+            cd = pt3d_chamfer_distance(
+                pred_multi[i][None, :, :3],
+                pred_multi[j][None, :, :3],
+            )[0]
+
+            cds.append(cd.item())
+
+        scores.append(np.mean(cds))
+
+    idx = int(np.argmin(scores))
+
+    return pred_multi[idx], idx
+
 if __name__ == "__main__":
     args = parse_args()
     # Example setup
@@ -739,7 +788,7 @@ if __name__ == "__main__":
     tb_dir = f"/home/palakons/logs/tb_log/{system_key}/{args.exp_name}"
     temp_dir = f"{data_dir}/temp"
     samples_dir = f"{data_dir}/samples"
-    inference_dir = f"{data_dir}/inference"
+    inference_dir = f"{data_dir}/inference_sc{args.eval_scene_id}-multi{args.n_multi}"
     checkpoint_dir = f"/data/palakons/{system_key}/checkpoints/"
     # cache_dir = f"/data/palakons/{system_key}/cache/"
     cache_dir = f"/data/palakons/{system_key}/cache{'_cameraxyz' if args.coord_frame == 'camera' else ''}_unnorm/"
@@ -986,6 +1035,25 @@ if __name__ == "__main__":
             train_idx_pool = torch.as_tensor(train_indices, dtype=torch.long)
 
             eval_idx_pool = torch.as_tensor(eval_indices, dtype=torch.long)
+
+            if args.eval_scene_id >= 0:
+                eval_idx_pool = torch.as_tensor(
+                    [
+                        i for i in eval_idx_pool.tolist()
+                        if all_frame_ids["scene_id"][i] == args.eval_scene_id
+                    ],
+                    dtype=torch.long,
+                )
+
+                assert eval_idx_pool.numel() > 0, \
+                    f"No eval frames found for scene_id={args.eval_scene_id}"
+
+            print(
+                f"Filtered eval to scene {args.eval_scene_id}: "
+                f"{eval_idx_pool.numel()} frames"
+            )
+            
+            
             test_idx_pool = torch.as_tensor(test_indices, dtype=torch.long) if len(test_indices) > 0 else None
             frame_ids = {
                 "split_method": "man_heldout_split",
@@ -1011,8 +1079,8 @@ if __name__ == "__main__":
                 x0sbn5_src=x0sbn5_all,
                 cond_src=cond_all,
                 train_idx_pool=train_idx_pool,
-                chunk_size=512,
-            )
+                chunk_size=4096,
+            )#this takes 3 mins
             
 
             print(f"Data normalization statistics from train set: {norm_stats}")
@@ -1082,7 +1150,8 @@ if __name__ == "__main__":
     if args.mode == "eval":
         print(f"Starting evaluation mode. loading TruckScenes dataset for evaluation...")
         time0= time.time()
-        trucksc_all={'man-mini': {"data_root": "/data/palakons/new_dataset/MAN/mini/man-truckscenes", "version": "v1.0-mini","sc_class": TruckScenes("v1.0-mini", "/data/palakons/new_dataset/MAN/mini/man-truckscenes", False)},
+        trucksc_all={
+            # 'man-mini': {"data_root": "/data/palakons/new_dataset/MAN/mini/man-truckscenes", "version": "v1.0-mini","sc_class": TruckScenes("v1.0-mini", "/data/palakons/new_dataset/MAN/mini/man-truckscenes", False)},
                 'man-full': {"data_root": "/data/palakons/new_dataset/MAN/man-truckscenes", "version": "v1.0-trainval","sc_class": TruckScenes("v1.0-trainval", "/data/palakons/new_dataset/MAN/man-truckscenes", False)}}
         print(f"Loaded TruckScenes dataset for evaluation in {time.time()-time0:.2f} seconds.")
 
@@ -1231,6 +1300,31 @@ if __name__ == "__main__":
                             unnormalize_data(pred_pass[eval_i].clone(), norm_stats)
                             for pred_pass in pred_multi_all
                         ]
+                        pred_medoid, medoid_idx = select_medoid_sample(
+                            pred_multi_unnormed
+                        )
+
+                        medoid_stats = calculate_pointset_stat(
+                            pred_medoid.unsqueeze(0),
+                            gt_unnormed.unsqueeze(0),
+                        )
+
+                        medoid_cd = medoid_stats["xyz_cd"]
+                        medoid_f2 = medoid_stats["fscore_2m"]
+
+                        multi_stats = [
+                            calculate_pointset_stat(
+                                p.unsqueeze(0),
+                                gt_unnormed.unsqueeze(0),
+                            )
+                            for p in pred_multi_unnormed
+                        ]
+
+                        multi_cd_mean = np.mean([s["xyz_cd"] for s in multi_stats])
+                        multi_cd_std = np.std([s["xyz_cd"] for s in multi_stats])
+
+                        multi_f2_mean = np.mean([s["fscore_2m"] for s in multi_stats])
+                        multi_f2_std = np.std([s["fscore_2m"] for s in multi_stats])
                         
                         # print(f"Image file path: {image_rgb_path}, token: {frame_token}, scene_id: {scene_id}, frame_index: {frame_index}, sensor_side: {sensor_side}, data_file: {data_file}")
                         #plot image, gt, pred
@@ -1239,11 +1333,21 @@ if __name__ == "__main__":
                         title=f"RGB Image: {data_file}, {sensor_side}, scene {scene_id}, frame {frame_index}"
 
                         # plot_combo(image_rgb_path,pred,gt,save_path,title)
-                        plot_combo(image_rgb_path,pred_unnormed,gt_unnormed,save_path,title, split_bottom=True,    pred_multi=pred_multi_unnormed,sigma=1.5)
+                        plot_combo(image_rgb_path,pred_unnormed,gt_unnormed,save_path,title, split_bottom=True,pred_multi=pred_multi_unnormed,sigma_m=args.plot_sigma_m)
+                        # plot medoid   
+                        plot_combo(image_rgb_path,pred_medoid,gt_unnormed,save_path.replace('.png', '_medoid.png'),title, split_bottom=True,pred_multi=None,sigma_m=args.plot_sigma_m)
                         # plot_combo(image_rgb_path,pred_unnormed,gt_unnormed,save_path.replace('.png', '_notsplit.png'),title, split_bottom=False)
                         
 
                 pointset_error_stat = calculate_pointset_stat(pred_unnormed.unsqueeze(0), gt_unnormed.unsqueeze(0))
+                pointset_error_stat.update({
+                    "multi_xyz_cd_mean": multi_cd_mean,
+                    "multi_xyz_cd_std": multi_cd_std,
+                    "multi_fscore_2m_mean": multi_f2_mean,
+                    "multi_fscore_2m_std": multi_f2_std,
+                    "medoid_xyz_cd": medoid_cd,
+                    "medoid_fscore_2m": medoid_f2,
+                })
 
                 per_frame_cds.append({'data_file': data_file, 'sensor_side': sensor_side, 'scene_id': scene_id, 'frame_index': frame_index, 'token': frame_token,"condition_use":c_name } | pointset_error_stat)
                     

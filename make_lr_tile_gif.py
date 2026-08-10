@@ -82,19 +82,20 @@ if args:
     BASE_DIR = Path(
         "/data/palakons/ddpm_cond_slow/"
         f"{args[0]}/"
-        "inference"
+        f"inference_{args[1]}"
     )
+    
 
-x_value = 2
+x_value = 1
 
 OUT_DIR = BASE_DIR / "tiles_lr_frames"
-GIF_PATH = BASE_DIR / f"tile_lr_fr002-037_hd_{x_value}x.gif"
+GIF_PATH = BASE_DIR / f"tile_{x_value}x.gif"
 
 FRAME_IDS = range(2, 38)   # 2..37 inclusive
 SIDES = ["left", "right"]
 
-SCENE_GRID_W = 8
-SCENE_GRID_H = 8
+SCENE_GRID_W = int(args[2])
+SCENE_GRID_H = int(args[3])
 
 # Because each scene has left/right pair:
 GRID_W = SCENE_GRID_W * 2  # 16 image columns
@@ -126,9 +127,9 @@ def data_file_to_token(data_file: str) -> str:
     return data_file
 
 
-def image_path(data_file: str, side: str, scene_id: int, frame_id: int) -> Path:
+def image_path(data_file: str, side: str, scene_id: int, frame_id: int,suffix:str="") -> Path:
     token = data_file_to_token(data_file)
-    return BASE_DIR / f"combo_{token}_{side}_sc-{scene_id}_fr-{frame_id}.png"
+    return BASE_DIR / f"combo_{token}_{side}_sc-{scene_id}_fr-{frame_id}{suffix}.png"
 
 
 def all_candidate_paths(views=VIEWS,frame_ids = FRAME_IDS):
@@ -158,7 +159,7 @@ def load_font():
         return ImageFont.load_default()
 
 
-def draw_one_frame(frame_id: int, tile_w: int, tile_h: int, font,views=VIEWS, grid_h=GRID_H, grid_w=GRID_W,label_h=LABEL_H, scene_grid_w=SCENE_GRID_W, scene_grid_h=SCENE_GRID_H,fname_prefix="tile_lr_fr"):
+def draw_one_frame(frame_id: int, tile_w: int, tile_h: int, font,views=VIEWS, grid_h=GRID_H, grid_w=GRID_W,label_h=LABEL_H, scene_grid_w=SCENE_GRID_W, scene_grid_h=SCENE_GRID_H,fname_prefix="tile_lr_fr",suffix=""):
     canvas_w = grid_w * tile_w
     canvas_h = grid_h * (tile_h + label_h)
 
@@ -196,7 +197,7 @@ def draw_one_frame(frame_id: int, tile_w: int, tile_h: int, font,views=VIEWS, gr
             x = col * tile_w
             y = row * (tile_h + label_h)
 
-            p = image_path(data_file, side, scene_id, frame_id)
+            p = image_path(data_file, side, scene_id, frame_id,suffix=suffix)
             print(f"  {p} -> ({x},{y})")
             label = f"sc-{scene_id} {side} fr-{frame_id}"
 
@@ -289,6 +290,7 @@ def make_gif_with_ffmpeg(fname_prefix="tile_lr_fr",gif_output_path=GIF_PATH,gif_
         "-framerate", str(gif_fps),
         "-start_number", "2",
         "-i", input_pattern,
+        "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
         "-c:v", "libx264",
         "-pix_fmt", "yuv420p",
         str(mp4_output_path),
@@ -363,13 +365,16 @@ def main():
 
     if True:
         for frame_id in frame_ids_from_file:
-            draw_one_frame(frame_id, tile_w, tile_h, font,views = views_from_file)
+            draw_one_frame(frame_id, tile_w, tile_h, font,views = views_from_file,fname_prefix="tile_lr_fr",suffix="")
+        make_gif_with_ffmpeg(fname_prefix="tile_lr_fr", gif_output_path=GIF_PATH)
+        crop_top_left(GIF_PATH, BASE_DIR / f"tile_{x_value}x_crop4.gif", OUT_DIR,4)
 
-
-        make_gif_with_ffmpeg()
-
-        crop_top_left(GIF_PATH, BASE_DIR / f"tile_lr_fr002-037_hd_{x_value}x_crop4.gif", OUT_DIR,4)
-
+        for frame_id in frame_ids_from_file:
+            draw_one_frame(frame_id, tile_w, tile_h, font,views = views_from_file,fname_prefix="tile_lr_fr_medoid",suffix="_medoid")
+        make_gif_with_ffmpeg(fname_prefix="tile_lr_fr_medoid", gif_output_path=GIF_PATH.with_name(GIF_PATH.stem + "_medoid.gif")
+        )
+        crop_top_left(GIF_PATH.with_name(GIF_PATH.stem + "_medoid.gif"), BASE_DIR / f"tile_{x_value}x_crop4_medoid.gif", OUT_DIR,4)
+        
     if True:
         # plot best/worst
         sampled_batch_cd_path = csv_file_path
@@ -400,6 +405,14 @@ def main():
             draw_one_frame(frame_id, tile_w, tile_h, font, views=interleaved_views, grid_h=4, grid_w=4, label_h=LABEL_H, scene_grid_w=2, scene_grid_h=4,fname_prefix="tile_lr_fr_best_worst")
         
         make_gif_with_ffmpeg(fname_prefix="tile_lr_fr_best_worst", gif_output_path=BASE_DIR / f"tile_lr_fr_best_worst_hd_{x_value//2}x.gif", gif_width=GIF_WIDTH//2, gif_fps=GIF_FPS)
+
+
+        for frame_id in frame_ids_from_file:
+            draw_one_frame(frame_id, tile_w, tile_h, font, views=interleaved_views, grid_h=4, grid_w=4, label_h=LABEL_H, scene_grid_w=2, scene_grid_h=4,fname_prefix="tile_lr_fr_best_worst",suffix="_medoid")
+        
+        make_gif_with_ffmpeg(fname_prefix="tile_lr_fr_best_worst", gif_output_path=BASE_DIR / f"tile_lr_fr_best_worst_hd_{x_value//2}x_medoid.gif", gif_width=GIF_WIDTH//2, gif_fps=GIF_FPS)
+
+
 
 
 

@@ -286,6 +286,7 @@ def append_per_scene_eval_rows(
             "use_condition_pooling": getattr(args, "use_condition_pooling", False),
             "condition_pool_kernel": getattr(args, "condition_pool_kernel", None),
             "set_tx_dim": getattr(args, "set_tx_dim", None),
+            "density_weight": args.density_weight,
         }
 
         for k, v in stat.items():
@@ -403,6 +404,160 @@ def chamfer_xyz_with_matched_attrs(
     }
     return loss_dict
 
+def gt_sparsity_weights(
+    gt,
+    k=5,
+    gamma=1.0,
+    w_min=0.5,
+    w_max=3.0,
+):
+    """
+    gt: [B, N, D]
+    return: [B, N], mean ~= 1 per frame
+
+    Duplicate points caused by sampling-with-replacement are ignored
+    when estimating local sparsity.
+    """
+    gt_xyz = gt[..., :3]
+
+    with torch.no_grad():
+
+        # All pairwise squared distances: [B,N,N]
+        d2 = torch.cdist(gt_xyz, gt_xyz).square()
+
+        # Ignore self AND exact/near duplicates.
+        d2 = d2.masked_fill(d2 < 1e-12, float("inf"))
+
+        # k nearest distinct spatial neighbors
+        k_eff = min(k, gt_xyz.shape[1] - 1)
+        knn_d2 = torch.topk(
+            d2,
+            k=k_eff,
+            dim=-1,
+            largest=False,
+        ).values
+
+        d = torch.sqrt(knn_d2.clamp_min(1e-12))
+
+        # Handle pathological all-duplicate frame safely.
+        d = torch.where(
+            torch.isfinite(d),
+            d,
+            torch.zeros_like(d),
+        )
+
+        sparsity = d.mean(dim=-1)  # [B,N]
+
+        w = sparsity.pow(gamma)
+
+        w = w / (w.mean(dim=1, keepdim=True) + 1e-8)
+        w = w.clamp(w_min, w_max)
+        w = w / (w.mean(dim=1, keepdim=True) + 1e-8)
+
+    return w
+
+def density_weighted_chamfer_xyz(
+    pred,
+    gt,
+    k=5,
+    gamma=1.0,
+    w_min=0.5,
+    w_max=3.0,
+):
+    """
+    Density-aware XYZ Chamfer.
+
+    pred: [B, N, D]
+    gt:   [B, M, D]
+
+    Sparse GT points receive larger weight in the GT -> prediction term.
+
+    Local sparsity:
+        s_i = mean distance to k nearest GT neighbors
+
+    Weight:
+        w_i ~ s_i^gamma
+
+    Returns:
+        loss scalar
+        weight tensor [B, M]
+    """
+
+    pred_xyz = pred[..., :3]
+    gt_xyz = gt[..., :3]
+
+    B, M, _ = gt_xyz.shape
+    k_eff = min(k + 1, M)
+
+    # ---------------------------------------------------------
+    # 1. Density/sparsity weights from GT only.
+    #    No gradient needed here.
+    # ---------------------------------------------------------
+    with torch.no_grad():
+        gt_knn = knn_points(
+            gt_xyz,
+            gt_xyz,
+            K=k_eff,
+            return_nn=False,
+        )
+
+        # PyTorch3D distances are squared L2.
+        # [:, :, 0] is self, so remove it.
+        neighbor_dist = torch.sqrt(
+            gt_knn.dists[..., 1:].clamp_min(1e-12)
+        )
+
+        # [B, M]
+        sparsity = neighbor_dist.mean(dim=-1)
+
+        weights = sparsity.pow(gamma)
+
+        # Mean weight = 1 per frame.
+        weights = weights / (
+            weights.mean(dim=1, keepdim=True) + 1e-8
+        )
+
+        weights = weights.clamp(w_min, w_max)
+
+        # Re-normalize after clipping.
+        weights = weights / (
+            weights.mean(dim=1, keepdim=True) + 1e-8
+        )
+
+    # ---------------------------------------------------------
+    # 2. Prediction -> GT: ordinary Chamfer term.
+    #    Prevents hallucinated points.
+    # ---------------------------------------------------------
+    fwd = knn_points(
+        pred_xyz,
+        gt_xyz,
+        K=1,
+        return_nn=False,
+    )
+
+    pred_to_gt = fwd.dists[..., 0].mean()
+
+    # ---------------------------------------------------------
+    # 3. GT -> prediction: sparse GT regions get more weight.
+    # ---------------------------------------------------------
+    bwd = knn_points(
+        gt_xyz,
+        pred_xyz,
+        K=1,
+        return_nn=False,
+    )
+
+    gt_to_pred_d2 = bwd.dists[..., 0]   # [B, M]
+
+    gt_to_pred = (
+        (weights * gt_to_pred_d2).sum(dim=1)
+        / (weights.sum(dim=1) + 1e-8)
+    ).mean()
+
+    loss = pred_to_gt + gt_to_pred
+
+    return loss, weights
+
 def reconstruct_x0(pred_eps, x_t, t, scheduler, prediction_type):
     # return x0 and scale factor for epsilon to x0 conversion if applicable
     if prediction_type == "sample":
@@ -486,8 +641,14 @@ def make_run_id(args):
     clip_str = f"_clip{args.clip_until_step}" if args.clip_until_step != 0 else ""
 
     norm_str = f"" if args.norm_per_scene else "_trainnorm"
+
+    density_str = (
+        f"_dw{args.density_weight:1.3f}"
+        if args.density_weight > 0
+        else ""
+    )
         
-    out_id =  f"{args.model_name}{model_spec}_it{args.ddpm_iteration:09d}_{args.shape_name}{shape_spec}_train_sc{args.n_scene}_N{args.N}_B{args.B}_T{args.T}-{args.T_infer}_{args.prediction_type}-{args.sampler}{scale_eps2x0_str}_{args.cond_mode}{cond_spec}{wan_id}_weight{dop_rcs_loss_weight}_lmse{args.lambda_mse:1.3f}_lcd{args.lambda_cd:1.3f}{cd_spec}_sd{args.seed}_lr{args.lr:.1e}{lr_sche_str}{clip_str}{norm_str}"
+    out_id =  f"{args.model_name}{model_spec}_it{args.ddpm_iteration:09d}_{args.shape_name}{shape_spec}_train_sc{args.n_scene}_N{args.N}_B{args.B}_T{args.T}-{args.T_infer}_{args.prediction_type}-{args.sampler}{scale_eps2x0_str}_{args.cond_mode}{cond_spec}{wan_id}_weight{dop_rcs_loss_weight}_lmse{args.lambda_mse:1.3f}{density_str}_lcd{args.lambda_cd:1.3f}{cd_spec}_sd{args.seed}_lr{args.lr:.1e}{lr_sche_str}{clip_str}{norm_str}"
 
     
 
@@ -667,13 +828,26 @@ def parse_args():
         "--cd_mode",
         type=str,
         default="xyz_attr",
-        help="Chamfer Distance mode: 'xyz_attr' (use chamfer with attribute loss), 'cd5d' (treat doppler and rcs as extra dimensions in chamfer)",
+        help=(
+            "Chamfer mode: "
+            "'xyz_attr', 'cd5d', 'weighted', or "
+            "'density_xyz' (upweights spatially sparse GT XYZ points)"
+        ),
     )
     parser.add_argument(
         "--lambda_mse",
         type=float,
         default=1.0,
         help="Weight for the MSE loss term",
+    )
+    parser.add_argument(
+        "--density_weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Strength of sparsity-aware point weighting in MSE. "
+            "0=ordinary MSE, 1=full density weighting."
+        ),
     )
     parser.add_argument(
         "--prediction_type",
@@ -1136,7 +1310,7 @@ def compute_norm_stats_from_train(
     cond_absmax = torch.tensor(0.0, dtype=torch.float32)
 
     # First pass: means + cond absmax
-    for s in tqdm(range(0, n, chunk_size), desc="Norm stats pass 1"):
+    for s in tqdm(range(0, n, chunk_size), desc="compute_norm_stats_from_train pass 1"):
         idx = train_idx_sorted[s:s + chunk_size]
 
         x = x0sbn5_src[idx].float()
@@ -1171,7 +1345,7 @@ def compute_norm_stats_from_train(
     rcs_max_half_range = torch.tensor(0.0, dtype=torch.float32)
 
     # Second pass: max absolute centered value
-    for s in tqdm(range(0, n, chunk_size), desc="Norm stats pass 2"):
+    for s in tqdm(range(0, n, chunk_size), desc="compute_norm_stats_from_train pass 2"):
         idx = train_idx_sorted[s:s + chunk_size]
 
         x = x0sbn5_src[idx].float()
@@ -1231,7 +1405,7 @@ def eval_multi_batch(
     cd_mode="xyz_attr",
     prediction_type="epsilon",
     scale_eps2x0_conversion=False,collect_loss_stats=False,
-    clip_grad_norm=True
+    clip_grad_norm=True,density_weight=0.0,
 ):
     model.eval()
 
@@ -1268,7 +1442,7 @@ def eval_multi_batch(
                 idx_pool=idx_batch,
                 lr_scheduler=None,
                 collect_loss_stats=collect_loss_stats,
-                clip_grad_norm=clip_grad_norm
+                clip_grad_norm=clip_grad_norm,density_weight=density_weight,
             )
 
             for k, v in val_dict_i.items():
@@ -1350,7 +1524,8 @@ def train_eval_step(
     idx_pool=None,
     collect_loss_stats=False,
     lr_scheduler=None,
-    clip_grad_norm=True
+    clip_grad_norm=True,
+    density_weight=0.0,
 ):    
     time_recrod = TimeRecorder(insert_order=True, cuda_sync=True)
 
@@ -1448,8 +1623,43 @@ def train_eval_step(
 
         # time1 = time.time()
 
+        # diff2 = (pred - target).square()
+        # loss_mse_position_fast = diff2[..., :3].mean()
+
         diff2 = (pred - target).square()
-        loss_mse_position_fast = diff2[..., :3].mean()
+
+        if density_weight > 0:
+            raw_density_w = gt_sparsity_weights(
+                x0,
+                k=5,
+                gamma=1.0,
+                w_min=0.5,
+                w_max=3.0,
+            )
+
+            density_w = (
+                (1.0 - density_weight)
+                + density_weight * raw_density_w
+            )
+
+            xyz_mse_per_point = diff2[..., :3].mean(dim=-1)
+
+            loss_mse_position_fast = (
+                density_w * xyz_mse_per_point
+            ).mean()
+
+            if collect_loss_stats:
+                loss_dict["density_raw_min"] = float(raw_density_w.min().detach().cpu())
+                loss_dict["density_raw_mean"] = float(raw_density_w.mean().detach().cpu())
+                loss_dict["density_raw_max"] = float(raw_density_w.max().detach().cpu())
+
+                loss_dict["density_eff_min"] = float(density_w.min().detach().cpu())
+                loss_dict["density_eff_mean"] = float(density_w.mean().detach().cpu())
+                loss_dict["density_eff_max"] = float(density_w.max().detach().cpu())
+
+        else:
+            loss_mse_position_fast = diff2[..., :3].mean()
+
         if inout_dim > 3:
             loss_mse_doppler_fast = diff2[..., 3].mean()
             loss_mse_rcs_fast = diff2[..., 4].mean()
@@ -1525,14 +1735,49 @@ def train_eval_step(
             loss_dict["cd_3d_loss"] = cd_loss_dict["cd_xyz"].item()
             loss_dict["cd_doppler_loss"] = cd_loss_dict["doppler_attr_loss"].item()
             loss_dict["cd_rcs_loss"] = cd_loss_dict["rcs_attr_loss"].item()
-            cd_loss = ( loss_weights["position"]  * cd_loss_dict["cd_xyz"]
-                + loss_weights["doppler"]  * cd_loss_dict["doppler_attr_loss"]
+
+            cd_loss = (
+                loss_weights["position"] * cd_loss_dict["cd_xyz"]
+                + loss_weights["doppler"] * cd_loss_dict["doppler_attr_loss"]
                 + loss_weights["rcs"] * cd_loss_dict["rcs_attr_loss"]
-            )* lambda_cd 
-            loss += cd_loss 
+            ) * lambda_cd
+
+            loss += cd_loss
+
+
+        elif cd_mode == "density_xyz":
+
+            density_cd, density_w = density_weighted_chamfer_xyz(
+                x0_hat,
+                x0,
+                k=5,
+                gamma=1.0,
+                w_min=0.5,
+                w_max=3.0,
+            )
+
+            loss_dict["density_cd_loss"] = float(
+                density_cd.detach().cpu()
+            )
+
+            if collect_loss_stats:
+                loss_dict["density_w_min"] = float(
+                    density_w.min().detach().cpu()
+                )
+                loss_dict["density_w_mean"] = float(
+                    density_w.mean().detach().cpu()
+                )
+                loss_dict["density_w_max"] = float(
+                    density_w.max().detach().cpu()
+                )
+
+            loss += lambda_cd * density_cd
+
+
         elif cd_mode in ["cd5d", "weighted"]:
             x0_hat_cd = x0_hat
             x0_cd = x0
+
             if cd_mode == "weighted":
                 assert inout_dim == 5, f"weighted_5d expects 5D points, got inout_dim={inout_dim}"
                 w = torch.tensor(
@@ -1694,6 +1939,7 @@ def append_per_frame_eval_rows(
             "lambda_cd": args.lambda_cd,
             "lambda_mse": args.lambda_mse,
             "set_tx_dim": getattr(args, "set_tx_dim", None),
+            "density_weight": args.density_weight,
         }
 
         for k, v in stat.items():
@@ -1832,6 +2078,7 @@ class LazyNpyArray:
     
 if __name__ == "__main__":
     args = parse_args()
+    assert 0.0 <= args.density_weight <= 1.0, "--density_weight should be in [0,1]"
     # Example setup
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -2293,7 +2540,7 @@ if __name__ == "__main__":
             idx_pool=train_idx_batch,
             collect_loss_stats=(step % log_train_every == 0),
             lr_scheduler=lr_scheduler,
-            clip_grad_norm=args.clip_until_step ==0 or step < args.clip_until_step
+            clip_grad_norm=args.clip_until_step ==0 or step < args.clip_until_step,density_weight=args.density_weight,
         )
 
         time_record.record("train_eval_step")
@@ -2449,7 +2696,7 @@ if __name__ == "__main__":
                             summary_row.update({
                                 "n_selected_frames": int(selected_idx.numel()),
                                 "selected_idx_min": int(selected_idx.min().item()),
-                                "selected_idx_max": int(selected_idx.max().item()),
+                                "selected_idx_max": int(selected_idx.max().item()),"density_weight": args.density_weight,
                             })
                             for k, v in point_stat_output.items():
                                 if isinstance(v, torch.Tensor):
@@ -2560,7 +2807,7 @@ if __name__ == "__main__":
                 prediction_type=args.prediction_type,
                 collect_loss_stats=True,
                 scale_eps2x0_conversion=args.scale_eps2x0_conversion,
-                clip_grad_norm= args.clip_until_step ==0 or step < args.clip_until_step
+                clip_grad_norm= args.clip_until_step ==0 or step < args.clip_until_step,density_weight=args.density_weight,
             )
 
             logger.log_val(step, val_dict, log_group=False)
