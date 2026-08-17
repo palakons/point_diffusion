@@ -466,6 +466,15 @@ def parse_args():
         default=1,
         help="Sigma for Gaussian smoothing of multi-sample density plots. in meters. Only used if --n_multi > 1.",
     )
+    parser.add_argument(
+        "--density_weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Strength of sparsity-aware point weighting in MSE. "
+            "0=ordinary MSE, 1=full density weighting."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -1256,7 +1265,7 @@ if __name__ == "__main__":
                     pred_multi_all.append(pred_i)
             print(f"pred_all, cond_used_all shapes: {pred_all.shape}, {cond_used_all.shape if cond_used_all is not None else None}, eval_idx_pool numel: {eval_idx_pool.numel()}")
                 
-            
+            pred_export = {}
             for eval_i, (
                 frame_token,
                 scene_id,
@@ -1337,7 +1346,16 @@ if __name__ == "__main__":
                         # plot medoid   
                         plot_combo(image_rgb_path,pred_medoid,gt_unnormed,save_path.replace('.png', '_medoid.png'),title, split_bottom=True,pred_multi=None,sigma_m=args.plot_sigma_m)
                         # plot_combo(image_rgb_path,pred_unnormed,gt_unnormed,save_path.replace('.png', '_notsplit.png'),title, split_bottom=False)
-                        
+
+                        # print(f"shape of pred_unnorm {pred_unnormed.shape}, gt_unnorm {gt_unnormed.shape}, pred_medoid {pred_medoid.shape}, medoid_idx {medoid_idx}") #shape of pred_unnorm torch.Size([128, 3]), gt_unnorm torch.Size([128, 5]), pred_medoid torch.Size([128, 3]), medoid_idx 9
+
+                        pred_export[frame_token] = {
+                            "pred_xyz_camera": pred_medoid[:, :3].cpu().numpy(),
+                            "sensor_side": sensor_side,
+                            "scene_id": scene_id,
+                            "frame_index": frame_index,
+                        }
+                     
 
                 pointset_error_stat = calculate_pointset_stat(pred_unnormed.unsqueeze(0), gt_unnormed.unsqueeze(0))
                 pointset_error_stat.update({
@@ -1354,7 +1372,12 @@ if __name__ == "__main__":
                 #save csv
                 sampled_batch_cd_df = pd.DataFrame(per_frame_cds)
                 sampled_batch_cd_df.to_csv(sampled_batch_cd_path, index=False)
-                
+
+            with open(
+                os.path.join(inference_dir, f"rerun_predictions_{c_name}.pkl"),
+                "wb",
+            ) as f:
+                pickle.dump(pred_export, f)   
 
         print(f"Saved per-frame Chamfer distances to {sampled_batch_cd_path}")
 
