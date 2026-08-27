@@ -1,7 +1,6 @@
 
 import sys,math
 
-from altair import condition
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -57,7 +56,7 @@ class FullSetTransformerBlock(nn.Module):
             self.film1 = FiLM(dim, context_dim)
 
         if self.cond_type in ["xattn", "film-xattn"]:
-            print(f"make xattn block with context_dim {context_dim} and num_heads {num_heads}")
+            # print(f"make xattn block with context_dim {context_dim} and num_heads {num_heads}")
             self.norm_cross = nn.LayerNorm(dim)
             self.cross_attn = nn.MultiheadAttention(embed_dim=dim, num_heads=num_heads, dropout=dropout, batch_first=True)
 
@@ -170,6 +169,14 @@ class FullSetTransformerDenoiser(nn.Module):
             nn.SiLU(),
             nn.Linear(dim, dim),
         )
+        assert dim % num_heads == 0, (
+            f"dim={dim} must be divisible by "
+            f"num_heads={num_heads}"
+        )
+
+        assert num_layers >= 1
+        assert mlp_ratio >= 1
+        assert condition_pool_kernel >= 1
         if self.cond_type in ["film", "film-xattn"]:
             # Backward compatibility: flatten the entire WAN latent into a single vector
             # wan_dim = math.prod(wan_shape)
@@ -188,6 +195,7 @@ class FullSetTransformerDenoiser(nn.Module):
                 nn.Linear(wan_hidden, dim),
                 nn.LayerNorm(dim),
             )
+
         if self.cond_type in ["xattn", "film-xattn"]:
             # For cross-attention: process tokens from the WAN latent space.
             wan_token_dim = wan_shape[0] * wan_shape[1] if len(wan_shape) >= 2 else math.prod(wan_shape)
@@ -216,6 +224,7 @@ class FullSetTransformerDenoiser(nn.Module):
             nn.GELU(),
             nn.Linear(dim, dim),
         )
+        print(f"make {num_layers} FullSetTransformerBlock with dim={dim}, context_dim={dim}, num_heads={num_heads}, dropout={dropout}, cond_type={cond_type}, mlp_ratio={mlp_ratio}")
         self.blocks = nn.ModuleList(
             [
                 FullSetTransformerBlock(
@@ -266,19 +275,112 @@ class FullSetTransformerDenoiser(nn.Module):
         x: [B, N, 3]
         """
         B, N, C = x.shape
+        assert C == self.in_channels, (
+            f"Expected input channels={self.in_channels}, "
+            f"got x.shape={x.shape}"
+        )
+
+        assert t.shape == (B,), (
+            f"Expected t shape [{B}], got {t.shape}"
+        )
+
+        assert torch.isfinite(x).all()
         # assert C == 3, f"Expected x [B,N,3], got {x.shape}"
         # xyz as the point feature
         # trace_tensor("input_x", x)
         # trace_tensor("input_t", t)
         # trace_tensor("input_condition", condition)
-        h = self.xyz_proj(x)
-        # timestep context
-        t_context = self.time_mlp(self.time_emb(t.to(x.device)))
-        # WAN condition context #shape [16, 2, 60, 104] -> flatten to [B, wan_dim]
-        context = t_context
-        cross_context = None
+        if False: #bug
+            h = self.xyz_proj(x)
+            # timestep context
+            t_context = self.time_mlp(self.time_emb(t.to(x.device)))
+            # WAN condition context #shape [16, 2, 60, 104] -> flatten to [B, wan_dim]
+            context = t_context
+            cross_context = None
+        else:
+            # ---------------------------------------------------------
+            # 1. Embed the noisy radar points.
+            #
+            # h: [B, N, dim]
+            # ---------------------------------------------------------
+            h = self.xyz_proj(x)
+
+
+            # ---------------------------------------------------------
+            # 2. Embed the diffusion timestep.
+            #
+            # t:         [B]
+            # time_emb:  [B, time_dim]
+            # t_context: [B, dim]
+            #
+            # IMPORTANT:
+            # For xattn-only conditioning, `context` is NOT consumed by
+            # the transformer blocks because FiLM is disabled.
+            #
+            # Therefore, without the explicit addition below, the xattn
+            # model has no information about which diffusion timestep t
+            # it is denoising.
+            # ---------------------------------------------------------
+            t_context = self.time_mlp(
+                self.time_emb(t.to(x.device))
+            )
+
+
+            # ---------------------------------------------------------
+            # 3. Inject timestep information directly into every point.
+            #
+            # The same timestep embedding is broadcast to all N points:
+            #
+            #     [B, dim] -> [B, 1, dim] -> broadcast over N
+            #
+            # This preserves permutation equivariance because every point
+            # in the set receives the same frame-level timestep embedding.
+            #
+            # Do this for xattn-only models because they do not use FiLM.
+            #
+            # "none" is included as well because otherwise an unconditional
+            # model would also have no timestep information.
+            # ---------------------------------------------------------
+            if self.cond_type in ["xattn", "none"]:
+                h = h + t_context[:, None, :]
+
+
+            # ---------------------------------------------------------
+            # FiLM models already consume t_context through `context`.
+            # Keep that behavior unchanged.
+            # ---------------------------------------------------------
+            context = t_context
+
+            cross_context = None
+        if False:
+            print(
+                "xattn timestep injection:",
+                "t=", t[:4],
+                "t_context mean=", t_context.mean().item(),
+                "t_context std=", t_context.std().item(),
+                "h mean=", h.mean().item(),
+                "h std=", h.std().item(),
+            )
+            exit()
         #if all are zeros in condition, set to None
         if condition is not None:
+
+            if self.cond_type in ["xattn", "film-xattn"]:
+                assert condition is not None, (
+                    f"{self.cond_type} requires condition"
+                )
+
+                assert condition.ndim == 5, (
+                    f"Expected WAN [B,C,F,H,W], "
+                    f"got {condition.shape}"
+                )
+
+                assert tuple(condition.shape[1:]) == tuple(self.wan_shape), (
+                    f"WAN condition shape mismatch: "
+                    f"expected {self.wan_shape}, "
+                    f"got {tuple(condition.shape[1:])}"
+                )
+
             if self.cond_type in ["film", "film-xattn"]:
                 # wan_film = condition.to(x.device).view(B, -1)
                 # wan_context_film = self.wan_mlp_film(wan_film)
@@ -808,13 +910,13 @@ def make_model( device, args):
             in_channels=inout_dim,
             dim =dim,
             time_dim=256,
-            num_layers=5,
+            num_layers=args.set_tx_num_layers,
             num_heads=8,
             dropout=0.,
             out_channels=inout_dim,
             wan_shape=wan_shape,
             cond_type=set_cond_type ,
-            mlp_ratio=4,
+            mlp_ratio=args.set_tx_mlp_ratio,
             use_condition_pooling=args.use_condition_pooling,
             condition_pool_kernel=args.condition_pool_kernel,
             use_wan_pos_emb=args.use_wan_pos_emb,

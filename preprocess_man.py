@@ -4,7 +4,7 @@ import torch
 import os
 import numpy as np
 import pickle
-from io_dataset import normalize_data,make_man_pc
+from io_dataset import normalize_data,make_man_pc,make_cache_fname
 # from fitone_dfs_cond_log import parse_args
 from tqdm import trange
 from truckscenes import TruckScenes
@@ -273,6 +273,29 @@ def parse_args():
         choices=["radar", "camera"],
         help="Coordinate frame used as the diffusion target.",
     )
+    parser.add_argument(
+        "--persistence_weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Strength of temporal-persistence weighting in MSE. "
+            "0=disabled, 1=full persistence weighting."
+        ),
+    )
+    parser.add_argument(
+        "--persistence_k_native",
+        type=int,
+        default=2,
+    )
+    parser.add_argument(
+        "--persistence_sigma",
+        type=float,
+        default=1.0,
+        help=(
+            "Gaussian spatial bandwidth in meters for "
+            "native-radar temporal persistence."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -329,10 +352,28 @@ if __name__ == "__main__":
     )
     print("VAE loaded successfully.")
 
+    assert args.data_file in ["man-mini", "man-full"], f"Invalid data file: {args.data_file}"
+
     for sc_id in trange(args.from_scene_id,min(args.from_scene_id + args.num_scenes, total_scenes), desc="Processing scenes", total=min(args.num_scenes, total_scenes - args.from_scene_id)):
 
          
-        cache_fname = f"man_{args.data_file}_{sc_id}{f'_right' if args.sensor_side =='right' else ''}{'_cameraxyz' if args.coord_frame == 'camera' else ''}_{args.cond_method}_{args.N}_{args.cond_mode}_{args.wan_frames}_{args.wan_frame_mode}_{args.wan_frame_stride}_{args.wan_edge_policy}{'_unnorm' if args.output_unnormalized else ''}.pkl"
+        # cache_fname_old = (
+        #     f"man_{args.data_file}_{sc_id}"
+        #     f"{'_right' if args.sensor_side == 'right' else ''}"
+        #     f"{'_cameraxyz' if args.coord_frame == 'camera' else ''}"
+        #     f"_{args.cond_method}_{args.N}"
+        #     f"_{args.cond_mode}"
+        #     f"_{args.wan_frames}"
+        #     f"_{args.wan_frame_mode}"
+        #     f"_{args.wan_frame_stride}"
+        #     f"_{args.wan_edge_policy}"
+        #     f"{persistence_tag}"
+        #     f"{'_unnorm' if args.output_unnormalized else ''}"
+        #     f".pkl"
+        # )
+        cache_fname = make_cache_fname(args, sc_id)
+        # assert cache_fname == cache_fname_old, f"Cache filename mismatch: {cache_fname} != {cache_fname_old}. Please check the make_cache_fname function."
+
         cache_path = os.path.join(checkpoint_dir, cache_fname)
         print(f"Processing scene {sc_id} with cache path: {cache_path}")
 
@@ -341,6 +382,16 @@ if __name__ == "__main__":
             print(f"Cache file {cache_path} already exists. Loading from cache.")
             loaded_data = pickle.load(open(cache_path, "rb"))
             mands, frame_ids_loaded = loaded_data
+            assert len(mands) == 5, (
+                f"Expected new 5-item cache, "
+                f"got {len(mands)} items in {cache_path}"
+            )
+
+            if args.persistence_weight >0 :
+                assert mands[4] is not None, (
+                    f"Persistence requested but absent: "
+                    f"{cache_path}"
+                )
             print(f"shapes of loaded mands: {[m.shape if m is not None else None for m in mands]} len(frame_ids_loaded['token']): {len(frame_ids_loaded['token'])}") # should be [n_scene, num_points, 3]
             all_32 =True
             for a in frame_ids_loaded['token']:
@@ -356,19 +407,39 @@ if __name__ == "__main__":
             # try:   
             if True: 
                 mands_org = make_man_pc(
-                    num_points=args.N,scene_ids= [sc_id],
+                    num_points=args.N,
+                    scene_ids=[sc_id],
                     n_scene=40,
                     is_dense=True,
                     device=device,
                     data_file=args.data_file,
                     wan_spec=wan_spec,
                     get_wan_cond=True,
-                    # get_wan_cond=False,
-                    radar_channel = "RADAR_LEFT_FRONT" if args.sensor_side == "left" else "RADAR_RIGHT_FRONT",
-                    camera_channel = "CAMERA_LEFT_FRONT" if args.sensor_side == "left" else "CAMERA_RIGHT_FRONT",
-                    trucksc= tc_mini if args.data_file == "man-mini" else tc_full   ,
-                    wan_vae21_object = wan_vae21_object ,
+
+                    radar_channel=(
+                        "RADAR_LEFT_FRONT"
+                        if args.sensor_side == "left"
+                        else "RADAR_RIGHT_FRONT"
+                    ),
+
+                    camera_channel=(
+                        "CAMERA_LEFT_FRONT"
+                        if args.sensor_side == "left"
+                        else "CAMERA_RIGHT_FRONT"
+                    ),
+
+                    trucksc=(
+                        tc_mini
+                        if args.data_file == "man-mini"
+                        else tc_full
+                    ),
+
+                    wan_vae21_object=wan_vae21_object,
                     coord_frame=args.coord_frame,
+
+                    get_persistence=args.persistence_weight>0,
+                    persistence_k_native=args.persistence_k_native,
+                    persistence_sigma=args.persistence_sigma,
                 )
             # except Exception as e:
             #     print(f"Error processing scene {sc_id} {args.data_file} {args.sensor_side}: {e}. Skipping this scene.")
@@ -376,13 +447,35 @@ if __name__ == "__main__":
 
 
             frame_ids = {'token':[mands_org[2][i]['frame_token'] for i in range(len(mands_org[0]))],"scene_id":[mands_org[2][i]['scene_id'] for i in range(len(mands_org[0]))],"frame_index":[mands_org[2][i]['frame_index'] for i in range(len(mands_org[0]))]} 
-            mands = [mands_org[0], mands_org[1], torch.norm(mands_org[3], p=2, dim=-1, keepdim=True), mands_org[4]] #xyz, wan_cond, doppler, rcs
+            mands = [
+                mands_org[0],  # xyz
+                mands_org[1],  # WAN condition
+
+                torch.norm(
+                    mands_org[3],
+                    p=2,
+                    dim=-1,
+                    keepdim=True,
+                ),             # Doppler magnitude
+
+                mands_org[4],  # RCS
+                mands_org[5],  # persistence [F,N] or None
+            ]
+            if args.persistence_weight>0:
+                assert mands[4] is not None
+                assert mands[4].shape == mands[0].shape[:2]
+
+                assert torch.isfinite(mands[4]).all()
+                assert (mands[4] >= 0).all()
+                assert (mands[4] <= 1).all()
+            else:
+                assert mands[4] is None
             
             for i in range(len(mands)):
                 data_i = mands[i]
                 print(
                     f" --- {args.coord_frame} {i} "
-                    f"shape={tuple(data_i.shape)} "
+                    f"shape={tuple(data_i.shape) if data_i is not None else None} "
                         # f"mean={data_i.mean(dim=(0, 1))} "
                         # f"min={data_i.amin(dim=(0, 1))} "
                         # f"max={data_i.amax(dim=(0, 1))}"
@@ -430,7 +523,11 @@ if __name__ == "__main__":
                 elif args.cond_method == 'scene_id': #actually frame_id
                     mands[1] = ((torch.arange(0, total_scenes_num, device='cpu').float() / total_scenes_num)*2-1).unsqueeze(1)  # [n_scene], normalized to [-1,1]
                         
-            for i, name in enumerate(["xyz", "wan_cond", "doppler","rcs"]): #assume no None
+            for i, name in enumerate(["xyz", "wan_cond", "doppler","rcs","persistence"]): #assume no None
+
+
+                if mands[i] is None:
+                    continue
                 # print(f"{name} {i}  shape: {mands[i].shape}, dtype: {mands[i].dtype}, device: {mands[i].device}") 
                 mands[i] = mands[i].cpu()
                 # print(f"{name} {i}  shape: {mands[i].shape}, dtype: {mands[i].dtype}, device: {mands[i].device}")  #must be on cpu for the following preprocessing steps to save GPU memory??
@@ -465,9 +562,53 @@ if __name__ == "__main__":
                 if not args.output_unnormalized:
                     mands[idx] =updated_data 
 
+            if mands[4] is not None and mands[4].shape[0]>0 :
+
+                p = mands[4]
+
+                print(
+                    "Persistence:",
+                    "shape=", tuple(p.shape),
+                    "min=", p.min().item(),
+                    "mean=", p.mean().item(),
+                    "max=", p.max().item(),
+                )
+
+                q = torch.quantile(
+                    p.flatten(),
+                    torch.tensor(
+                        [
+                            0.0,
+                            0.1,
+                            0.25,
+                            0.5,
+                            0.75,
+                            0.9,
+                            1.0,
+                        ]
+                    ),
+                )
+
+                print(
+                    "Persistence quantiles:",
+                    q.tolist(),
+                )
+
+            assert mands[4] is None or (
+                mands[4].shape[0]
+                == mands[0].shape[0]
+            )
+
+            assert mands[4] is None or (
+                mands[4].shape[1]
+                == mands[0].shape[1]
+            )
+                
             with open(cache_path, "wb") as f:            
                 pickle.dump([ mands,frame_ids], f)
-            for i, name in enumerate(["xyz", "wan_cond", "doppler","rcs"]): #assume no None
+            for i, name in enumerate(["xyz", "wan_cond", "doppler","rcs", "persistence"]): #assume no None
+                if mands[i] is None:
+                    continue
                 print(f"{name} {i}  shape: {mands[i].shape}, dtype: {mands[i].dtype}, device: {mands[i].device}")
             for key in frame_ids:
                 print(f"frame_ids[{key}] length: {len(frame_ids[key])}")

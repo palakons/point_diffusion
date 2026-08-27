@@ -22,7 +22,7 @@ from plot_utils import plot_pc_batch, azm_easing, calculate_pointset_stat
 from io_dataset import (
     normalize_data, #will need this
     load_checkpoint,
-    save_checkpoint,
+    save_checkpoint,make_cache_fname
 )
 def find_nn_cond_exact_chunked(cond_b, cond_all, train_idx_pool=None, train_chunk=32):
     """
@@ -342,6 +342,7 @@ def check_tensor(name, x):
         "max=", x.max().item() if x.numel() else None,
         "nan=", torch.isnan(x).any().item() if x.is_floating_point() else False,
     )
+    
 def chamfer_xyz_with_matched_attrs(
     pred,
     gt,
@@ -350,25 +351,24 @@ def chamfer_xyz_with_matched_attrs(
     """
     pred: [B, N, 5] = x,y,z,doppler,rcs
     gt:   [B, M, 5]
-    Computes:
-    - Chamfer Distance using xyz only
-    - Doppler/RCS loss using xyz nearest-neighbor matching
-    Returns:
-        total_attr_loss, loss_dict
     """
     pred_xyz = pred[..., :3]
     gt_xyz = gt[..., :3]
+
     # Forward NN: each pred point -> nearest GT point
-    # dists: [B, N, 1], idx: [B, N, 1]
     fwd = knn_points(pred_xyz, gt_xyz, K=1, return_nn=False)
     fwd_dists = fwd.dists[..., 0]  # [B, N]
-    fwd_idx = fwd.idx[..., 0]  # [B, N]
+    fwd_idx = fwd.idx[..., 0]      # [B, N]
+
     # Backward NN: each GT point -> nearest pred point
     bwd = knn_points(gt_xyz, pred_xyz, K=1, return_nn=False)
     bwd_dists = bwd.dists[..., 0]  # [B, M]
-    bwd_idx = bwd.idx[..., 0]  # [B, M]
-    # Chamfer xyz, symmetric
-    cd_xyz = fwd_dists.mean() + bwd_dists.mean()
+    bwd_idx = bwd.idx[..., 0]      # [B, M]
+
+    pred_to_gt = fwd_dists.mean()
+    gt_to_pred = bwd_dists.mean()
+    cd_xyz = pred_to_gt + gt_to_pred
+
     # Gather GT attributes matched to each predicted point
     B, N, D = pred.shape
     batch_idx = torch.arange(B, device=pred.device)[:, None]
@@ -382,7 +382,6 @@ def chamfer_xyz_with_matched_attrs(
         gt_matched_to_pred[..., 4:5],
     )
     if bidirectional_attr:
-        # Also compare each GT point to nearest predicted point
         pred_matched_to_gt = pred[batch_idx, bwd_idx]  # [B, M, 5]
         doppler_bwd = F.mse_loss(
             pred_matched_to_gt[..., 3:4],
@@ -397,8 +396,11 @@ def chamfer_xyz_with_matched_attrs(
     else:
         doppler_loss = doppler_fwd
         rcs_loss = rcs_fwd
+
     loss_dict = {
         "cd_xyz": cd_xyz,
+        "pred_to_gt_cd_xyz": pred_to_gt,
+        "gt_to_pred_cd_xyz": gt_to_pred,
         "doppler_attr_loss": doppler_loss,
         "rcs_attr_loss": rcs_loss,
     }
@@ -588,15 +590,20 @@ def make_run_id(args):
         else ""
     )
 
-    model_spec = f"_dim{args.set_tx_dim}" if args.model_name == "SetTxDnsr" else ""
     if args.model_name == "SetTxDnsr":
+        model_spec = f"_dim{args.set_tx_dim}" if args.model_name == "SetTxDnsr" else ""
+        if args.set_tx_num_layers != 5:
+            model_spec += f"_nl{args.set_tx_num_layers}"
+        if args.set_tx_mlp_ratio != 4:
+            model_spec += f"_mlpr{args.set_tx_mlp_ratio}"
         if args.set_cond_type != "film":
             model_spec += f"_{args.set_cond_type}"
         if args.use_condition_pooling:
             model_spec += f"_pool_k{args.condition_pool_kernel}"
         if args.use_wan_pos_emb:
             model_spec += "_wanpe"
-
+    else:   
+        raise NotImplementedError(f"Not implemented for model {args.model_name}")
     shape_spec =""
     if args.shape_name.startswith("man_"):
         shape_spec = f"_{args.data_file}_side{args.sensor_side}"
@@ -647,8 +654,16 @@ def make_run_id(args):
         if args.density_weight > 0
         else ""
     )
+
+    persistence_str = (
+        f"_pw{args.persistence_weight:.3f}"
+        f"_pk{args.persistence_k_native}"
+        f"_psig{args.persistence_sigma:g}"
+        if args.persistence_weight > 0
+        else ""
+    )
         
-    out_id =  f"{args.model_name}{model_spec}_it{args.ddpm_iteration:09d}_{args.shape_name}{shape_spec}_train_sc{args.n_scene}_N{args.N}_B{args.B}_T{args.T}-{args.T_infer}_{args.prediction_type}-{args.sampler}{scale_eps2x0_str}_{args.cond_mode}{cond_spec}{wan_id}_weight{dop_rcs_loss_weight}_lmse{args.lambda_mse:1.3f}{density_str}_lcd{args.lambda_cd:1.3f}{cd_spec}_sd{args.seed}_lr{args.lr:.1e}{lr_sche_str}{clip_str}{norm_str}"
+    out_id =  f"{args.model_name}{model_spec}_it{args.ddpm_iteration:09d}_{args.shape_name}{shape_spec}_train_sc{args.n_scene}_N{args.N}_B{args.B}_T{args.T}-{args.T_infer}_{args.prediction_type}-{args.sampler}{scale_eps2x0_str}_{args.cond_mode}{cond_spec}{wan_id}_weight{dop_rcs_loss_weight}_lmse{args.lambda_mse:1.3f}{density_str}{persistence_str}_lcd{args.lambda_cd:1.3f}{cd_spec}_sd{args.seed}_lr{args.lr:.1e}{lr_sche_str}{clip_str}{norm_str}_corrected-time"
 
     
 
@@ -684,21 +699,62 @@ def p_sample_loop(
     if condition is not None:
         condition = condition.to(device)
     # print(f"loop")
-    try:
-        for t_step in tqdm(scheduler.timesteps, desc="p_sample_loop", leave=False):
-            # print(f"make tensor")
-            t_tensor = torch.full((B,), t_step.item(), device=device, dtype=torch.long)
-            # print(f"model pred")
-            model_output = model(x, t_tensor, condition=condition)
-            # print(f"step")
-            x = scheduler.step(model_output, t_step, x).prev_sample
-    except Exception as e:
-        print(f"Exception in p_sample_loop: {e}")
-        print(f"shaps at exception: x {x.shape}, t_tensor {t_tensor.shape}, condition {condition.shape if condition is not None else None}")
-    finally:
-        model.train(prev_mode)
-    return x
 
+    if False:
+        try:
+            for t_step in tqdm(scheduler.timesteps, desc="p_sample_loop", leave=False):
+                # print(f"make tensor")
+                t_tensor = torch.full((B,), t_step.item(), device=device, dtype=torch.long)
+                # print(f"model pred")
+                model_output = model(x, t_tensor, condition=condition)
+                # print(f"step")
+                x = scheduler.step(model_output, t_step, x).prev_sample
+        except Exception as e:
+            print(f"Exception in p_sample_loop: {e}")
+            print(f"shaps at exception: x {x.shape}, t_tensor {t_tensor.shape}, condition {condition.shape if condition is not None else None}")
+        finally:
+            model.train(prev_mode)
+        return x
+    else:
+        try:
+            for t_step in tqdm(
+                scheduler.timesteps,
+                desc="p_sample_loop",
+                leave=False,
+            ):
+                t_tensor = torch.full(
+                    (B,),
+                    t_step.item(),
+                    device=device,
+                    dtype=torch.long,
+                )
+
+                model_output = model(
+                    x,
+                    t_tensor,
+                    condition=condition,
+                )
+
+                x = scheduler.step(
+                    model_output,
+                    t_step,
+                    x,
+                ).prev_sample
+
+        except Exception as e:
+            print(f"Exception in p_sample_loop: {e}")
+            print(
+                f"x={x.shape}, "
+                f"t={t_tensor.shape}, "
+                f"condition="
+                f"{condition.shape if condition is not None else None}"
+            )
+            raise  # IMPORTANT: do not silently return broken samples
+
+        finally:
+            model.train(prev_mode)
+
+        return x
 def parse_args():
     import argparse
 
@@ -910,6 +966,18 @@ def parse_args():
         help="Dimension of the Set Transformer features in the SetTxDnsr model",
     )
     parser.add_argument(
+        "--set_tx_num_layers",
+        type=int,
+        default=5,
+        help="Number of layers in the Set Transformer in the SetTxDnsr model",
+    )
+    parser.add_argument(
+        "--set_tx_mlp_ratio",
+        type=int,
+        default=4,
+        help="MLP ratio for the Set Transformer in the SetTxDnsr model",
+    )
+    parser.add_argument(
         "--use_condition_pooling",
         action="store_true",
         help="Pool WAN condition spatially before FiLM/XAttn conditioning.",
@@ -1036,6 +1104,48 @@ def parse_args():
         choices=["radar", "camera"],
         help="Coordinate frame used as the diffusion target.",
     )
+    parser.add_argument(
+        "--n_multi",
+        type=int,
+        default=1,
+        help="Number of stochastic generation passes for uncertainty visualization.",
+    )
+
+    parser.add_argument(
+        "--eval_scene_id",
+        type=int,
+        default=-1,
+        help="If >=0, restrict evaluation to this scene_id.",
+    )
+    parser.add_argument(
+        "--plot_sigma_m",
+        type=float,
+        default=1,
+        help="Sigma for Gaussian smoothing of multi-sample density plots. in meters. Only used if --n_multi > 1.",
+    )
+    parser.add_argument(
+        "--persistence_weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Strength of temporal persistence weighting. "
+            "0 disables it, 1 uses persistence directly."
+        ),
+    )
+
+    parser.add_argument(
+        "--persistence_k_native",
+        type=int,
+        default=2,
+    )
+
+    parser.add_argument(
+        "--persistence_sigma",
+        type=float,
+        default=1.0,
+        help="Persistence Gaussian bandwidth in meters.",
+    )
+
     args = parser.parse_args()
 
     return args
@@ -1196,11 +1306,9 @@ def gather_man_ds(args, checkpoint_dir):
         cond_string = f"{args.cond_mode}_{args.wan_frames}_{args.wan_frame_mode}_{args.wan_frame_stride}_{args.wan_edge_policy}"
     elif args.cond_method == "none": #get "wan", then set to None
         cond_method = "wan"
-        cond_string = f"{args.cond_mode}_{args.wan_frames}_{args.wan_frame_mode}_{args.wan_frame_stride}_{args.wan_edge_policy}"
-
         cond_string = f"pdnorm_only_5_center_1_skip"
     
-    x0sbn3_all, cond_all, doppler_all, rcs_all = [], [], [], []
+    x0sbn3_all, cond_all, doppler_all, rcs_all, persistence_all = [], [], [], [], []
     frame_ids_all = {'token':[],"scene_id":[],"frame_index":[],"data_file":[],"sensor_side":[]}
     data_files = ['man-mini',"man-full"] if args.data_file == 'both' else [args.data_file]
     missing_files = {}
@@ -1210,9 +1318,10 @@ def gather_man_ds(args, checkpoint_dir):
         for sc_id in sc_ids:
             sensor_sides = ["left", "right"] if args.sensor_side == "both" else [args.sensor_side]
             for sensor_side in sensor_sides:
-                side_str = "" if sensor_side == "left" else f"_{sensor_side}"
+                # side_str = "" if sensor_side == "left" else f"_{sensor_side}"
                 # cache_fname = f"man_{data_file}_{sc_id}{side_str}_{cond_method}_{args.N}_{cond_string}.pkl"
-                cache_fname = f"man_{data_file}_{sc_id}{side_str}{'_cameraxyz' if args.coord_frame == 'camera' else ''}_{cond_method}_{args.N}_{cond_string}_unnorm.pkl"
+                cache_fname = make_cache_fname(args, sc_id,data_file=data_file, sensor_side=sensor_side)
+                # cache_fname = f"man_{data_file}_{sc_id}{side_str}{'_cameraxyz' if args.coord_frame == 'camera' else ''}_{cond_method}_{args.N}_{cond_string}_unnorm.pkl"
                 cache_path = os.path.join(checkpoint_dir, cache_fname)
                 if not os.path.exists(cache_path):
                     if data_file not in missing_files:
@@ -1232,14 +1341,15 @@ def gather_man_ds(args, checkpoint_dir):
         for sc_id in tqdm(sc_ids, desc=f"Loading data for {data_file}", leave=False):
             sensor_sides = ["left", "right"] if args.sensor_side == "both" else [args.sensor_side]
             for sensor_side in sensor_sides:
-                side_str = "" if sensor_side == "left" else f"_{sensor_side}"
+                # side_str = "" if sensor_side == "left" else f"_{sensor_side}"
                 # cache_fname = f"man_{data_file}_{sc_id}{side_str}_{cond_method}_{args.N}_{cond_string}.pkl"
-                cache_fname = f"man_{data_file}_{sc_id}{side_str}{'_cameraxyz' if args.coord_frame == 'camera' else ''}_{cond_method}_{args.N}_{cond_string}_unnorm.pkl"
+                # cache_fname = f"man_{data_file}_{sc_id}{side_str}{'_cameraxyz' if args.coord_frame == 'camera' else ''}_{cond_method}_{args.N}_{cond_string}_unnorm.pkl"
+                cache_fname = make_cache_fname(args, sc_id ,data_file=data_file, sensor_side=sensor_side)
                 cache_path = os.path.join(checkpoint_dir, cache_fname)
                 assert  os.path.exists(cache_path), f"Cache file {cache_fname} not found, need to run python /palakons/point_diffusion/preprocess_man.py --cond_method wan --wan_frames 5 --wan_frame_mode center --wan_frame_stride 1 --wan_edge_policy skip --N 128  --data_file man-mini --num_scenes 100 --from_scene_id 0"
                 with open(cache_path, "rb") as f:   
                     # (x0sbn3_norm, cond_norm, doppler_norm, rcs_norm),frame_ids= pickle.load(f)
-                    (x0sbn3_file, cond_file, doppler_file, rcs_file),frame_ids= pickle.load(f)
+                    (x0sbn3_file, cond_file, doppler_file, rcs_file, persistence_file),frame_ids= pickle.load(f)
 
                     # args.cond_ram_dtype : ["fp32", "fp16", "bf16"]
                     if args.cond_method == "wan" and cond_file is not None:
@@ -1254,6 +1364,9 @@ def gather_man_ds(args, checkpoint_dir):
                         cond_all.append(cond_file)
                     doppler_all.append(doppler_file)
                     rcs_all.append(rcs_file)
+                    # persistence_all.append(persistence_file)
+                    if persistence_file is not None:
+                        persistence_all.append(persistence_file)
 
                     frame_ids_all["token"].extend(frame_ids["token"])
                     frame_ids_all["scene_id"].extend(frame_ids["scene_id"])
@@ -1274,7 +1387,19 @@ def gather_man_ds(args, checkpoint_dir):
     doppler_all = torch.cat(doppler_all, dim=0) if doppler_all[0] is not None else None
     print(f"Concatenated doppler_all shape: {doppler_all.shape if doppler_all is not None else None}, now concatenating rcs_all")   
     rcs_all = torch.cat(rcs_all, dim=0) if rcs_all[0] is not None else None
-
+    # persistence_all = torch.cat(persistence_all, dim=0) if persistence_all[0] is not None else None
+    if args.persistence_weight > 0:
+        assert len(persistence_all) > 0
+        persistence_all = torch.cat(
+            persistence_all,
+            dim=0,
+        )
+        assert persistence_all.shape == x0sbn3_all.shape[:2], (
+            f"persistence {persistence_all.shape} "
+            f"vs xyz {x0sbn3_all.shape}"
+        )
+    else:
+        persistence_all = None
     assert x0sbn3_all.shape[0] == len(frame_ids_all["token"]) == len(frame_ids_all["scene_id"]) == len(frame_ids_all["frame_index"]), f"Mismatch in number of samples and frame IDs: {x0sbn3_all.shape[0]} vs {len(frame_ids_all['token'])}"
     print(f"Loaded {x0sbn3_all.shape} samples from {len(data_files)} data files.")
     
@@ -1283,7 +1408,7 @@ def gather_man_ds(args, checkpoint_dir):
 
     # x0sbn3_norm_all, cond_norm_all, doppler_norm_all, rcs_norm_all, stat_dict = normalize_all_data(x0sbn3_all, cond_all,doppler_all, rcs_all)
     # print(f"Data normalization statistics: {stat_dict}")#{'x0sbn3': {'mean': [28.74150848388672, 4.547235488891602, -0.0046195280738174915], 'max_half_range': 45.444610595703125}, 'doppler': {'mean': [8.53986930847168], 'max_half_range': 84.40284729003906}, 'rcs': {'mean': [-7.473166465759277], 'max_half_range': 45.473167419433594}, 'cond_max': 5.805410385131836}
-    return x0sbn3_all, cond_all,doppler_all, rcs_all, frame_ids_all
+    return x0sbn3_all, cond_all,doppler_all, rcs_all, persistence_all, frame_ids_all
 def compute_norm_stats_from_train(
     x0sbn5_src,
     cond_src,
@@ -1406,6 +1531,8 @@ def eval_multi_batch(
     prediction_type="epsilon",
     scale_eps2x0_conversion=False,collect_loss_stats=False,
     clip_grad_norm=True,density_weight=0.0,
+    persistence_all=None,
+    persistence_weight=0.0,  
 ):
     model.eval()
 
@@ -1442,7 +1569,10 @@ def eval_multi_batch(
                 idx_pool=idx_batch,
                 lr_scheduler=None,
                 collect_loss_stats=collect_loss_stats,
-                clip_grad_norm=clip_grad_norm,density_weight=density_weight,
+                clip_grad_norm=clip_grad_norm,
+                density_weight=density_weight,
+                persistence_all=persistence_all,
+                persistence_weight=persistence_weight,
             )
 
             for k, v in val_dict_i.items():
@@ -1526,6 +1656,8 @@ def train_eval_step(
     lr_scheduler=None,
     clip_grad_norm=True,
     density_weight=0.0,
+    persistence_all=None,
+    persistence_weight=0.0,
 ):    
     time_recrod = TimeRecorder(insert_order=True, cuda_sync=True)
 
@@ -1540,6 +1672,31 @@ def train_eval_step(
 
     time_recrod.record("change_mode")
     x0_cpu = x0sbn3_norm_all[idx][:,:,:inout_dim]  # [B, N, inout_dim]
+    if persistence_weight > 0:
+
+        assert persistence_all is not None
+
+        persistence_cpu = persistence_all[idx]
+
+        persistence = persistence_cpu.to(
+            device,
+            non_blocking=True,
+        ).float()
+
+        assert persistence.shape == x0_cpu.shape[:2], (
+            f"persistence {persistence.shape} "
+            f"vs x0 {x0_cpu.shape}"
+        )
+
+        assert torch.isfinite(persistence).all()
+
+        persistence = persistence.clamp(
+            0.0,
+            1.0,
+        )
+
+    else:
+        persistence = None
     time_recrod.record("indexing_x0")
     x0 = x0_cpu.to(device, non_blocking=True)
     assert not torch.isnan(x0).any() and not torch.isinf(x0).any(), f"NaN or Inf detected in x0 after moving to device: {x0}"
@@ -1567,6 +1724,7 @@ def train_eval_step(
         noise = torch.randn(x0.shape, device=device, dtype=x0.dtype, generator=g)
 
     time_recrod.record("generate_noise")
+    print(f"noise min: {noise.min().item()}, noise max: {noise.max().item()}, noise mean: {noise.mean().item()}, noise std: {noise.std().item()}")
 
     x_t = ddpm_scheduler.add_noise(x0, noise, t)
     time_recrod.record("add_noise")
@@ -1578,6 +1736,11 @@ def train_eval_step(
         raise ValueError(f"Unknown prediction_type: {prediction_type}")
 
     with torch.set_grad_enabled(is_train):
+
+
+        print(f"x_t min: {x_t.min().item()}, x_t max: {x_t.max().item()}, x_t mean: {x_t.mean().item()}, x_t std: {x_t.std().item()}")
+        print(f"t min: {t.min().item()}, t max: {t.max().item()}, t mean: {t.float().mean().item()}, t std: {t.float().std().item()}")
+        print(f"cond min: {cond.min().item() if cond is not None else 'N/A'}, cond max: {cond.max().item() if cond is not None else 'N/A'}, cond mean: {cond.mean().item() if cond is not None else 'N/A'}, cond std: {cond.std().item() if cond is not None else 'N/A'}")
 
         pred = model(x_t, t, condition=cond)
         
@@ -1628,7 +1791,26 @@ def train_eval_step(
 
         diff2 = (pred - target).square()
 
+        xyz_mse_per_point = diff2[..., :3].mean(
+            dim=-1
+        )  # [B,N]
+
+
+        # ---------------------------------------------------------
+        # Start with uniform point weights.
+        # ---------------------------------------------------------
+
+        point_w = torch.ones_like(
+            xyz_mse_per_point
+        )
+
+
+        # ---------------------------------------------------------
+        # Density weighting
+        # ---------------------------------------------------------
+
         if density_weight > 0:
+
             raw_density_w = gt_sparsity_weights(
                 x0,
                 k=5,
@@ -1642,23 +1824,116 @@ def train_eval_step(
                 + density_weight * raw_density_w
             )
 
-            xyz_mse_per_point = diff2[..., :3].mean(dim=-1)
-
-            loss_mse_position_fast = (
-                density_w * xyz_mse_per_point
-            ).mean()
+            point_w = point_w * density_w
 
             if collect_loss_stats:
-                loss_dict["density_raw_min"] = float(raw_density_w.min().detach().cpu())
-                loss_dict["density_raw_mean"] = float(raw_density_w.mean().detach().cpu())
-                loss_dict["density_raw_max"] = float(raw_density_w.max().detach().cpu())
+                loss_dict["density_raw_min"] = float(
+                    raw_density_w.min().detach().cpu()
+                )
+                loss_dict["density_raw_mean"] = float(
+                    raw_density_w.mean().detach().cpu()
+                )
+                loss_dict["density_raw_max"] = float(
+                    raw_density_w.max().detach().cpu()
+                )
 
-                loss_dict["density_eff_min"] = float(density_w.min().detach().cpu())
-                loss_dict["density_eff_mean"] = float(density_w.mean().detach().cpu())
-                loss_dict["density_eff_max"] = float(density_w.max().detach().cpu())
 
-        else:
-            loss_mse_position_fast = diff2[..., :3].mean()
+        # ---------------------------------------------------------
+        # Temporal-persistence weighting
+        # ---------------------------------------------------------
+
+        if persistence_weight > 0:
+
+            # persistence: persistence calculateed from GT , shape ???
+            # 0 = temporally inconsistent
+            # 1 = highly persistent
+
+            # persistence_w = ( #persistence W: 0 baseline, 1 pure persistence-weighted, shape ??
+            #     (1.0 - persistence_weight)
+            #     + persistence_weight * persistence
+            # )
+            persistence_w = 1.0 + persistence_weight * persistence
+
+
+            point_w = point_w * persistence_w
+
+            if collect_loss_stats:
+                loss_dict["point_w_min"] = float(
+                    point_w.min().detach().cpu()
+                )
+                loss_dict["point_w_mean"] = float(
+                    point_w.mean().detach().cpu()
+                )
+                loss_dict["point_w_max"] = float(
+                    point_w.max().detach().cpu()
+                )
+
+                loss_dict["persist_score_min"] = float(
+                    persistence.min().detach().cpu()
+                )
+                loss_dict["persist_score_mean"] = float(
+                    persistence.mean().detach().cpu()
+                )
+                loss_dict["persist_score_max"] = float(
+                    persistence.max().detach().cpu()
+                )
+
+                loss_dict["persist_w_min"] = float(
+                    persistence_w.min().detach().cpu()
+                )
+                loss_dict["persist_w_mean"] = float(
+                    persistence_w.mean().detach().cpu()
+                )
+                loss_dict["persist_w_max"] = float(
+                    persistence_w.max().detach().cpu()
+                )
+
+
+        # ---------------------------------------------------------
+        # Weighted MSE.
+        #
+        # Normalize by sum(weights), so weighting does not
+        # arbitrarily alter the overall loss scale.
+        # ---------------------------------------------------------
+
+        loss_mse_position_fast = (
+            (point_w * xyz_mse_per_point).sum()
+            / point_w.sum().clamp_min(1e-8)
+        )
+
+        unweighted_loss = xyz_mse_per_point.mean().item()
+        weighted_loss = loss_mse_position_fast.item()
+
+        if False:
+            print(f"\n--- Persistence Loss Diagnostic ---")
+            print(f"target shape: {tuple(target.shape)}, min={target.min():.4f}, mean={target.mean():.4f}, max={target.max():.4f}, has_nan={torch.isnan(target).any().item()}")
+            print(f"pred   shape: {tuple(pred.shape)}, min={pred.min():.4f}, mean={pred.mean():.4f}, max={pred.max():.4f}, has_nan={torch.isnan(pred).any().item()}")
+            print(f"persistence_weight : {persistence_weight}")
+            print(f"persistence scores : shape={tuple(persistence.shape)}, min={persistence.min():.4f}, mean={persistence.mean():.4f}, max={persistence.max():.4f}, has_nan={torch.isnan(persistence).any().item()}")
+            print(f"persistence_w      : shape={tuple(persistence_w.shape)}, min={persistence_w.min():.4f}, mean={persistence_w.mean():.4f}, max={persistence_w.max():.4f}")
+            print(f"final point_w      : shape={tuple(point_w.shape)}, min={point_w.min():.4f}, mean={point_w.mean():.4f}, max={point_w.max():.4f}, sum={point_w.sum():.4f}")
+            print(f"xyz_mse_per_point  : min={xyz_mse_per_point.min():.4e}, mean={xyz_mse_per_point.mean():.4e}, max={xyz_mse_per_point.max():.4e}")
+            print(f"Loss comparison    : unweighted={unweighted_loss:.6e} vs weighted={weighted_loss:.6e} (ratio={weighted_loss / (unweighted_loss + 1e-12):.4f})")
+            print(f"-----------------------------------\n")
+
+            # Temporary check right before pred = model(x_t, t, condition=cond)
+            model.train()  # disables dropout / droppath
+            torch.manual_seed(42)
+            with torch.no_grad():
+                test_pred_1 = model(x_t, t, condition=cond)
+                test_pred_2 = model(x_t, t, condition=cond)
+
+            print(f"Pred diff in train mode: {(test_pred_1 - test_pred_2).abs().max().item():.6e}")
+            model.eval()  # disables dropout / droppath
+            torch.manual_seed(42)
+            with torch.no_grad():
+                test_pred_1 = model(x_t, t, condition=cond)
+                test_pred_2 = model(x_t, t, condition=cond)
+
+            print(f"Pred diff in eval mode: {(test_pred_1 - test_pred_2).abs().max().item():.6e}")
+            exit()
+
+
 
         if inout_dim > 3:
             loss_mse_doppler_fast = diff2[..., 3].mean()
@@ -1685,6 +1960,28 @@ def train_eval_step(
 
         
         loss += lambda_mse * loss_mse_fast
+
+        #print for diagnosticม ถ 5 items, mean, std, min, max
+        if False:
+            print("xyz_mse_per_point first frame:")
+            print(xyz_mse_per_point[0, :5])
+
+            print("persistence first frame:")
+            print(persistence[0, :5])
+
+            print("point_w first frame:")
+            print(point_w[0, :5])
+
+            print(
+                "weighted per-point loss first frame:"
+            )
+            print(
+                (
+                    point_w
+                    * xyz_mse_per_point
+                )[0, :5]
+            )
+            exit()
     time_recrod.record("compute_mse_loss")
     if lambda_cd > 0.0:  # include CD loss
 
@@ -1733,6 +2030,8 @@ def train_eval_step(
             )
 
             loss_dict["cd_3d_loss"] = cd_loss_dict["cd_xyz"].item()
+            loss_dict["pred_to_gt_cd_xyz"] = cd_loss_dict["pred_to_gt_cd_xyz"].item()
+            loss_dict["gt_to_pred_cd_xyz"] = cd_loss_dict["gt_to_pred_cd_xyz"].item()
             loss_dict["cd_doppler_loss"] = cd_loss_dict["doppler_attr_loss"].item()
             loss_dict["cd_rcs_loss"] = cd_loss_dict["rcs_attr_loss"].item()
 
@@ -2078,7 +2377,6 @@ class LazyNpyArray:
     
 if __name__ == "__main__":
     args = parse_args()
-    assert 0.0 <= args.density_weight <= 1.0, "--density_weight should be in [0,1]"
     # Example setup
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -2092,12 +2390,13 @@ if __name__ == "__main__":
     # cache_dir = f"/data/palakons/{system_key}/cache/"
     cache_dir = f"/data/palakons/{system_key}/cache{'_cameraxyz' if args.coord_frame == 'camera' else ''}_unnorm/"
     checkpoint_path = os.path.join(checkpoint_dir, f"latest_{run_id}.pt")
+    best_checkpoint_path = os.path.join(checkpoint_dir, f"best_{run_id}.pt")
     exists = {'tb_dir': os.path.exists(tb_dir), 'data_dir': os.path.exists(data_dir),"checkpoint_file": os.path.exists(checkpoint_path)}
     print(f"Directories and checkpoint existence: {exists}")
-    print(f"checkpoint_path: {checkpoint_path}")
+    # print(f"checkpoint_path: {checkpoint_path}")
     #            re.sub(r"it\d+", "it*", checkpoint_path)
     ceckpoint_path_pattern = re.sub(r"it\d+", "it*", checkpoint_path)
-    print(f"checkpoint_path pattern: {ceckpoint_path_pattern}")
+    # print(f"checkpoint_path pattern: {ceckpoint_path_pattern}")
     print(f"exists wild card checkpoint: {glob(ceckpoint_path_pattern)}")
     assert not exists['tb_dir'] , f"TensorBoard log directory {tb_dir} already exists. Please choose a different experiment name or remove the existing logs to avoid overwriting."
     # creat dir, nested if not exist
@@ -2125,6 +2424,39 @@ if __name__ == "__main__":
     }
     frame_ids = None
 
+    inout_dim = 5  if args.train_rcs_doppler else 3
+    
+    # Recall best validation CD from the previous best checkpoint, if it exists.
+    best_val_cd = float("inf")
+    best_val_cd_step = -1
+    if os.path.exists(best_checkpoint_path):
+        best_checkpoint = torch.load(best_checkpoint_path, map_location="cpu")
+        best_val_cd = best_checkpoint.get("best_val_cd", float("inf"))
+        best_val_cd_step = best_checkpoint.get("step", -1)  
+        print(f"Best validation CD so far: {best_val_cd:.6g}")
+    
+    seed = args.seed
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+
+    model = make_model(device, args)
+    
+    if False:
+        # verify whether your script is actually instantiating different architectures or accidentally using hardcoded default dimensions/layers
+        print(f"dim and ly ers: inout_dim={inout_dim}, model_name={model_name}, model tx dim={args.set_tx_dim}, model depth={args.set_tx_num_layers}, model mlp_ratio={args.set_tx_mlp_ratio}")
+        total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"Total Trainable Parameters: {total_params:,}")
+        # e.g., if using nn.ModuleList or Sequential:
+        print(f"Instantiated layers: {len(model.blocks)}") # or len(model.layers)
+        # Check an attention projection or linear weight shape
+        for name, param in model.named_parameters():
+            if "weight" in name and ("attn" in name or "mlp" in name):
+                print(f"{name}: {param.shape}")
+                break
+
+        exit()
+
     if True:
 
         if args.cond_method in [ "wan", "scene_id"]:
@@ -2134,14 +2466,31 @@ if __name__ == "__main__":
             cond_method = "wan"
             cond_string = f"pdnorm_only_5_center_1_skip"
             
-        data_key = f"{args.data_file}_side{args.sensor_side}{'_cameraframe' if args.coord_frame == 'camera' else ''}_{cond_method}_{args.N}_{cond_string}"
+        persistence_data_tag = ""
 
-        print(f"data_key: {data_key}")
+        if args.persistence_weight > 0:
+            persistence_data_tag = (
+                f"_persist"
+                f"K{args.persistence_k_native}"
+                f"_sig{args.persistence_sigma:g}"
+            )
+        data_key = f"{args.data_file}_side{args.sensor_side}{'_cameraframe' if args.coord_frame == 'camera' else ''}_{cond_method}_{args.N}_{cond_string}{persistence_data_tag}"
+
+        print(f"data_key: {data_key} use for data chaching")
         gather_cache_dir = os.path.join(cache_dir, data_key )
         os.makedirs(gather_cache_dir, exist_ok=True)
 
-        whole_ds_cache_fname= {k: f"man_{k}.npy" for k in ["x0sbn5_all", "cond_all"]}
-        whole_ds_cache_fname.update({"frame_ids_all": f"man_frame_ids_all.json"})
+        whole_ds_cache_fname = {
+            "x0sbn5_all": "man_x0sbn5_all.npy",
+            "cond_all": "man_cond_all.npy",
+            "frame_ids_all": "man_frame_ids_all.json",
+        }
+
+        if args.persistence_weight > 0:
+            whole_ds_cache_fname[
+                "persistence_all"
+            ] = "man_persistence_all.npy"
+
 
         if not all(os.path.exists(os.path.join(gather_cache_dir, fname)) for fname in whole_ds_cache_fname.values()): #prepare for lazy loading through NPY's MemMap
             print(f"some cache files are missing, gathering MAN dataset from individual scene cache files. This may take a while...")
@@ -2149,7 +2498,7 @@ if __name__ == "__main__":
             for k, v in whole_ds_cache_fname.items():
                 if not os.path.exists(os.path.join(gather_cache_dir, v)):
                     print(f"Missing cache file: {v}")
-            x0sbn3_all, cond_all, doppler_all, rcs_all,frame_ids_all = gather_man_ds(args, cache_dir)
+            x0sbn3_all, cond_all, doppler_all, rcs_all, persistence_all, frame_ids_all = gather_man_ds(args, cache_dir)
             x0sbn5_all= torch.cat([x0sbn3_all, doppler_all, rcs_all], dim=-1) 
 
             all_frame_ids=frame_ids_all
@@ -2174,7 +2523,6 @@ if __name__ == "__main__":
 
             print(f"MAN dataset saved to cache: {whole_ds_cache_fname}")
             print(f"Gathered MAN dataset: {x0sbn5_all.shape} samples") 
-            # print(f"cond : {cond_all}")
             print(f"cond shape: {cond_all.shape if cond_all is not None else None}") 
             print(f"frame_ids: {len(all_frame_ids['token'])} tokens") 
             print(f"{len(all_frame_ids['scene_id'])} scene_ids") 
@@ -2185,32 +2533,86 @@ if __name__ == "__main__":
             print(f"Loading MAN dataset from cache: {whole_ds_cache_fname}")
 
             time_recorder = TimeRecorder(insert_order=True, cuda_sync=True)
+            # if args.lazy_npy:
+            #     x0sbn5_all, cond_all, persistence_all = [ LazyNpyArray(os.path.join(gather_cache_dir, whole_ds_cache_fname[k])) for k in ["x0sbn5_all", "cond_all", "persistence_all"]]
+            # else:#load all to RAM
+            #     x0sbn5_all, cond_all, persistence_all = [torch.as_tensor(np.load(os.path.join(gather_cache_dir, whole_ds_cache_fname[k]), allow_pickle=False)) for k in ["x0sbn5_all", "cond_all", "persistence_all"]]
             if args.lazy_npy:
-                x0sbn5_all, cond_all= [ LazyNpyArray(os.path.join(gather_cache_dir, whole_ds_cache_fname[k])) for k in ["x0sbn5_all", "cond_all"]]
-            else:#load all to RAM
-                x0sbn5_all, cond_all = [torch.as_tensor(np.load(os.path.join(gather_cache_dir, whole_ds_cache_fname[k]), allow_pickle=False)) for k in ["x0sbn5_all", "cond_all"]]
+                x0sbn5_all = LazyNpyArray(
+                    os.path.join(
+                        gather_cache_dir,
+                        "man_x0sbn5_all.npy",
+                    )
+                )
+
+                cond_all = LazyNpyArray(
+                    os.path.join(
+                        gather_cache_dir,
+                        "man_cond_all.npy",
+                    )
+                )
+            else:
+                x0sbn5_all = torch.as_tensor(
+                    np.load(
+                        os.path.join(
+                            gather_cache_dir,
+                            "man_x0sbn5_all.npy",
+                        ),
+                        allow_pickle=False,
+                    )
+                )
+
+                cond_all = torch.as_tensor(
+                    np.load(
+                        os.path.join(
+                            gather_cache_dir,
+                            "man_cond_all.npy",
+                        ),
+                        allow_pickle=False,
+                    )
+                )
+
+            if args.persistence_weight > 0:
+                persistence_path = os.path.join(
+                    gather_cache_dir,
+                    "man_persistence_all.npy",
+                )
+
+                assert os.path.exists(persistence_path)
+
+                persistence_all = (
+                    LazyNpyArray(persistence_path)
+                    if args.lazy_npy
+                    else torch.as_tensor(
+                        np.load(
+                            persistence_path,
+                            allow_pickle=False,
+                        )
+                    )
+                )
+            else:
+                persistence_all = None
             with open(os.path.join(gather_cache_dir, whole_ds_cache_fname["frame_ids_all"]), "r") as f:
                 frame_ids_all = json.load(f)         
 
 
+
             all_frame_ids=frame_ids_all
             time_recorder.record("load_from_cache")
-            print(f"Loaded MAN dataset from cache in {time_recorder.get_records()}  with {'LazyNpyArray' if args.lazy_npy else 'non-Lazy'}")
+            print(f"Time for loading MAN dataset from cache in {time_recorder.get_records()} sec with {'LazyNpyArray' if args.lazy_npy else 'non-Lazy'}")
             
-            print(f"Gathered MAN dataset: {x0sbn5_all.shape} samples") 
-            # print(f"cond : {cond_all}")
-            print(f"cond shape: {cond_all.shape if cond_all is not None else None}") 
-            print(f"frame_ids: {len(all_frame_ids['token'])} tokens") 
-            print(f"{len(all_frame_ids['scene_id'])} scene_ids") 
-            print(f"{len(all_frame_ids['frame_index'])} frame_indices")
-            print(f"{len(all_frame_ids['sensor_side'])} sensor_sides") 
-            print(f"{len(all_frame_ids['data_file'])} data_files key {data_key}")
+            print(f"Gathered MAN dataset: {x0sbn5_all.shape} samples, cond shape: {cond_all.shape if cond_all is not None else None}, frame_ids: {len(all_frame_ids['token'])} tokens") 
+            assert len(all_frame_ids['scene_id']) == len(all_frame_ids['frame_index']) == len(all_frame_ids['sensor_side']) == len(all_frame_ids['data_file']), f"Mismatch in frame_ids lengths: {len(all_frame_ids['scene_id'])} scene_ids, {len(all_frame_ids['frame_index'])} frame_indices, {len(all_frame_ids['sensor_side'])} sensor_sides, {len(all_frame_ids['data_file'])} data_files"
+            # print(f"{len(all_frame_ids['scene_id'])} scene_ids") 
+            # print(f"{len(all_frame_ids['frame_index'])} frame_indices")
+            # print(f"{len(all_frame_ids['sensor_side'])} sensor_sides") 
+            # print(f"{len(all_frame_ids['data_file'])} data_files key {data_key}")
             # Gathered MAN dataset: (43373, 128, 3) samples, cond shape: (43373, 16, 2, 60, 104), doppler shape: (43373, 128, 1), rcs shape: (43373, 128, 1) frame_ids: 43373 tokens, 43373 scene_ids, 43373 frame_indices, 43373 sensor_sides, 43373 data_files key both_wan_128_pdnorm_only_5_center_1_skip
 
     
-    print(f"MAN dataset loaded from cache. frame_ids (first 8 items): ")
-    for k in all_frame_ids.keys():
-        print(f"{k}: {all_frame_ids[k][:8]}")
+    # print(f"MAN dataset loaded from cache. frame_ids (first 8 items): ")
+    # for k in all_frame_ids.keys():
+    #     print(f"{k}: {all_frame_ids[k][:8]}")
 
     if args.shape_name == "man_heldout_split":
         split_seed = args.split_seed 
@@ -2310,8 +2712,77 @@ if __name__ == "__main__":
             f"eval_frames={eval_idx_pool.numel()}, "
             f"test_frames={0 if test_idx_pool is None else test_idx_pool.numel()}"
         )
-        print(f"eval_scene_set={sorted(list(eval_scene_set))}")
-        print(f"test_scene_set={sorted(list(test_scene_set))}")
+
+
+        
+        if persistence_all is not None:
+            # ---------------------------------------------------------
+            # Full Dataset / Train-Set Persistence Diagnostics
+            # ---------------------------------------------------------
+            # Use train_idx_pool to measure the actual training distribution
+            eval_indices = train_idx_pool.cpu().long()
+            total_frames = eval_indices.numel()
+            
+            # Collect point counts per threshold across all frames
+            thresholds = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
+            counts_accum = {th: [] for th in thresholds}
+            
+            # Subsample points evenly across the entire dataset for percentile calculation
+            sampled_p_points = []
+            chunk_size = 1024
+
+            for s in range(0, total_frames, chunk_size):
+                idx_chunk = eval_indices[s:s + chunk_size]
+                p_chunk = persistence_all[idx_chunk]
+                if hasattr(p_chunk, "arr"):
+                    p_chunk = torch.from_numpy(p_chunk.arr[:].copy()).float()
+                else:
+                    p_chunk = torch.as_tensor(p_chunk).float()
+
+                # Record counts per frame
+                for th in thresholds:
+                    counts_accum[th].append((p_chunk >= th).sum(dim=1).cpu())
+
+                # Subsample ~10 points per frame for global percentiles
+                sampled_p_points.append(p_chunk[:, ::12].flatten().cpu())
+
+            p_flat_sample = torch.cat(sampled_p_points)
+            q_points = torch.quantile(p_flat_sample, torch.tensor([0.10, 0.25, 0.50, 0.75, 0.90]))
+
+            print(f"\n================ Full Train-Set Persistence Statistics ================")
+            print(f"Total evaluated frames: {total_frames:,}, Points per frame: {p_chunk.shape[1]}")
+            print(f"Per-Point Persistence Distribution (Subsampled across all frames):")
+            print(f"  min:  {p_flat_sample.min():.4f}")
+            print(f"  p10:  {q_points[0]:.4f}")
+            print(f"  p25:  {q_points[1]:.4f}")
+            print(f"  p50 (median): {q_points[2]:.4f}")
+            print(f"  p75:  {q_points[3]:.4f}")
+            print(f"  p90:  {q_points[4]:.4f}")
+            print(f"  max:  {p_flat_sample.max():.4f}")
+            print(f"  mean: {p_flat_sample.mean():.4f}")
+
+            print(f"\nRetained Point Count (out of {p_chunk.shape[1]}) per Frame across Whole Dataset:")
+            print(f"{'Threshold':<10} | {'p10':<6} | {'p25':<6} | {'p50 (med)':<10} | {'p75':<6} | {'p90':<6} | {'% Empty Frames (<5 pts)'}")
+            print("-" * 75)
+
+            for th in thresholds:
+                all_counts = torch.cat(counts_accum[th]).float()
+                q_counts = torch.quantile(all_counts, torch.tensor([0.10, 0.25, 0.50, 0.75, 0.90]))
+                pct_sparse = (all_counts < 5).float().mean().item() * 100.0
+
+                print(
+                    f"{th:<10.1f} | "
+                    f"{int(q_counts[0]):<6} | "
+                    f"{int(q_counts[1]):<6} | "
+                    f"{int(q_counts[2]):<10} | "
+                    f"{int(q_counts[3]):<6} | "
+                    f"{int(q_counts[4]):<6} | "
+                    f"{pct_sparse:.2f}%"
+                )
+            print("=======================================================================\n")
+        exit()
+        # print(f"eval_scene_set={sorted(list(eval_scene_set))}")
+        # print(f"test_scene_set={sorted(list(test_scene_set))}")
 
         norm_stats = compute_norm_stats_from_train(
             x0sbn5_src=x0sbn5_all,
@@ -2355,9 +2826,7 @@ if __name__ == "__main__":
         f"shapes after dataset creation: x0sbn5_all {x0sbn5_all.shape}, cond {cond_all.shape if cond_all is not None else None}"
     )
         
-    inout_dim = 5  if args.train_rcs_doppler else 3
     
-    model = make_model(device, args)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     if args.lr_schedule == "cosine":
@@ -2415,7 +2884,6 @@ if __name__ == "__main__":
     if args.mode != "train":
         raise NotImplementedError("Evaluation mode is not implemented yet. Please use 'train' or 'interpolate' modes.")
     
-    seed = args.seed
 
     # check_data_source( "x0sbn3_train_norm",x0sbn5_all[:, :, :3])
     # x0sbn3_train_norm shape= (40, 128, 5) type= <class 'torch.Tensor'> dtype= torch.float32 device= cpu requires_grad= False min= -0.8094146251678467 max= 1.0 nan= False
@@ -2424,17 +2892,7 @@ if __name__ == "__main__":
 
     print(f"indices length: train_idx_pool {train_idx_pool.numel()}, eval_idx_pool {eval_idx_pool.numel()} test_idx_pool {0 if test_idx_pool is None else test_idx_pool.numel()}")
 
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    random.seed(seed)
 
-    tt = tqdm(
-        range(start_step, ddpm_iteration),
-        total=ddpm_iteration,
-        initial=start_step,
-        desc="Training",
-        unit="step",
-    )
     total_work_step = ddpm_iteration - start_step
     log_train_every = max(1, total_work_step // args.num_train_log)
     save_checkpoint_every = max(1, total_work_step // args.num_checkpoints_save)
@@ -2466,8 +2924,8 @@ if __name__ == "__main__":
     logger.log_text("node_name", os.uname().nodename, 0)
     if frame_ids is not None:
         print(f"Saving frame_ids to logger config: (first 8 frames)")
-        print(f"train: token:{frame_ids['train']['token'][:8]}, scene_id: {frame_ids['train']['scene_id'][:8]}, frame_index: {frame_ids['train']['frame_index'][:8]};")
-        print(f"eval:  token:{frame_ids['eval']['token'][:8]}, scene_id: {frame_ids['eval']['scene_id'][:8]}, frame_index: {frame_ids['eval']['frame_index'][:8]}")
+        print(f"train: token:{frame_ids['train']['token'][:8][-5:]}, scene_id: {frame_ids['train']['scene_id'][:8]}, frame_index: {frame_ids['train']['frame_index'][:8]};")
+        print(f"eval:  token:{frame_ids['eval']['token'][:8][-5:]}, scene_id: {frame_ids['eval']['scene_id'][:8]}, frame_index: {frame_ids['eval']['frame_index'][:8]}")
         # logger.log_text("frame_ids",json.dumps(frame_ids, indent=4),0)
         print("Saving frame_ids to JSON file, not TensorBoard text.")
 
@@ -2507,14 +2965,22 @@ if __name__ == "__main__":
             0,
         )
         
+    
     time_record = TimeRecorder()
+    tt = tqdm(
+        range(start_step, ddpm_iteration),
+        total=ddpm_iteration,
+        initial=start_step,
+        desc="Training",
+        unit="step",
+    )
     for step in tt:
         time_record.record("step_start")
         # is_final_sample_eval = step + save_checkpoint_every >= ddpm_iteration
         is_final_sample_eval = (step == ddpm_iteration - 1)
         # print(f"Step {step}/{ddpm_iteration}, is_final_sample_eval: {is_final_sample_eval}")
 
-        assert len(train_idx_pool) >= B,f"len(train_idx_pool) >= B"
+        assert len(train_idx_pool) >= B,f"len(train_idx_pool) >= B: {len(train_idx_pool)} >= {B} is not satisfied. Please reduce B or increase the number of training samples."
         train_local = torch.randperm(train_idx_pool.numel(), device="cpu")[:B]
         train_idx_batch = train_idx_pool[train_local]
         train_idx_batch = torch.sort(train_idx_batch).values
@@ -2541,6 +3007,8 @@ if __name__ == "__main__":
             collect_loss_stats=(step % log_train_every == 0),
             lr_scheduler=lr_scheduler,
             clip_grad_norm=args.clip_until_step ==0 or step < args.clip_until_step,density_weight=args.density_weight,
+            persistence_all=persistence_all,
+            persistence_weight=args.persistence_weight,
         )
 
         time_record.record("train_eval_step")
@@ -2578,6 +3046,8 @@ if __name__ == "__main__":
                             c_list = ["correct_cond", "zero_cond", "shuffled_cond", "nn_retrieval"] if set_cond is not None else ["none"]
                         else:
                             c_list = ["correct_cond"] if set_cond is not None else ["none"]
+                            if step % (save_checkpoint_every*50) == 0:
+                                c_list +=["zero_cond", "shuffled_cond", "nn_retrieval"] if set_cond is not None else ["none"]
                         for c_name in tqdm(c_list, desc=f"Conditions for {set_name}", leave=False):
                             # print(f"-=-===--==--- {set_name}/{sample_seed}/{c_name}/{step}...")
                             if set_name == "train" and c_name == "nn_retrieval":
@@ -2631,9 +3101,35 @@ if __name__ == "__main__":
                                     pred_all.cpu(), full_gt.cpu(), prefix=f"{c_name}_{sample_seed}_"
                                 )
                             except Exception as e:
-                                print(f"Error calculating point set statistics at step {step} for {set_name} with condition {c_name} and seed {sample_seed}: {e}")
+                                print(f"Error calculating point set statistics at step {step} for {set_name} with condition {c_name} and seed {sample_seed}: {e}, pred stat min:{pred_all.min().item() if pred_all.numel() > 0 else 'N/A'}, max: {pred_all.max().item() if pred_all.numel() > 0 else 'N/A'}, gt stat min: {full_gt.min().item() if full_gt.numel() > 0 else 'N/A'}, max: {full_gt.max().item() if full_gt.numel() > 0 else 'N/A'}")
                                 point_stat_output = {"cd": float("nan"), "fidelity": float("nan"), "diversity": float("nan")}
+                                #also count nan
+                                print(f"pred_all nan count: {torch.isnan(pred_all).sum().item()}, full_gt nan count: {torch.isnan(full_gt).sum().item()}")
                             
+                            # Save the best validation model using CD (lower is better).
+                            if set_name == "eval":
+                                try:
+                                    val_cd = float(point_stat_output[f"{c_name}_{sample_seed}_xyz_cd"])
+                                except Exception as e:
+                                    print(f"Error converting CD to float at step {step} for {set_name} with condition {c_name} and seed {sample_seed}: {e}")
+                                    print(f"key error: {point_stat_output.keys()}") #dict_keys(['correct_cond_42_xyz_cd', 'correct_cond_42_centroid_error', 'correct_cond_42_range_hist_error', 'correct_cond_42_azm_hist_error', 'correct_cond_42_x_y_occupancy_error', 'correct_cond_42_binary_x_y_occupancy_error', 'correct_cond_42_precision_0.5m', 'correct_cond_42_recall_0.5m', 'correct_cond_42_fscore_0.5m', 'correct_cond_42_precision_1m', 'correct_cond_42_recall_1m', 'correct_cond_42_fscore_1m', 'correct_cond_42_precision_2m', 'correct_cond_42_recall_2m', 'correct_cond_42_fscore_2m', 'correct_cond_42_precision_3m', 'correct_cond_42_recall_3m', 'correct_cond_42_fscore_3m', 'correct_cond_42_precision_5m', 'correct_cond_42_recall_5m', 'correct_cond_42_fscore_5m', 'correct_cond_42_doppler_mae', 'correct_cond_42_rcs_mae', 'correct_cond_42_doppler_hist_mae', 'correct_cond_42_rcs_hist_mae', 'correct_cond_42_doppler_sign_accuracy'])
+
+                                    val_cd = float("nan")
+
+                                if np.isfinite(val_cd) and val_cd < best_val_cd:
+                                    best_val_cd = val_cd
+
+                                    save_checkpoint(
+                                        model,
+                                        optimizer,
+                                        step,
+                                        best_checkpoint_path,
+                                        vars(args),
+                                        lr_scheduler=lr_scheduler,
+                                        best_val_cd=best_val_cd,
+                                    )
+                                    best_val_cd_step = step
+
                             npz_fname = (
                                 f"{dir_name}/{set_name}_{c_name}_sd{sample_seed}.npz"
                             )
@@ -2680,7 +3176,7 @@ if __name__ == "__main__":
                                 "exp_name": args.exp_name,
                                 "step": step,
                                 "n_scene": args.n_scene,
-                                "set_name": set_name,              # train/eval
+                                "set_name": set_name,              # train/_al
                                 "condition_type": c_name,          # correct/zero/shuffled/nn
                                 "sample_seed": sample_seed,
                                 "model_name": args.model_name,
@@ -2743,14 +3239,14 @@ if __name__ == "__main__":
                             else:
                                 raise ValueError(f"Unknown set_name: {set_name}")
                             try:
-                                plot_B = min(8, pred_all.shape[0]) 
+                                plot_B = min(8,full_B)
                                 pred_x = pred_all[:plot_B]
                                 extended_gt = full_gt[:plot_B]
                                 c_value_use = cond_used_all[:plot_B] if cond_used_all is not None else None
 
                                 batch_titles = [
                                     f"cond:{c:.2f}"
-                                    for c in c_value_use[:plot_B]
+                                    for c in c_value_use
                                     .view(plot_B, -1)
                                     .mean(dim=1)
                                 ] if c_value_use is not None else [f"N/A" for _ in range(plot_B)]
@@ -2765,14 +3261,12 @@ if __name__ == "__main__":
                                     title=f"step{step} {set_name} {c_name} sd{sample_seed} N:{N} T:{T} Inf:{T_infer} B:{B}",
                                     fname=f"{temp_dir}/denoised_{set_name}_{c_name}_{sample_seed}_{step:06d}.png",
                                     azm=azm_easing(
-                                        step, ddpm_iteration, style="cosine"
-                                    ),
+                                        step+1, ddpm_iteration, style="cosine", start_angle=90, end_angle=360+90),
+                                    # azm = 90,
                                     progress=step / ddpm_iteration,
+                                    # elev=0,
                                     elev=azm_easing(
-                                        step, ddpm_iteration, style="cosine"
-                                    )
-                                    / 360
-                                    * 90,
+                                        step+1, ddpm_iteration, style="cosine", start_angle=0, end_angle=90),
                                     batch_titles=batch_titles,
                                 )
                             except Exception as e:
@@ -2808,32 +3302,15 @@ if __name__ == "__main__":
                 collect_loss_stats=True,
                 scale_eps2x0_conversion=args.scale_eps2x0_conversion,
                 clip_grad_norm= args.clip_until_step ==0 or step < args.clip_until_step,density_weight=args.density_weight,
+                persistence_all=persistence_all,
+                persistence_weight=args.persistence_weight,
             )
 
             logger.log_val(step, val_dict, log_group=False)
 
-            # _, val_dict = train_eval_step(
-            #     model=model,
-            #     optimizer=optimizer,
-            #     ddpm_scheduler=ddpm_scheduler,
-            #     x0sbn3_norm_all=x0sbn3_eval_norm,
-            #     scene_condition_all=cond_eval_norm,
-            #     T=T,
-            #     device=device,
-            #     loss_weights=loss_weights,
-            #     inout_dim=inout_dim,
-            #     is_train=False,
-            #     lambda_cd=args.lambda_cd,
-            #     cd_mode=args.cd_mode,
-            #     lambda_mse=args.lambda_mse,
-            #     prediction_type=args.prediction_type,
-            #     scale_eps2x0_conversion=args.scale_eps2x0_conversion,
-            #     idx_pool=eval_idx_fixed,
-            #     lr_scheduler=None
-            # )
-            # logger.log_val(step, val_dict, log_group=False)
+
             time_record.record("log_val")
-        tt.set_description(f"Loss: {loss.item():.1e}")
+        tt.set_description(f"L:{loss.item():.5f}/{eval_every - (step % eval_every)} to eval/{save_checkpoint_every - (step % save_checkpoint_every)} to cp/best val {best_val_cd:.5f}@{best_val_cd_step}")
         time_record.record("step_end")
         time_record_cache = time_record.get_records()
         time_record.reset()
@@ -2873,7 +3350,7 @@ if __name__ == "__main__":
                     os.system(
                         f"cp {temp_dir}/denoised_{set_name}_{c_name}_{seed}_*.png {temp_dir}/../"
                     )
-                os.system(
-                    f"rm {temp_dir}/denoised_{set_name}_{c_name}_{seed}_*.png"
-                )
-    os.system(f"rm -r {temp_dir}")
+                # os.system(
+                #     f"rm {temp_dir}/denoised_{set_name}_{c_name}_{seed}_*.png"
+                # )
+    # os.system(f"rm -r {temp_dir}")

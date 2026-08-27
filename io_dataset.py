@@ -28,7 +28,27 @@ def save_point_sample(path, pred, gt=None, condition=None, meta=None):
     np.savez_compressed(path, **data)
 
 def make_man_pc(
-    num_points=64, n_scene=1, device="cpu", is_dense=False, data_file="man-mini",wan_spec={"wan_frames":5, "wan_frame_mode":"repeat", "wan_frame_stride":1,"wan_edge_policy":"skip"},get_wan_cond=True,scene_ids=[],radar_channel = "RADAR_LEFT_FRONT",camera_channel = "CAMERA_LEFT_FRONT",trucksc = None,wan_vae21_object = None,coord_frame="radar",
+    num_points=64,
+    n_scene=1,
+    device="cpu",
+    is_dense=False,
+    data_file="man-mini",
+    wan_spec={
+        "wan_frames":5,
+        "wan_frame_mode":"repeat",
+        "wan_frame_stride":1,
+        "wan_edge_policy":"skip",
+    },
+    get_wan_cond=True,
+    scene_ids=[],
+    radar_channel="RADAR_LEFT_FRONT",
+    camera_channel="CAMERA_LEFT_FRONT",
+    trucksc=None,
+    wan_vae21_object=None,
+    coord_frame="radar",
+    get_persistence=False,
+    persistence_k_native=2,
+    persistence_sigma=1.0,
 ):
     # B 128 128 pt 9.482Gi/15.992Gi
     import sys
@@ -37,27 +57,35 @@ def make_man_pc(
     from man_ddpm import MANDataset
     if is_dense:
         ds = MANDataset(
-            # scene_ids=list(range(450,598)),
             scene_ids=scene_ids,
             data_file=data_file,
             device=device,
             wan_vae=get_wan_cond,
-            wan_vae_checkpoint="/checkpoints/huggingface_hub/models--Wan-AI--Wan2.2-T2V-A14B/Wan2.1_VAE.pth",
+            wan_vae_checkpoint=(
+                "/checkpoints/huggingface_hub/"
+                "models--Wan-AI--Wan2.2-T2V-A14B/Wan2.1_VAE.pth"
+            ),
             n_p=num_points,
             normalize_type="minmax",
             get_camera=False,
             keep_frames=n_scene,
             point_preset="original",
+
             x_range=[0, 50],
             y_range=[-50, 50],
             z_range=[-2, 2],
+
             wan_preprocess_dir="/data/palakons/man_wan_preprocessed",
             coord_only=False,
-            wan_spec = wan_spec,
-            radar_channel = radar_channel,
-            camera_channel = camera_channel,
-            trucksc = trucksc,
-            wan_vae21_object = wan_vae21_object 
+            wan_spec=wan_spec,
+            radar_channel=radar_channel,
+            camera_channel=camera_channel,
+            trucksc=trucksc,
+            wan_vae21_object=wan_vae21_object,
+
+            get_persistence=get_persistence,
+            persistence_k_native=persistence_k_native,
+            persistence_sigma=persistence_sigma,
         )
 
         # print(f"keys in man dataset item: {ds[0].keys()}")  # keys
@@ -75,7 +103,7 @@ def make_man_pc(
                 ).to(
                     device
                 )  # [B, latent_dim]
-            return torch.empty(0, num_points, 3), wan_cond, ds, torch.empty(0, num_points, 3), torch.empty(0, num_points, 1)
+            return torch.empty(0, num_points, 3), wan_cond, ds, torch.empty(0, num_points, 3), torch.empty(0, num_points, 1), torch.empty(0, num_points) if get_persistence else None
 
         npoints_originals =[ds[i]['npoints_original'] for i in range(n_scene)]
         npoints_after_distance_filter = [ds[i]['npoints_after_distance_filter'] for i in range(n_scene)]
@@ -95,6 +123,31 @@ def make_man_pc(
             device
         )  # [B, N, 3]
         # print(f"shapes x0sbn3: {x0sbn3.shape}") #shapes x0sbn3: torch.Size([40, 128, 7])
+
+        persistence = None
+
+        if get_persistence:
+            persistence = torch.stack(
+                [
+                    ds[i]["persistence"]
+                    for i in range(n_scene)
+                ],
+                dim=0,
+            ).to(device)
+
+            assert persistence.shape == (
+                n_scene,
+                num_points,
+            )
+
+            assert torch.isfinite(
+                persistence
+            ).all()
+
+            assert (
+                (persistence >= 0.0)
+                & (persistence <= 1.0)
+            ).all()
         
         wan_cond = None
         if get_wan_cond and wan_spec is not None:
@@ -104,9 +157,17 @@ def make_man_pc(
                 device
             )  # [B, latent_dim]
         
-        return x0sbn3[:,:,:3], wan_cond, ds, x0sbn3[:,:,3:6],x0sbn3[:,:,6:]
+        return (
+            x0sbn3[:, :, :3],
+            wan_cond,
+            ds,
+            x0sbn3[:, :, 3:6],
+            x0sbn3[:, :, 6:],
+            persistence,
+        )
 
     else:
+        raise NotImplementedError("Non-dense mode is not implemented yet. Please set is_dense=True.")
         ds = [
             MANDataset(
                 scene_ids=[i],
@@ -285,7 +346,15 @@ def make_various_pc(num_points=64, device="cpu", n_shapes=7,wan_spec={"wan_frame
         data = data / data.abs().max(dim=1, keepdim=True)[0].max(dim=2, keepdim=True)[0]
     return data[:n_shapes, :num_points, :]
 
-def save_checkpoint(model, optimizer,  step, checkpoint_path, config,lr_scheduler=None):
+def save_checkpoint(
+    model,
+    optimizer,
+    step,
+    checkpoint_path,
+    config,
+    lr_scheduler=None,
+    best_val_cd=None,
+):
     """Save training checkpoint."""
     os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
     checkpoint = {
@@ -295,8 +364,12 @@ def save_checkpoint(model, optimizer,  step, checkpoint_path, config,lr_schedule
         "config": config,
         "lr_scheduler_state": lr_scheduler.state_dict() if lr_scheduler is not None else None,
     }
+
+    # Optional: only best checkpoints need to remember their validation CD.
+    if best_val_cd is not None:
+        checkpoint["best_val_cd"] = best_val_cd
+
     torch.save(checkpoint, checkpoint_path)
-    # print(f"Checkpoint saved at step {step}: {checkpoint_path}")
 
 
 def load_checkpoint(model, optimizer,  checkpoint_path, epoch, device="cuda",config=None,lr_scheduler=None):
@@ -310,16 +383,16 @@ def load_checkpoint(model, optimizer,  checkpoint_path, epoch, device="cuda",con
         if f.startswith(os.path.basename(checkpoint_path).split("*")[0])
         and f.endswith(os.path.basename(checkpoint_path).split("*")[1])
     ]
-    print(
-        f"Looking for checkpoints in {os.path.dirname(checkpoint_path)}/{os.path.basename(checkpoint_path)}. Found: {matched_files}"
-    )
+    # print(
+    #     f"Looking for checkpoints in {os.path.dirname(checkpoint_path)}/{os.path.basename(checkpoint_path)}. Found: {matched_files}"
+    # )
     latest_step = -1
     checkpoint = None
     for match in matched_files:
         _checkpoint_path = os.path.join(os.path.dirname(checkpoint_path), match)
         try:
             loaded_checkpoint = torch.load(_checkpoint_path, map_location=device)
-            print(f"Found checkpoint file: {match}, at step {loaded_checkpoint['step']}")
+            # print(f"Found checkpoint file: {match}, at step {loaded_checkpoint['step']}")
             if loaded_checkpoint["step"] > latest_step:
                 if epoch <loaded_checkpoint["step"]:
                     print(
@@ -699,3 +772,30 @@ def save_point_sample(path, pred, gt=None, condition=None, meta=None):
         data["meta"] = np.array(str(meta))
 
     np.savez_compressed(path, **data)
+def make_cache_fname(args, sc_id, 
+    data_file=None,
+    sensor_side=None,):
+    persistence_tag = ""
+
+    if args.persistence_weight >0:
+        persistence_tag = (
+            f"_persist"
+            f"K{args.persistence_k_native}"
+            f"_sig{args.persistence_sigma:g}"
+        )
+    sensor_side = sensor_side if sensor_side is not None else args.sensor_side
+    cache_fname = (
+        f"man_{args.data_file if data_file is  None else data_file}_{sc_id}"
+        f"{'_right' if sensor_side == 'right' else ''}"
+        f"{'_cameraxyz' if args.coord_frame == 'camera' else ''}"
+        f"_{args.cond_method}_{args.N}"
+        f"_{args.cond_mode}"
+        f"_{args.wan_frames}"
+        f"_{args.wan_frame_mode}"
+        f"_{args.wan_frame_stride}"
+        f"_{args.wan_edge_policy}"
+        f"{persistence_tag}"
+        f"_unnorm"
+        f".pkl"
+    )
+    return cache_fname
